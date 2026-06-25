@@ -710,5 +710,179 @@ router.get('/passengers-data', async (req, res) => {
     }
 });
 
+// GET active poll settings
+router.get('/polls/settings', adminAuth, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('poll_settings')
+            .select('*')
+            .eq('id', 1)
+            .maybeSingle();
+        
+        if (error) throw error;
+        
+        // Fallback seed just in case
+        if (!data) {
+            const defaultSettings = {
+                id: 1,
+                question: 'Что помешало вам завершить покупку билета?',
+                option1: 'Слишком высокая итоговая цена после выбора мест и комиссии',
+                option2: 'Неудобный способ оплаты или не прошла оплата',
+                option3: 'Изменились планы или поездка стала неактуальной'
+            };
+            await supabase.from('poll_settings').insert([defaultSettings]);
+            return res.json(defaultSettings);
+        }
+        
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// UPDATE poll settings
+router.put('/polls/settings', adminAuth, async (req, res) => {
+    try {
+        const { question, option1, option2, option3 } = req.body;
+        const { data, error } = await supabase
+            .from('poll_settings')
+            .update({ question, option1, option2, option3 })
+            .eq('id', 1)
+            .select()
+            .single();
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET customer poll answers
+router.get('/polls/answers', adminAuth, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('purchase_poll_answers')
+            .select(`
+                id, booking_id, user_id, telegram_id, answer, created_at,
+                users:user_id (name, phone),
+                bus_ticket_bookings:booking_id (
+                    id, total_price, passenger_count, seat_numbers,
+                    bus_tickets:bus_ticket_id (from_city, to_city, departure_date, departure_time)
+                )
+            `)
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST trigger polls (for cron task)
+router.post('/polls/trigger', adminAuth, async (req, res) => {
+    try {
+        // 1. Fetch poll settings
+        let { data: settings, error: settingsErr } = await supabase
+            .from('poll_settings')
+            .select('*')
+            .eq('id', 1)
+            .maybeSingle();
+        if (settingsErr) throw settingsErr;
+
+        if (!settings) {
+            settings = {
+                id: 1,
+                question: 'Что помешало вам завершить покупку билета?',
+                option1: 'Слишком высокая итоговая цена после выбора мест и комиссии',
+                option2: 'Неудобный способ оплаты или не прошла оплата',
+                option3: 'Изменились планы или поездка стала неактуальной'
+            };
+            await supabase.from('poll_settings').insert([settings]);
+        }
+
+        // 2. Fetch pending bookings
+        const { data: bookings, error: bookingsErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select(`
+                id, passenger_id, phone, status, total_price,
+                users:passenger_id (id, name, telegram_id)
+            `)
+            .eq('status', 'pending_payment');
+        if (bookingsErr) throw bookingsErr;
+
+        if (!bookings || bookings.length === 0) {
+            return res.json({ message: 'No pending bookings found.', count: 0 });
+        }
+
+        // 3. Fetch sent polls and answers to filter out already polled/answered bookings
+        const { data: sentPolls, error: sentErr } = await supabase
+            .from('sent_polls')
+            .select('booking_id');
+        if (sentErr) throw sentErr;
+        const sentBookingIds = new Set(sentPolls.map(sp => sp.booking_id));
+
+        const { data: answers, error: answersErr } = await supabase
+            .from('purchase_poll_answers')
+            .select('booking_id');
+        if (answersErr) throw answersErr;
+        const answeredBookingIds = new Set(answers.map(a => a.booking_id));
+
+        const eligibleBookings = bookings.filter(b => {
+            const hasTg = b.users && b.users.telegram_id;
+            return hasTg && !sentBookingIds.has(b.id) && !answeredBookingIds.has(b.id);
+        });
+
+        if (eligibleBookings.length === 0) {
+            return res.json({ message: 'No eligible users to send polls to.', count: 0 });
+        }
+
+        // 4. Send polls
+        const telegramBot = require('../utils/telegramBot');
+        let successCount = 0;
+        let failCount = 0;
+
+        for (const b of eligibleBookings) {
+            const tgId = b.users.telegram_id;
+            const result = await telegramBot.sendPoll(
+                tgId,
+                settings.question,
+                [settings.option1, settings.option2, settings.option3, 'Ваш вариант (напишите, что именно мешает)']
+            );
+
+            if (result && result.ok && result.result) {
+                const telegramMessage = result.result;
+                const pollId = telegramMessage.poll.id;
+
+                // Save in sent_polls
+                const { error: saveErr } = await supabase
+                    .from('sent_polls')
+                    .insert({
+                        poll_id: pollId,
+                        booking_id: b.id,
+                        user_id: b.passenger_id,
+                        telegram_id: tgId.toString()
+                    });
+
+                if (saveErr) {
+                    console.error(`Error saving sent poll: ${saveErr.message}`);
+                } else {
+                    successCount++;
+                }
+            } else {
+                failCount++;
+            }
+        }
+
+        res.json({
+            message: 'Finished sending polls.',
+            total_eligible: eligibleBookings.length,
+            success: successCount,
+            failed: failCount
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 module.exports = router;
 

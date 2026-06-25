@@ -156,8 +156,40 @@ async function sendPersonalMessage(userId, text, options = {}) {
     }
 }
 
+/**
+ * Sends a non-anonymous poll to a Telegram chat.
+ * @param {string|number} chatId - The Telegram chat ID.
+ * @param {string} question - The poll question.
+ * @param {string[]} optionsArray - Array of answer options.
+ * @param {object} [options] - Optional configurations.
+ * @returns {Promise<object|boolean>} - Returns Telegram message object on success, false on failure.
+ */
+async function sendPoll(chatId, question, optionsArray, options = {}) {
+    if (!chatId) {
+        console.error('Telegram Bot: Missing chatId');
+        return false;
+    }
+
+    try {
+        const payload = {
+            chat_id: chatId,
+            question: question,
+            options: optionsArray,
+            is_anonymous: false,
+            ...options
+        };
+
+        const response = await axios.post(`${BOT_API_URL}/sendPoll`, payload);
+        return response.data;
+    } catch (error) {
+        console.error(`Telegram Bot Poll Error (chatId: ${chatId}):`, error.response?.data?.description || error.message);
+        return false;
+    }
+}
+
 module.exports = {
     sendMessage,
     sendBroadcast,
-    sendPersonalMessage
+    sendPersonalMessage,
+    sendPoll
 };
