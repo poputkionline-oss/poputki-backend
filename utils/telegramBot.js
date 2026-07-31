@@ -1,7 +1,7 @@
 const axios = require('axios');
 const supabase = require('../db');
 
-const BOT_TOKEN = '8669833278:AAE2RYNpP530Nt1bDmXnbcNSg4qL_cKRNQA';
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const BROADCAST_GROUP_ID = process.env.TELEGRAM_BROADCAST_GROUP_ID; // Optional fallback
 const BOT_API_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const BOT_LINK = 'https://t.me/poputkionline_bot'; // Or t.me/poputkionline_bot, must be valid URL for inline keyboard

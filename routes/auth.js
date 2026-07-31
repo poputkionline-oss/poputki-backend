@@ -4,8 +4,8 @@ const supabase = require('../db');
 const crypto = require('crypto');
 
 // Professional Telegram initData verification
-// Hardcoded Bot Token to ensure consistency across services
-const BOT_TOKEN = '8669833278:AAE2RYNpP530Nt1bDmXnbcNSg4qL_cKRNQA';
+// Use environment variable for bot token
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 function verifyTelegramData(initData) {
     if (!initData) return false;
