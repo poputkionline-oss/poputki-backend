@@ -2,8 +2,8 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 
-const ADMIN_PASSCODE = '941206'; // Tricky 6-digit code
-const ADMIN_SECRET_TOKEN = 'poputki-admin-super-secret-token-2026';
+const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE;
+const ADMIN_SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN;
 
 // Middleware to verify admin token
 function adminAuth(req, res, next) {

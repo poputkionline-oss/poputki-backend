@@ -6,8 +6,7 @@ const path = require('path');
 const os = require('os');
 const { uploadToCloudinary } = require('../utils/cloudinaryUtils');
 
-// IMPORTANT: Replace with actual key or move to .env
-const OCR_API_KEY = process.env.OCR_API_KEY || 'nkIXg5z3fkwFdApQB1lVYVheMn9XkYXr';
+const OCR_API_KEY = process.env.OCR_API_KEY;
 const OCR_API_URL = 'https://api.100ocrapi.com/v1/passport';
 
 /**
