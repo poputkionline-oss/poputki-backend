@@ -77,22 +77,22 @@ async function sendBroadcast(text, rideId = null, type = 'ride') {
     const inlineKeyboard = [];
 
     // The BOT_LINK or bot username should be used for deep linking
-    // Pattern: https://t.me/bot_username/app?startapp=param
+    // Pattern: https://t.me/bot_username?start=param
     const botUsername = 'poputkionline_bot'; // From BOT_LINK 'https://t.me/poputkionline_bot'
     
     if (rideId) {
         const prefix = type === 'bus' ? 'bus' : 'ride';
         inlineKeyboard.push([
             { 
-                text: '🚀 Подробнее в приложении', 
-                url: `https://t.me/${botUsername}/app?startapp=${prefix}_${rideId}` 
+                text: '🚀 Подробнее в боте', 
+                url: `https://t.me/${botUsername}?start=${prefix}_${rideId}` 
             }
         ]);
     } else {
         inlineKeyboard.push([
             { 
-                text: '📱 Открыть приложение', 
-                url: `https://t.me/${botUsername}/app` 
+                text: '📱 Открыть бота', 
+                url: `https://t.me/${botUsername}?start=menu` 
             }
         ]);
     }
