@@ -49,3 +49,5 @@
 ## Лицензия
 
 Собственность Poputki.online. Все права защищены.
+
+<!-- Render auto-deploy verification: 2026-08-24 -->
