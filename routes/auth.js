@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 
 // Professional Telegram initData verification
 // Use environment variable for bot token
@@ -334,7 +335,7 @@ router.post('/register', async (req, res) => {
  */
 router.post('/bus-login', async (req, res) => {
     const { phone, password } = req.body;
-    if (!phone || !password) return res.status(400).json({ error: 'Phone and password required' });
+    if (!phone || !password) return res.status(400).json({ error: 'Необходимо указать телефон и пароль' });
 
     try {
         const { data: user, error } = await supabase
@@ -342,15 +343,79 @@ router.post('/bus-login', async (req, res) => {
             .select('*')
             .eq('phone', phone)
             .eq('password', password)
-            .eq('role', 'bus_driver')
-            .single();
+            .maybeSingle();
 
         if (error || !user) {
-            return res.status(401).json({ error: 'Неверный телефон, пароль или нет прав водителя автобуса' });
+            return res.status(401).json({ error: 'Неверный телефон, пароль или нет прав доступа' });
         }
 
-        res.json({ user, token: 'bus-token-' + user.id });
+        if (user.is_blocked) {
+            return res.status(403).json({ error: 'Аккаунт заблокирован администратором' });
+        }
+
+        let carrierId = user.id;
+        let memberRole = user.role === 'bus_driver' ? 'owner' : null;
+
+        // Check carrier_members if user is an employee
+        try {
+            const { data: member } = await supabase
+                .from('carrier_members')
+                .select('carrier_id, role, is_active')
+                .eq('user_id', user.id)
+                .maybeSingle();
+
+            if (member) {
+                if (!member.is_active) {
+                    return res.status(403).json({ error: 'Доступ сотрудника отключен владельцем перевозчика' });
+                }
+                carrierId = member.carrier_id;
+                memberRole = member.role;
+            }
+        } catch (mErr) {
+            // graceful fallback if carrier_members not present
+        }
+
+        // If neither bus_driver nor carrier_member
+        if (!memberRole && user.role !== 'bus_driver') {
+            return res.status(403).json({ error: 'У пользователя нет прав доступа к кабинету перевозчика' });
+        }
+
+        const jwtSecret = process.env.JWT_SECRET;
+        if (!jwtSecret) {
+            console.error('[Auth Error] JWT_SECRET is not configured in environment!');
+            return res.status(500).json({ error: 'Внутренняя ошибка конфигурации безопасности сервера' });
+        }
+
+        // Issue cryptographically signed JWT (7 days TTL, strict issuer & audience)
+        const token = jwt.sign(
+            {
+                sub: String(user.id),
+                carrierId: carrierId,
+                role: memberRole || 'owner',
+                phone: user.phone
+            },
+            jwtSecret,
+            {
+                algorithm: 'HS256',
+                expiresIn: '7d',
+                issuer: 'poputki.online',
+                audience: 'poputki-carrier'
+            }
+        );
+
+        res.json({
+            user: {
+                id: user.id,
+                name: user.name,
+                phone: user.phone,
+                role: user.role,
+                carrierId,
+                memberRole: memberRole || 'owner'
+            },
+            token
+        });
     } catch (err) {
+        console.error('[bus-login error]', err);
         res.status(500).json({ error: err.message });
     }
 });

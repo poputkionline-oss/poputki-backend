@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinaryUtils');
+const { carrierAuth, verifyTicketAccess } = require('../utils/carrierAuth');
 
 /**
  * @swagger
@@ -10,30 +11,27 @@ const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinar
  *   description: Operations for Bus Drivers Panel
  */
 
+// Protect ALL carrier panel routes with carrierAuth
+router.use(carrierAuth);
+
 /**
  * @swagger
- * /api/bus-admin/tickets:
+ * /api/bus-admin/stats:
  *   get:
- *     summary: Get tickets created by the bus operator
+ *     summary: Get dashboard stats for the authenticated carrier
  *     tags: [Bus Admin]
- *     parameters:
- *       - in: query
- *         name: operator_id
- *         required: true
- *         schema:
- *           type: integer
  */
 router.get('/stats', async (req, res) => {
-    const { operator_id } = req.query;
-    if (!operator_id) return res.status(400).json({ error: 'operator_id required' });
+    // Trusted carrier ID extracted directly from verified JWT
+    const operatorId = req.carrier.carrier_id;
 
     try {
         // 1. Basic counts
-        const { count: totalRides } = await supabase.from('bus_tickets').select('*', { count: 'exact', head: true }).eq('operator_id', operator_id);
-        const { count: activeRides } = await supabase.from('bus_tickets').select('*', { count: 'exact', head: true }).eq('operator_id', operator_id).eq('status', 'active');
+        const { count: totalRides } = await supabase.from('bus_tickets').select('*', { count: 'exact', head: true }).eq('operator_id', operatorId);
+        const { count: activeRides } = await supabase.from('bus_tickets').select('*', { count: 'exact', head: true }).eq('operator_id', operatorId).eq('status', 'active');
         
         // 2. Bookings and Revenue
-        const { data: tickets } = await supabase.from('bus_tickets').select('id, total_seats').eq('operator_id', operator_id);
+        const { data: tickets } = await supabase.from('bus_tickets').select('id, total_seats').eq('operator_id', operatorId);
         const ticketIds = (tickets || []).map(t => t.id);
 
         if (ticketIds.length === 0) {
@@ -87,7 +85,7 @@ router.get('/stats', async (req, res) => {
             .sort((a, b) => a.date.localeCompare(b.date));
 
         // 5. Popular Routes
-        const { data: routeInfo } = await supabase.from('bus_tickets').select('from_city, to_city').eq('operator_id', operator_id);
+        const { data: routeInfo } = await supabase.from('bus_tickets').select('from_city, to_city').eq('operator_id', operatorId);
         const routeCounts = (routeInfo || []).reduce((acc, curr) => {
             const route = `${curr.from_city} → ${curr.to_city}`;
             acc[route] = (acc[route] || 0) + 1;
@@ -117,19 +115,19 @@ router.get('/stats', async (req, res) => {
  * @swagger
  * /api/bus-admin/tickets:
  *   get:
- *     summary: Get tickets created by the bus operator
+ *     summary: Get tickets created by the authenticated carrier
  *     tags: [Bus Admin]
  */
 router.get('/tickets', async (req, res) => {
-    const { operator_id } = req.query;
-    if (!operator_id) return res.status(400).json({ error: 'operator_id required' });
+    // Trusted carrier ID extracted directly from verified JWT
+    const operatorId = req.carrier.carrier_id;
 
     try {
-        console.log(`[BusAdmin] Fetching tickets for operator: ${operator_id}`);
+        console.log(`[BusAdmin] Fetching tickets for carrier: ${operatorId} (user: ${req.carrier.user_id})`);
         const { data: tickets, error } = await supabase
             .from('bus_tickets')
             .select('*')
-            .eq('operator_id', operator_id)
+            .eq('operator_id', operatorId)
             .order('departure_date', { ascending: false });
 
         if (error) {
@@ -138,7 +136,7 @@ router.get('/tickets', async (req, res) => {
         }
 
         if (!tickets || tickets.length === 0) {
-            console.log(`[BusAdmin] No tickets found for operator: ${operator_id}`);
+            console.log(`[BusAdmin] No tickets found for carrier: ${operatorId}`);
             return res.json([]);
         }
 
@@ -185,7 +183,7 @@ router.get('/tickets', async (req, res) => {
             };
         });
 
-        console.log(`[BusAdmin] Successfully returning ${result.length} tickets for operator ${operator_id}`);
+        console.log(`[BusAdmin] Successfully returning ${result.length} tickets for carrier ${operatorId}`);
         res.json(result);
     } catch (err) {
         console.error('[BusAdmin] Critical error in /tickets:', err);
@@ -197,26 +195,20 @@ router.get('/tickets', async (req, res) => {
  * @swagger
  * /api/bus-admin/bookings:
  *   get:
- *     summary: Get bookings on tickets owned by operator
+ *     summary: Get bookings on tickets owned by authenticated carrier
  *     tags: [Bus Admin]
- *     parameters:
- *       - in: query
- *         name: operator_id
- *         required: true
- *         schema:
- *           type: integer
  */
 router.get('/bookings', async (req, res) => {
-    const { operator_id } = req.query;
-    if (!operator_id) return res.status(400).json({ error: 'operator_id required' });
+    // Trusted carrier ID extracted directly from verified JWT
+    const operatorId = req.carrier.carrier_id;
 
     try {
-        console.log(`[BusAdmin] Fetching bookings for operator: ${operator_id}`);
-        // Find tickets for this operator
+        console.log(`[BusAdmin] Fetching bookings for carrier: ${operatorId}`);
+        // Find tickets for this carrier
         const { data: tickets, error: tErr } = await supabase
             .from('bus_tickets')
             .select('id, from_city, to_city, departure_date, departure_time')
-            .eq('operator_id', operator_id);
+            .eq('operator_id', operatorId);
 
         if (tErr) {
             console.error('[BusAdmin] Error fetching operator tickets for bookings:', tErr);
@@ -224,7 +216,7 @@ router.get('/bookings', async (req, res) => {
         }
         
         if (!tickets || tickets.length === 0) {
-            console.log(`[BusAdmin] No tickets found, so no bookings to return for operator ${operator_id}`);
+            console.log(`[BusAdmin] No tickets found, so no bookings to return for carrier ${operatorId}`);
             return res.json([]);
         }
 
@@ -270,7 +262,7 @@ router.get('/bookings', async (req, res) => {
             };
         });
 
-        console.log(`[BusAdmin] Successfully returning ${result.length} bookings for operator ${operator_id}`);
+        console.log(`[BusAdmin] Successfully returning ${result.length} bookings for carrier ${operatorId}`);
         res.json(result);
     } catch (err) {
         console.error('[BusAdmin] Critical error in /bookings:', err);
@@ -282,24 +274,25 @@ router.get('/bookings', async (req, res) => {
  * @swagger
  * /api/bus-admin/tickets/{id}:
  *   put:
- *     summary: Update a bus ticket
+ *     summary: Update a bus ticket with ownership verification
  *     tags: [Bus Admin]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
  */
 router.put('/tickets/:id', async (req, res) => {
     const { id } = req.params;
     const updateData = req.body;
     
-    // Remove metadata fields from updateData
+    // Strict ownership verification
+    const hasAccess = await verifyTicketAccess(req.carrier, id);
+    if (!hasAccess) {
+        return res.status(403).json({ error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+    }
+
+    // Remove metadata and ownership fields from updateData
     delete updateData.id;
     delete updateData.created_at;
+    delete updateData.operator_id; // prevent changing owner
     const incomingPhotos = updateData.photos;
-    delete updateData.photos; // we will process and attach later
+    delete updateData.photos; // process and attach safely
 
     try {
         // Fetch existing ticket to compare photos
@@ -349,17 +342,17 @@ router.put('/tickets/:id', async (req, res) => {
  * @swagger
  * /api/bus-admin/tickets/{id}:
  *   delete:
- *     summary: Delete a bus ticket
+ *     summary: Delete a bus ticket with ownership verification
  *     tags: [Bus Admin]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
  */
 router.delete('/tickets/:id', async (req, res) => {
     const { id } = req.params;
+
+    // Strict ownership verification
+    const hasAccess = await verifyTicketAccess(req.carrier, id);
+    if (!hasAccess) {
+        return res.status(403).json({ error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+    }
 
     try {
         // Fetch to get photos before deleting
@@ -390,11 +383,21 @@ router.delete('/tickets/:id', async (req, res) => {
  * @swagger
  * /api/bus-admin/bookings/manual:
  *   post:
- *     summary: Create a manual booking (by operator)
+ *     summary: Create a manual booking (by authenticated carrier)
  *     tags: [Bus Admin]
  */
 router.post('/bookings/manual', async (req, res) => {
-    const { bus_ticket_id, operator_id, seat_numbers, passengers_data, phone, passenger_name, pickup_city, drop_off_city } = req.body;
+    const { bus_ticket_id, seat_numbers, passengers_data, phone, passenger_name, pickup_city, drop_off_city } = req.body;
+
+    if (!bus_ticket_id) {
+        return res.status(400).json({ error: 'Необходимо указать bus_ticket_id' });
+    }
+
+    // Strict ownership verification
+    const hasAccess = await verifyTicketAccess(req.carrier, bus_ticket_id);
+    if (!hasAccess) {
+        return res.status(403).json({ error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+    }
 
     try {
         const { data: ticket, error: tErr } = await supabase
@@ -403,26 +406,26 @@ router.post('/bookings/manual', async (req, res) => {
             .eq('id', bus_ticket_id)
             .single();
 
-        if (tErr) throw tErr;
+        if (tErr || !ticket) return res.status(404).json({ error: 'Рейс не найден' });
 
         // Check if seats are already taken
         const reserved = typeof ticket.reserved_seats === 'string' ? JSON.parse(ticket.reserved_seats || '[]') : (ticket.reserved_seats || []);
-        const conflict = seat_numbers.some(s => reserved.includes(s));
-        if (conflict) return res.status(400).json({ error: 'Seats already taken' });
+        const conflict = (seat_numbers || []).some(s => reserved.includes(s));
+        if (conflict) return res.status(400).json({ error: 'Одно или несколько мест уже заняты' });
 
-        // Insert booking
+        // Insert booking with authenticated carrier as manager
         const { data: booking, error: bErr } = await supabase
             .from('bus_ticket_bookings')
             .insert([{
                 bus_ticket_id,
-                passenger_id: operator_id, // Managed by operator
+                passenger_id: req.carrier.user_id, // Authenticated carrier manager
                 seat_numbers,
-                passenger_count: seat_numbers.length,
+                passenger_count: (seat_numbers || []).length,
                 passengers_data,
                 phone,
                 status: 'confirmed',
                 total_price: 0, // Manual booking
-                passenger_name: passenger_name, // Store name for table display
+                passenger_name: passenger_name,
                 pickup_city,
                 drop_off_city
             }])
@@ -432,7 +435,7 @@ router.post('/bookings/manual', async (req, res) => {
         if (bErr) throw bErr;
 
         // Update ticket reserved seats
-        const newReserved = [...reserved, ...seat_numbers];
+        const newReserved = [...reserved, ...(seat_numbers || [])];
         await supabase
             .from('bus_tickets')
             .update({ reserved_seats: newReserved })
@@ -448,7 +451,7 @@ router.post('/bookings/manual', async (req, res) => {
  * @swagger
  * /api/bus-admin/bookings/{id}:
  *   put:
- *     summary: Update an existing booking
+ *     summary: Update an existing booking with ownership verification
  *     tags: [Bus Admin]
  */
 router.put('/bookings/:id', async (req, res) => {
@@ -463,9 +466,15 @@ router.put('/bookings/:id', async (req, res) => {
             .eq('id', id)
             .single();
 
-        if (obErr || !oldBooking) return res.status(404).json({ error: 'Booking not found' });
+        if (obErr || !oldBooking) return res.status(404).json({ error: 'Бронирование не найдено' });
 
         const ticketId = oldBooking.bus_ticket_id;
+
+        // Strict ownership verification: verify the booking's ticket belongs to current carrier
+        const hasAccess = await verifyTicketAccess(req.carrier, ticketId);
+        if (!hasAccess) {
+            return res.status(403).json({ error: 'Доступ запрещен: бронирование принадлежит рейсу другого перевозчика' });
+        }
 
         // 2. If seats changed, check for conflicts and update ticket.reserved_seats
         if (JSON.stringify(oldBooking.seat_numbers) !== JSON.stringify(seat_numbers)) {
@@ -480,13 +489,13 @@ router.put('/bookings/:id', async (req, res) => {
             const reserved = typeof ticket.reserved_seats === 'string' ? JSON.parse(ticket.reserved_seats || '[]') : (ticket.reserved_seats || []);
             
             // Remove old seats from the reserved list
-            const withoutOld = reserved.filter(s => !oldBooking.seat_numbers.includes(s));
+            const withoutOld = reserved.filter(s => !(oldBooking.seat_numbers || []).includes(s));
             
             // Check for conflicts with new seats (excluding the seats we just "released")
-            const conflict = seat_numbers.some(s => withoutOld.includes(s));
-            if (conflict) return res.status(400).json({ error: 'One or more of the new seats are already taken' });
+            const conflict = (seat_numbers || []).some(s => withoutOld.includes(s));
+            if (conflict) return res.status(400).json({ error: 'Одно или несколько выбранных мест уже заняты' });
 
-            const newReserved = [...withoutOld, ...seat_numbers];
+            const newReserved = [...withoutOld, ...(seat_numbers || [])];
 
             // Update ticket
             await supabase
@@ -500,7 +509,7 @@ router.put('/bookings/:id', async (req, res) => {
             .from('bus_ticket_bookings')
             .update({
                 seat_numbers,
-                passenger_count: seat_numbers.length,
+                passenger_count: (seat_numbers || []).length,
                 passengers_data,
                 phone,
                 passenger_name,
@@ -521,14 +530,8 @@ router.put('/bookings/:id', async (req, res) => {
  * @swagger
  * /api/bus-admin/bookings/{id}:
  *   delete:
- *     summary: Delete a bus booking and release seats
+ *     summary: Delete a bus booking and release seats with ownership verification
  *     tags: [Bus Admin]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
  */
 router.delete('/bookings/:id', async (req, res) => {
     const { id } = req.params;
@@ -541,9 +544,16 @@ router.delete('/bookings/:id', async (req, res) => {
             .eq('id', id)
             .single();
 
-        if (bErr || !booking) return res.status(404).json({ error: 'Booking not found' });
+        if (bErr || !booking) return res.status(404).json({ error: 'Бронирование не найдено' });
 
         const ticketId = booking.bus_ticket_id;
+
+        // Strict ownership verification: verify the booking's ticket belongs to current carrier
+        const hasAccess = await verifyTicketAccess(req.carrier, ticketId);
+        if (!hasAccess) {
+            return res.status(403).json({ error: 'Доступ запрещен: бронирование принадлежит рейсу другого перевозчика' });
+        }
+
         const seatsToRelease = typeof booking.seat_numbers === 'string' ? JSON.parse(booking.seat_numbers || '[]') : (booking.seat_numbers || []);
 
         // 2. Delete the booking
