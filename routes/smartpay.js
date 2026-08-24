@@ -169,10 +169,42 @@ router.post('/create-invoice', async (req, res) => {
             totalPrice += premiumSeatNums.includes(seatNum) ? premiumPrice : ticket.price;
         }
 
-        // Generate unique order_id
-        const paymentOrderId = `bus_${bus_ticket_id}_${passenger_id}_${Date.now()}`;
+        const { 
+            bus_ticket_id, 
+            passenger_id, 
+            seat_numbers, 
+            passengers_data, 
+            phone, 
+            pickup_city, 
+            drop_off_city,
+            channel,
+            source_type,
+            source_id
+        } = req.body;
 
-        // Create booking with pending_payment status
+        if (!bus_ticket_id || !passenger_id || !seat_numbers || !phone) {
+            return res.status(400).json({ error: 'Не все обязательные поля заполнены' });
+        }
+
+        // Validate and sanitize attribution parameters
+        const validChannels = ['web', 'telegram', 'manual'];
+        const validSourceTypes = ['direct', 'carrier_link', 'partner_link', 'manual', 'bot', 'platform'];
+
+        let finalChannel = validChannels.includes(channel) ? channel : 'web';
+        let finalSourceType = validSourceTypes.includes(source_type) ? source_type : 'direct';
+        let finalSourceId = source_id ? String(source_id).trim() : null;
+
+        // Security verification: If claimed source_type is carrier_link, verify against the ticket operator_id
+        if (finalSourceType === 'carrier_link' && finalSourceId) {
+            const claimedCarrierId = parseInt(finalSourceId, 10);
+            if (!claimedCarrierId || ticket.operator_id !== claimedCarrierId) {
+                // False attribution prevention: Reset to direct if carrier ID does not match ticket owner
+                finalSourceType = 'direct';
+                finalSourceId = null;
+            }
+        }
+
+        // Create booking with pending_payment status and verified attribution
         const { data: booking, error: insertError } = await supabase
             .from('bus_ticket_bookings')
             .insert([{
@@ -186,7 +218,11 @@ router.post('/create-invoice', async (req, res) => {
                 total_price: totalPrice,
                 pickup_city,
                 drop_off_city,
-                payment_order_id: paymentOrderId
+                payment_order_id: paymentOrderId,
+                channel: finalChannel,
+                source_type: finalSourceType,
+                source_id: finalSourceId,
+                created_by_user_id: null // Online bookings cannot be created by an internal manager
             }])
             .select('id')
             .single();

@@ -427,7 +427,11 @@ router.post('/bookings/manual', async (req, res) => {
                 total_price: 0, // Manual booking
                 passenger_name: passenger_name,
                 pickup_city,
-                drop_off_city
+                drop_off_city,
+                channel: 'manual',
+                source_type: 'manual',
+                source_id: String(req.carrier.carrier_id || req.carrier.id),
+                created_by_user_id: req.carrier.user_id
             }])
             .select('id')
             .single();
