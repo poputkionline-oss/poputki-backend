@@ -13,20 +13,20 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://poputki.online';
  */
 async function processSuccessfulPayment(booking) {
     const ticketId = booking.bus_ticket_id;
-    
+
     // Check for seat conflicts before confirming
     const { data: confirmedBookings } = await supabase
         .from('bus_ticket_bookings')
         .select('seat_numbers')
         .eq('bus_ticket_id', ticketId)
         .eq('status', 'confirmed');
-        
+
     const takenSeats = [];
     (confirmedBookings || []).forEach(b => {
         const s = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
         takenSeats.push(...s);
     });
-    
+
     const mySeats = typeof booking.seat_numbers === 'string' ? JSON.parse(booking.seat_numbers || '[]') : (booking.seat_numbers || []);
     const conflict = mySeats.some(s => takenSeats.includes(s));
 
@@ -36,7 +36,7 @@ async function processSuccessfulPayment(booking) {
             .from('bus_ticket_bookings')
             .update({ status: 'conflict_refund_needed' })
             .eq('id', booking.id);
-        
+
         return { status: 'failed', error: 'Seats were taken by another user during payment. Please contact support for a refund.' };
     }
 
@@ -94,7 +94,7 @@ async function processSuccessfulPayment(booking) {
             sendPersonalMessage(ticket.operator_id, driverMsg);
         }
     }
-    
+
     return { status: 'confirmed', booking_id: booking.id };
 }
 
@@ -169,18 +169,14 @@ router.post('/create-invoice', async (req, res) => {
             totalPrice += premiumSeatNums.includes(seatNum) ? premiumPrice : ticket.price;
         }
 
-        const { 
-            bus_ticket_id, 
-            passenger_id, 
-            seat_numbers, 
-            passengers_data, 
-            phone, 
-            pickup_city, 
-            drop_off_city,
+        const {
             channel,
             source_type,
             source_id
         } = req.body;
+
+        // Generate unique order_id
+        const paymentOrderId = `bus_${bus_ticket_id}_${passenger_id}_${Date.now()}`;
 
         if (!bus_ticket_id || !passenger_id || !seat_numbers || !phone) {
             return res.status(400).json({ error: 'Не все обязательные поля заполнены' });
@@ -354,7 +350,7 @@ module.exports = router;
 router.post('/webhook', async (req, res) => {
     const payload = req.body;
     const { order_id } = payload;
-    
+
     if (!order_id) {
         return res.status(400).json({ error: 'Missing order_id' });
     }
@@ -380,9 +376,9 @@ router.post('/webhook', async (req, res) => {
 
         // Run the main confirmation logic
         const result = await processSuccessfulPayment(booking);
-        
+
         console.log(`[WEBHOOK] Successfully processed order: ${order_id}. Result:`, result);
-        
+
         // Respond HTTP 200 OK to the bank
         res.json(result);
 
