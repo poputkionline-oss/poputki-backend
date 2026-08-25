@@ -26,7 +26,7 @@ function adminAuth(req, res, next) {
 router.post('/login', (req, res) => {
     const { passcode } = req.body;
     console.log(`[Admin Login Attempt] Passcode received: ${passcode ? '***' + passcode.slice(-2) : 'NONE'}`);
-    
+
     if (String(passcode) === String(ADMIN_PASSCODE)) {
         console.log(`[Admin Login Success] Standard passcode used`);
         res.json({ token: ADMIN_SECRET_TOKEN });
@@ -145,7 +145,7 @@ router.get('/stats', async (req, res) => {
             .from('bus_ticket_bookings')
             .select('created_at, status, total_price')
             .gte('created_at', thirtyDateString);
-        
+
         const bookingMap = {};
         let paidCount = 0;
         let manualCount = 0;
@@ -154,7 +154,7 @@ router.get('/stats', async (req, res) => {
         (busBookings || []).forEach(b => {
             const d = b.created_at.split('T')[0];
             bookingMap[d] = (bookingMap[d] || 0) + 1;
-            
+
             if (b.status !== 'cancelled') {
                 totalCount++;
                 if (b.total_price === 0) {
@@ -418,7 +418,7 @@ router.get('/cities', async (req, res) => {
             .from('cities')
             .select('*')
             .order('name', { ascending: true });
-        
+
         if (type) {
             query = query.eq('type', type);
         }
@@ -579,7 +579,7 @@ router.get('/bus-drivers/:id/tickets', async (req, res) => {
             ticketBookings.forEach(b => {
                 const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
                 const count = Array.isArray(seats) ? seats.length : (seats ? 1 : 0);
-                
+
                 // We only count confirmed as reserved for the "free seats" calculation
                 if (b.status === 'confirmed') {
                     reservedSeats.push(...(Array.isArray(seats) ? seats : [seats]));
@@ -718,9 +718,9 @@ router.get('/polls/settings', adminAuth, async (req, res) => {
             .select('*')
             .eq('id', 1)
             .maybeSingle();
-        
+
         if (error) throw error;
-        
+
         // Fallback seed just in case
         if (!data) {
             const defaultSettings = {
@@ -733,7 +733,7 @@ router.get('/polls/settings', adminAuth, async (req, res) => {
             await supabase.from('poll_settings').insert([defaultSettings]);
             return res.json(defaultSettings);
         }
-        
+
         res.json(data);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -800,14 +800,17 @@ router.post('/polls/trigger', adminAuth, async (req, res) => {
             await supabase.from('poll_settings').insert([settings]);
         }
 
-        // 2. Fetch pending bookings
+        // 2. Fetch only pending bookings older than 30 minutes
+        const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+
         const { data: bookings, error: bookingsErr } = await supabase
             .from('bus_ticket_bookings')
             .select(`
-                id, passenger_id, phone, status, total_price,
-                users:passenger_id (id, name, telegram_id)
-            `)
-            .eq('status', 'pending_payment');
+        id, passenger_id, phone, status, total_price,
+        users:passenger_id (id, name, telegram_id)
+    `)
+            .eq('status', 'pending_payment')
+            .lte('created_at', cutoff);
         if (bookingsErr) throw bookingsErr;
 
         if (!bookings || bookings.length === 0) {
@@ -842,11 +845,35 @@ router.post('/polls/trigger', adminAuth, async (req, res) => {
         let failCount = 0;
 
         for (const b of eligibleBookings) {
+            // Re-check booking status immediately before sending the poll
+            const { data: currentBooking, error: currentBookingErr } = await supabase
+                .from('bus_ticket_bookings')
+                .select('id, status')
+                .eq('id', b.id)
+                .maybeSingle();
+
+            if (currentBookingErr) {
+                console.error(`Error re-checking booking ${b.id}: ${currentBookingErr.message}`);
+                failCount++;
+                continue;
+            }
+
+            // Do not send the poll if the booking is no longer awaiting payment
+            if (!currentBooking || currentBooking.status !== 'pending_payment') {
+                continue;
+            }
+
             const tgId = b.users.telegram_id;
+
             const result = await telegramBot.sendPoll(
                 tgId,
                 settings.question,
-                [settings.option1, settings.option2, settings.option3, 'Ваш вариант (напишите, что именно мешает)']
+                [
+                    settings.option1,
+                    settings.option2,
+                    settings.option3,
+                    'Ваш вариант (напишите, что именно мешает)'
+                ]
             );
 
             if (result && result.ok && result.result) {

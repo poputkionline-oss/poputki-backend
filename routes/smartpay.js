@@ -247,7 +247,7 @@ router.post('/create-invoice', async (req, res) => {
                 order_id: paymentOrderId,
                 return_url: returnUrl,
                 lifetime: 1800,
-                customer_phone: phone ? phone.replace(/^\+992/, '').replace(/\D/g, '') : undefined,
+                customer_phone: phone ? phone.replace(/\D/g, '').replace(/^992/, '') : undefined,
                 qty: seat_numbers.length,
                 unit_price: Math.round(ticket.price * feePercent / 100),  // Use dynamic fee percentage from DB
                 name: customerName || undefined
