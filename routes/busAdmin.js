@@ -398,16 +398,153 @@ router.delete('/tickets/:id', async (req, res) => {
 
         if (error) throw error;
 
-        // Cleanup cloudinary
+        // Cleanup Cloudinary only if no other ticket is referencing this photo public_id (FAIL-CLOSED)
         for (const photo of photos) {
             if (photo && photo.public_id) {
-                await deleteFromCloudinary(photo.public_id);
+                try {
+                    const { data: otherTickets, error: checkErr } = await supabase
+                        .from('bus_tickets')
+                        .select('id')
+                        .neq('id', id)
+                        .contains('photos', [{ public_id: photo.public_id }])
+                        .limit(1);
+
+                    // Fail-closed: only delete from Cloudinary if check succeeded and definitively returned 0 records
+                    if (!checkErr && Array.isArray(otherTickets) && otherTickets.length === 0) {
+                        await deleteFromCloudinary(photo.public_id).catch(e => console.error('[Cloudinary] Destroy error:', e));
+                    }
+                } catch (e) {
+                    console.error('[Cloudinary Photo Cleanup] Reference check failed (fail-closed, asset preserved):', e);
+                }
             }
         }
 
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/tickets/{id}/duplicate:
+ *   post:
+ *     summary: Quick duplicate or reverse a bus ticket on a new date
+ *     tags: [Bus Admin]
+ */
+router.post('/tickets/:id/duplicate', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot create/duplicate tickets
+    if (req.carrier.role === 'driver' || req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для создания и дублирования рейсов' });
+    }
+
+    const { id } = req.params;
+    const { 
+        departure_date, 
+        departure_time, 
+        arrival_date, 
+        arrival_time, 
+        price, 
+        premium_price,
+        is_reverse 
+    } = req.body;
+
+    if (!departure_date) {
+        return res.status(400).json({ error: 'Укажите дату отправления нового рейса' });
+    }
+
+    // Ownership verification
+    const hasAccess = await verifyTicketAccess(req.carrier, id);
+    if (!hasAccess) {
+        return res.status(403).json({ error: 'Доступ запрещен: исходный рейс не принадлежит вашему аккаунту' });
+    }
+
+    try {
+        const { data: sourceTicket, error: sErr } = await supabase
+            .from('bus_tickets')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (sErr || !sourceTicket) {
+            return res.status(404).json({ error: 'Исходный рейс не найден' });
+        }
+
+        let fromCity = sourceTicket.from_city;
+        let fromAddress = sourceTicket.from_address;
+        let toCity = sourceTicket.to_city;
+        let toAddress = sourceTicket.to_address;
+        
+        // Deep clone intermediate stops to guarantee source immutability
+        let rawStops = sourceTicket.intermediate_stops || [];
+        if (typeof rawStops === 'string') {
+            try { rawStops = JSON.parse(rawStops); } catch(e) { rawStops = []; }
+        }
+        let stops = JSON.parse(JSON.stringify(rawStops));
+
+        // Deep clone photos to guarantee source immutability
+        let rawPhotos = sourceTicket.photos || [];
+        if (typeof rawPhotos === 'string') {
+            try { rawPhotos = JSON.parse(rawPhotos); } catch(e) { rawPhotos = []; }
+        }
+        const clonedPhotos = JSON.parse(JSON.stringify(rawPhotos));
+
+        // If reverse trip requested, swap origin/destination and reverse stops
+        if (is_reverse) {
+            fromCity = sourceTicket.to_city;
+            fromAddress = sourceTicket.to_address;
+            toCity = sourceTicket.from_city;
+            toAddress = sourceTicket.from_address;
+            stops = stops.reverse().map(s => ({
+                city: s.city,
+                address: s.address || '',
+                time: '' // Direction-dependent time is strictly cleared for safety
+            }));
+        }
+
+        const newTicketData = {
+            operator_id: req.carrier.carrier_id, // Trusted from JWT
+            transport_company: sourceTicket.transport_company,
+            from_city: fromCity,
+            from_address: fromAddress,
+            to_city: toCity,
+            to_address: toAddress,
+            departure_date: departure_date,
+            departure_time: departure_time || sourceTicket.departure_time,
+            arrival_date: arrival_date || null,
+            arrival_time: arrival_time || null,
+            duration_minutes: sourceTicket.duration_minutes || null,
+            price: price !== undefined && price !== null ? Number(price) : sourceTicket.price,
+            premium_price: premium_price !== undefined ? (premium_price ? Number(premium_price) : null) : sourceTicket.premium_price,
+            total_seats: sourceTicket.total_seats || 53,
+            floor1_seats: sourceTicket.floor1_seats || null,
+            floor2_seats: sourceTicket.floor2_seats || null,
+            reserved_seats: [], // STRICT SAFETY: Always reset reserved seats
+            status: 'active',
+            bus_type: sourceTicket.bus_type || 'single',
+            passenger_comments: sourceTicket.passenger_comments || '',
+            intermediate_stops: stops,
+            photos: clonedPhotos
+        };
+
+        const { data: newTicket, error: insertErr } = await supabase
+            .from('bus_tickets')
+            .insert([newTicketData])
+            .select('id')
+            .single();
+
+        if (insertErr) throw insertErr;
+
+        res.status(201).json({
+            success: true,
+            id: newTicket.id,
+            message: is_reverse ? 'Обратный рейс успешно создан' : 'Рейс успешно продублирован',
+            ticket: { ...newTicketData, id: newTicket.id }
+        });
+
+    } catch (err) {
+        console.error('[BusAdmin Duplicate Ticket] Error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка создания копии рейса' });
     }
 });
 
