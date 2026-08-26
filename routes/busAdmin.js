@@ -140,8 +140,19 @@ router.get('/tickets', async (req, res) => {
             return res.json([]);
         }
 
+        // Filter tickets if role is driver
+        let filteredTickets = tickets;
+        if (req.carrier.role === 'driver') {
+            const assigned = Array.isArray(req.carrier.assignedTicketIds) ? req.carrier.assignedTicketIds : [];
+            filteredTickets = tickets.filter(t => assigned.includes(t.id));
+        }
+
+        if (filteredTickets.length === 0) {
+            return res.json([]);
+        }
+
         // Fetch all relevant bookings to calculate accurate reserved seats (including pending_payment)
-        const ticketIds = tickets.map(t => t.id);
+        const ticketIds = filteredTickets.map(t => t.id);
         const { data: allBookings, error: bErr } = await supabase
             .from('bus_ticket_bookings')
             .select('bus_ticket_id, seat_numbers, status')
@@ -310,6 +321,11 @@ router.get('/bookings', async (req, res) => {
  *     tags: [Bus Admin]
  */
 router.put('/tickets/:id', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot edit tickets
+    if (req.carrier.role === 'driver' || req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для изменения рейсов' });
+    }
+
     const { id } = req.params;
     const updateData = req.body;
     
@@ -378,6 +394,11 @@ router.put('/tickets/:id', async (req, res) => {
  *     tags: [Bus Admin]
  */
 router.delete('/tickets/:id', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot delete tickets
+    if (req.carrier.role === 'driver' || req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для удаления рейсов' });
+    }
+
     const { id } = req.params;
 
     // Strict ownership verification
@@ -556,6 +577,11 @@ router.post('/tickets/:id/duplicate', async (req, res) => {
  *     tags: [Bus Admin]
  */
 router.post('/bookings/manual', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot create manual bookings
+    if (req.carrier.role === 'driver' || req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для ручного бронирования' });
+    }
+
     const { bus_ticket_id, seat_numbers, passengers_data, phone, passenger_name, pickup_city, drop_off_city } = req.body;
 
     if (!bus_ticket_id) {
@@ -645,6 +671,11 @@ router.post('/bookings/manual', async (req, res) => {
  *     tags: [Bus Admin]
  */
 router.put('/bookings/:id', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot edit bookings
+    if (req.carrier.role === 'driver' || req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для изменения бронирования' });
+    }
+
     const { id } = req.params;
     const { seat_numbers, passengers_data, phone, passenger_name, pickup_city, drop_off_city } = req.body;
 
@@ -746,6 +777,11 @@ router.put('/bookings/:id', async (req, res) => {
  *     tags: [Bus Admin]
  */
 router.delete('/bookings/:id', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot delete bookings
+    if (req.carrier.role === 'driver' || req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для удаления бронирования' });
+    }
+
     const { id } = req.params;
 
     try {
@@ -807,6 +843,11 @@ router.delete('/bookings/:id', async (req, res) => {
  *     tags: [Bus Admin]
  */
 router.patch('/bookings/:id/boarding', async (req, res) => {
+    // Security Gate: Accountants cannot mutate boarding
+    if (req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для отметки посадки' });
+    }
+
     const { id } = req.params;
     const { boarding_status } = req.body;
 
@@ -1375,4 +1416,345 @@ router.get('/finance', async (req, res) => {
     }
 });
 
+/**
+ * =========================================================================
+ * PHASE P1.1: TEAM MANAGEMENT & ROLE ASSIGNMENTS
+ * =========================================================================
+ */
+
+/**
+ * @swagger
+ * /api/bus-admin/members:
+ *   get:
+ *     summary: List team members for the authenticated carrier (Owner only)
+ *     tags: [Bus Admin Team]
+ */
+router.get('/members', async (req, res) => {
+    // Only owner can view and manage team members
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании имеет доступ к списку сотрудников' });
+    }
+
+    const carrierId = req.carrier.carrier_id;
+
+    try {
+        const { data: members, error } = await supabase
+            .from('carrier_members')
+            .select(`
+                id,
+                carrier_id,
+                user_id,
+                role,
+                assigned_ticket_ids,
+                is_active,
+                created_at,
+                users (
+                    id,
+                    name,
+                    phone
+                )
+            `)
+            .eq('carrier_id', carrierId)
+            .order('created_at', { ascending: true });
+
+        if (error) throw error;
+
+        const formattedMembers = (members || []).map(m => ({
+            id: m.id,
+            carrier_id: m.carrier_id,
+            user_id: m.user_id,
+            role: m.role,
+            assigned_ticket_ids: m.assigned_ticket_ids || [],
+            is_active: m.is_active,
+            created_at: m.created_at,
+            name: m.users?.name || 'Сотрудник',
+            phone: m.users?.phone || ''
+        }));
+
+        res.json({
+            owner: {
+                user_id: req.carrier.user_id,
+                name: req.carrier.name,
+                phone: req.carrier.phone,
+                role: 'owner'
+            },
+            members: formattedMembers
+        });
+    } catch (err) {
+        console.error('[BusAdmin Team] Error fetching members:', err);
+        res.status(500).json({ error: err.message || 'Ошибка загрузки списка сотрудников' });
+    }
+});
+
+/**
+ * Validate and sanitize driver assigned ticket IDs (Strict Carrier Tenant Isolation)
+ */
+async function sanitizeAssignedTickets(carrierId, ticketIds) {
+    if (!Array.isArray(ticketIds) || ticketIds.length === 0) return [];
+    const numericIds = [...new Set(ticketIds.map(id => parseInt(id, 10)).filter(id => !isNaN(id) && id > 0))];
+    if (numericIds.length === 0) return [];
+
+    const { data: validTickets, error } = await supabase
+        .from('bus_tickets')
+        .select('id')
+        .eq('operator_id', carrierId)
+        .in('id', numericIds);
+
+    if (error || !validTickets) return [];
+    return validTickets.map(t => t.id);
+}
+
+/**
+ * @swagger
+ * /api/bus-admin/members:
+ *   post:
+ *     summary: Add a new member to the carrier team (Owner only)
+ *     tags: [Bus Admin Team]
+ */
+router.post('/members', async (req, res) => {
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании может добавлять сотрудников' });
+    }
+
+    const carrierId = req.carrier.carrier_id;
+    const { phone, role, assigned_ticket_ids } = req.body;
+
+    if (!phone || !phone.trim()) {
+        return res.status(400).json({ error: 'Укажите номер телефона сотрудника' });
+    }
+
+    const validRoles = ['dispatcher', 'driver', 'accountant'];
+    if (!validRoles.includes(role)) {
+        return res.status(400).json({ error: 'Недопустимая роль. Допустимы: dispatcher, driver, accountant' });
+    }
+
+    const normalizedPhone = phone.trim().replace(/\s+/g, '');
+
+    try {
+        // 1. Find existing user by phone
+        let { data: user, error: uErr } = await supabase
+            .from('users')
+            .select('id, name, phone, role, is_blocked')
+            .eq('phone', normalizedPhone)
+            .maybeSingle();
+
+        if (uErr) throw uErr;
+
+        // Security Gate: NEVER auto-create accounts with default/predictable passwords.
+        if (!user) {
+            return res.status(404).json({
+                code: 'USER_NOT_REGISTERED',
+                error: 'Пользователь с таким номером еще не зарегистрирован в POPUTKI.ONLINE. Попросите сотрудника сначала пройти регистрацию на сайте или в Telegram-боте, после чего добавьте его в команду.'
+            });
+        }
+
+        // Prevent adding owner to their own team as a sub-member
+        if (user.id === req.carrier.user_id) {
+            return res.status(400).json({ error: 'Владелец компании уже обладает полным доступом и не может быть добавлен как сотрудник' });
+        }
+
+        // 2. Check if already a member of this carrier
+        const { data: existingMember } = await supabase
+            .from('carrier_members')
+            .select('id, role, is_active')
+            .eq('carrier_id', carrierId)
+            .eq('user_id', user.id)
+            .maybeSingle();
+
+        if (existingMember) {
+            return res.status(409).json({ error: 'Пользователь с этим номером уже добавлен в команду перевозчика' });
+        }
+
+        // 3. Sanitize driver ticket assignments against current carrier trips
+        const validAssignedTickets = role === 'driver' 
+            ? await sanitizeAssignedTickets(carrierId, assigned_ticket_ids) 
+            : [];
+
+        // 4. Insert carrier_member (DO NOT mutate user profile or password)
+        const memberPayload = {
+            carrier_id: carrierId,
+            user_id: user.id,
+            role: role,
+            assigned_ticket_ids: validAssignedTickets,
+            is_active: true
+        };
+
+        const { data: newMember, error: mErr } = await supabase
+            .from('carrier_members')
+            .insert([memberPayload])
+            .select('id, carrier_id, user_id, role, assigned_ticket_ids, is_active, created_at')
+            .single();
+
+        if (mErr) throw mErr;
+
+        res.status(201).json({
+            success: true,
+            member: {
+                ...newMember,
+                name: user.name,
+                phone: user.phone
+            }
+        });
+    } catch (err) {
+        console.error('[BusAdmin Team] Error adding member:', err);
+        res.status(500).json({ error: err.message || 'Ошибка при добавлении сотрудника' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/members/{id}:
+ *   patch:
+ *     summary: Update member role, status, or driver ticket assignments (Owner only)
+ *     tags: [Bus Admin Team]
+ */
+router.patch('/members/:id', async (req, res) => {
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании может редактировать сотрудников' });
+    }
+
+    const { id } = req.params;
+    const carrierId = req.carrier.carrier_id;
+    const { role, assigned_ticket_ids, is_active } = req.body;
+
+    try {
+        // Ownership verification
+        const { data: member, error: mErr } = await supabase
+            .from('carrier_members')
+            .select('*')
+            .eq('id', id)
+            .eq('carrier_id', carrierId)
+            .single();
+
+        if (mErr || !member) {
+            return res.status(404).json({ error: 'Сотрудник не найден в вашей компании' });
+        }
+
+        const updateData = {};
+        const effectiveRole = role !== undefined ? role : member.role;
+
+        if (role !== undefined) {
+            const validRoles = ['dispatcher', 'driver', 'accountant'];
+            if (!validRoles.includes(role)) {
+                return res.status(400).json({ error: 'Недопустимая роль. Допустимы: dispatcher, driver, accountant' });
+            }
+            updateData.role = role;
+            if (role !== 'driver') {
+                updateData.assigned_ticket_ids = [];
+            }
+        }
+
+        if (assigned_ticket_ids !== undefined) {
+            if (effectiveRole === 'driver') {
+                updateData.assigned_ticket_ids = await sanitizeAssignedTickets(carrierId, assigned_ticket_ids);
+            } else {
+                updateData.assigned_ticket_ids = [];
+            }
+        }
+
+        if (is_active !== undefined) {
+            updateData.is_active = Boolean(is_active);
+        }
+
+        const { data: updatedMember, error: uErr } = await supabase
+            .from('carrier_members')
+            .update(updateData)
+            .eq('id', id)
+            .select('*')
+            .single();
+
+        if (uErr) throw uErr;
+
+        res.json({ success: true, member: updatedMember });
+    } catch (err) {
+        console.error('[BusAdmin Team] Error updating member:', err);
+        res.status(500).json({ error: err.message || 'Ошибка обновления данных сотрудника' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/members/{id}/status:
+ *   patch:
+ *     summary: Quick toggle active status for a team member (Owner only)
+ *     tags: [Bus Admin Team]
+ */
+router.patch('/members/:id/status', async (req, res) => {
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании может активировать или отключать сотрудников' });
+    }
+
+    const { id } = req.params;
+    const carrierId = req.carrier.carrier_id;
+    const { is_active } = req.body;
+
+    try {
+        const { data: member, error: mErr } = await supabase
+            .from('carrier_members')
+            .select('id, user_id, carrier_id')
+            .eq('id', id)
+            .eq('carrier_id', carrierId)
+            .single();
+
+        if (mErr || !member) {
+            return res.status(404).json({ error: 'Сотрудник не найден в вашей компании' });
+        }
+
+        const { error: uErr } = await supabase
+            .from('carrier_members')
+            .update({ is_active: Boolean(is_active) })
+            .eq('id', id);
+
+        if (uErr) throw uErr;
+
+        res.json({ success: true, is_active: Boolean(is_active) });
+    } catch (err) {
+        console.error('[BusAdmin Team] Error toggling status:', err);
+        res.status(500).json({ error: err.message || 'Ошибка изменения статуса сотрудника' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/members/{id}:
+ *   delete:
+ *     summary: Soft-deactivate a team member (Owner only, preserves history)
+ *     tags: [Bus Admin Team]
+ */
+router.delete('/members/:id', async (req, res) => {
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании может отключать сотрудников' });
+    }
+
+    const { id } = req.params;
+    const carrierId = req.carrier.carrier_id;
+
+    try {
+        const { data: member, error: mErr } = await supabase
+            .from('carrier_members')
+            .select('id')
+            .eq('id', id)
+            .eq('carrier_id', carrierId)
+            .single();
+
+        if (mErr || !member) {
+            return res.status(404).json({ error: 'Сотрудник не найден в вашей компании' });
+        }
+
+        // Soft-deactivate to preserve historical integrity (referential safety)
+        const { error: uErr } = await supabase
+            .from('carrier_members')
+            .update({ is_active: false })
+            .eq('id', id);
+
+        if (uErr) throw uErr;
+
+        res.json({ success: true, message: 'Доступ сотрудника отключен' });
+    } catch (err) {
+        console.error('[BusAdmin Team] Error deactivating member:', err);
+        res.status(500).json({ error: err.message || 'Ошибка при отключении сотрудника' });
+    }
+});
+
 module.exports = router;
+
