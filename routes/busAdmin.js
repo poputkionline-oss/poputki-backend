@@ -220,19 +220,30 @@ router.get('/bookings', async (req, res) => {
             return res.json([]);
         }
 
-        const ticketIds = tickets.map(t => t.id);
+        const ticketIds = req.query.ticket_id 
+            ? [parseInt(req.query.ticket_id, 10)]
+            : tickets.map(t => t.id);
 
         // Get bookings for these tickets
-        const { data: bookings, error: bErr } = await supabase
+        let query = supabase
             .from('bus_ticket_bookings')
             .select(`
                 id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, phone, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
                 boarding_status, boarded_at, boarded_by_user_id,
+                channel, source_type, source_id, created_by_user_id,
+                commission_rate, commission_amount, carrier_amount,
                 users:passenger_id (name, phone)
             `)
-            .in('bus_ticket_id', ticketIds)
-            .eq('status', 'confirmed')
-            .order('created_at', { ascending: false });
+            .in('bus_ticket_id', ticketIds);
+
+        if (req.query.status) {
+            query = query.eq('status', req.query.status);
+        } else {
+            // Default: exclude cancelled, return confirmed and pending
+            query = query.neq('status', 'cancelled');
+        }
+
+        const { data: bookings, error: bErr } = await query.order('created_at', { ascending: false });
 
         if (bErr) {
             console.error('[BusAdmin] Error fetching bookings:', bErr);
@@ -253,6 +264,15 @@ router.get('/bookings', async (req, res) => {
                 parsedPData = typeof b.passengers_data === 'string' ? JSON.parse(b.passengers_data || '[]') : (b.passengers_data || []);
             } catch (e) { console.error(`Error parsing passengers_data for booking ${b.id}`, e); }
 
+            const isDriver = req.carrier.role === 'driver';
+            const channel = b.channel || 'web';
+            const sourceType = b.source_type || (channel === 'manual' ? 'manual' : 'platform');
+            const isManual = channel === 'manual' || sourceType === 'manual' || sourceType === 'carrier';
+            const totalPrice = Number(b.total_price || 0);
+            const commRate = Number(b.commission_rate ?? (isManual ? 0 : 10));
+            const commAmount = Number(b.commission_amount ?? (isManual ? 0 : Math.round(totalPrice * (commRate / 100))));
+            const carrierAmount = Number(b.carrier_amount ?? Math.max(0, totalPrice - commAmount));
+
             return {
                 ...b,
                 passenger_name: b.passenger_name || b.users?.name || '—',
@@ -262,6 +282,14 @@ router.get('/bookings', async (req, res) => {
                 boarding_status: b.boarding_status || 'pending_boarding',
                 boarded_at: b.boarded_at || null,
                 boarded_by_user_id: b.boarded_by_user_id || null,
+                channel: channel,
+                source_type: sourceType,
+                source_id: b.source_id || null,
+                // Security Projection: Drivers do NOT see financial data
+                commission_rate: isDriver ? null : commRate,
+                commission_amount: isDriver ? null : commAmount,
+                carrier_amount: isDriver ? null : carrierAmount,
+                total_price: isDriver ? null : totalPrice,
                 ticket_context: ticket ? `${ticket.from_city} -> ${ticket.to_city} (${ticket.departure_date})` : 'Unknown'
             };
         });
@@ -687,6 +715,180 @@ router.patch('/bookings/:id/boarding', async (req, res) => {
     } catch (err) {
         console.error('[BusAdmin Boarding] Fatal error:', err);
         res.status(500).json({ error: err.message || 'Ошибка обновления статуса посадки' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/tickets/{ticketId}/summary:
+ *   get:
+ *     summary: Get trip financial and operational summary for a specific bus ticket
+ *     tags: [Bus Admin]
+ */
+router.get('/tickets/:ticketId/summary', async (req, res) => {
+    const { ticketId } = req.params;
+
+    // Security Gate: Drivers MUST NOT access financial summary
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ 
+            error: 'Доступ к финансовым данным рейса запрещен для роли водителя' 
+        });
+    }
+
+    try {
+        // 1. Fetch ticket and verify carrier ownership / dispatcher access
+        const { data: ticket, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select('*')
+            .eq('id', ticketId)
+            .maybeSingle();
+
+        if (tErr || !ticket) {
+            return res.status(404).json({ error: 'Рейс не найден' });
+        }
+
+        const hasAccess = await verifyTicketAccess(req.carrier, ticketId);
+        if (!hasAccess) {
+            return res.status(403).json({ 
+                error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' 
+            });
+        }
+
+        // 2. Fetch all bookings on this ticket
+        const { data: bookings, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select(`
+                id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, phone, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
+                boarding_status, boarded_at, boarded_by_user_id,
+                channel, source_type, source_id, created_by_user_id,
+                commission_rate, commission_amount, carrier_amount
+            `)
+            .eq('bus_ticket_id', ticketId);
+
+        if (bErr) {
+            console.error('[BusAdmin Ticket Summary] Error fetching bookings:', bErr);
+            throw bErr;
+        }
+
+        const capacity = ticket.total_seats || 53;
+        const allBookings = bookings || [];
+
+        // Count unique booked seats from non-cancelled bookings
+        const activeBookings = allBookings.filter(b => b.status !== 'cancelled');
+        const uniqueReservedSeats = new Set();
+
+        activeBookings.forEach(b => {
+            let seats = [];
+            try {
+                seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                if (!Array.isArray(seats)) seats = seats ? [seats] : [];
+            } catch(e) { }
+            seats.forEach(s => uniqueReservedSeats.add(s));
+        });
+
+        const bookedSeatsCount = uniqueReservedSeats.size;
+        const freeSeatsCount = Math.max(0, capacity - bookedSeatsCount);
+        const fillRate = capacity > 0 ? parseFloat(((bookedSeatsCount / capacity) * 100).toFixed(1)) : 0;
+
+        // Categorize bookings
+        const confirmedBookings = allBookings.filter(b => b.status === 'confirmed');
+        const pendingBookings = allBookings.filter(b => b.status === 'pending_payment');
+        const cancelledBookings = allBookings.filter(b => b.status === 'cancelled');
+
+        const onlineBookings = confirmedBookings.filter(b => b.channel !== 'manual' && b.source_type !== 'manual');
+        const manualBookings = confirmedBookings.filter(b => b.channel === 'manual' || b.source_type === 'manual' || b.source_type === 'carrier');
+
+        // Financial aggregations based on historical snapshots
+        let paidAmount = 0;
+        let serviceCommission = 0;
+        let carrierAmount = 0;
+        let unpaidAmount = 0;
+
+        // 1. Confirmed bookings (actual completed payments / confirmed manual)
+        confirmedBookings.forEach(b => {
+            const totalPrice = Number(b.total_price || 0);
+            const isManual = b.channel === 'manual' || b.source_type === 'manual' || b.source_type === 'carrier';
+            
+            paidAmount += totalPrice;
+
+            if (isManual) {
+                // 0% platform fee for carrier's manual bookings
+                carrierAmount += totalPrice;
+            } else {
+                // Online booking: use snapshot commission_amount or calculate from snapshot commission_rate
+                const commRate = Number(b.commission_rate ?? 10);
+                const comm = Number(b.commission_amount > 0 ? b.commission_amount : Math.round(totalPrice * (commRate / 100)));
+                serviceCommission += comm;
+                carrierAmount += Math.max(0, totalPrice - comm);
+            }
+        });
+
+        // 2. Pending payment bookings (money awaiting payment)
+        pendingBookings.forEach(b => {
+            unpaidAmount += Number(b.total_price || 0);
+        });
+
+        // 3. Gross amount represents confirmed sales (or total expected)
+        const grossAmount = paidAmount;
+
+        // Boarding counters across confirmed passengers
+        let boardingPending = 0;
+        let boardingBoarded = 0;
+        let boardingNoShow = 0;
+
+        confirmedBookings.forEach(b => {
+            const count = b.passenger_count || (Array.isArray(b.passengers_data) ? b.passengers_data.length : 1) || 1;
+            const bStatus = b.boarding_status || 'pending_boarding';
+            if (bStatus === 'boarded') {
+                boardingBoarded += count;
+            } else if (bStatus === 'no_show') {
+                boardingNoShow += count;
+            } else {
+                boardingPending += count;
+            }
+        });
+
+        const totalPassengers = boardingPending + boardingBoarded + boardingNoShow;
+
+        res.json({
+            ticket_id: ticket.id,
+            from_city: ticket.from_city,
+            to_city: ticket.to_city,
+            departure_date: ticket.departure_date,
+            departure_time: ticket.departure_time,
+            price: ticket.price,
+            currency: 'сомони',
+
+            capacity: capacity,
+            booked_seats: bookedSeatsCount,
+            free_seats: freeSeatsCount,
+            fill_rate: fillRate,
+
+            bookings_total: allBookings.length,
+            confirmed_bookings: confirmedBookings.length,
+            pending_bookings: pendingBookings.length,
+            cancelled_bookings: cancelledBookings.length,
+
+            online_bookings: onlineBookings.length,
+            manual_bookings: manualBookings.length,
+
+            gross_amount: grossAmount,
+            paid_amount: paidAmount,
+            unpaid_amount: unpaidAmount,
+
+            service_commission: serviceCommission,
+            carrier_amount: carrierAmount,
+
+            boarding: {
+                total_passengers: totalPassengers,
+                pending: boardingPending,
+                boarded: boardingBoarded,
+                no_show: boardingNoShow
+            }
+        });
+    } catch (err) {
+        console.error('[BusAdmin Ticket Summary] Fatal error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка получения финансовой сводки рейса' });
     }
 });
 
