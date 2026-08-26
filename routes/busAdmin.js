@@ -227,6 +227,7 @@ router.get('/bookings', async (req, res) => {
             .from('bus_ticket_bookings')
             .select(`
                 id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, phone, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
+                boarding_status, boarded_at, boarded_by_user_id,
                 users:passenger_id (name, phone)
             `)
             .in('bus_ticket_id', ticketIds)
@@ -258,6 +259,9 @@ router.get('/bookings', async (req, res) => {
                 passenger_phone: b.users?.phone || b.phone || '—',
                 seat_numbers: parsedSeats,
                 passengers_data: parsedPData,
+                boarding_status: b.boarding_status || 'pending_boarding',
+                boarded_at: b.boarded_at || null,
+                boarded_by_user_id: b.boarded_by_user_id || null,
                 ticket_context: ticket ? `${ticket.from_city} -> ${ticket.to_city} (${ticket.departure_date})` : 'Unknown'
             };
         });
@@ -588,6 +592,101 @@ router.delete('/bookings/:id', async (req, res) => {
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/bookings/{id}/boarding:
+ *   patch:
+ *     summary: Update passenger boarding status (pending_boarding, boarded, no_show)
+ *     tags: [Bus Admin]
+ */
+router.patch('/bookings/:id/boarding', async (req, res) => {
+    const { id } = req.params;
+    const { boarding_status } = req.body;
+
+    const allowedStatuses = ['pending_boarding', 'boarded', 'no_show'];
+    if (!boarding_status || !allowedStatuses.includes(boarding_status)) {
+        return res.status(400).json({ 
+            error: 'Недопустимый статус посадки. Допустимы: pending_boarding, boarded, no_show' 
+        });
+    }
+
+    try {
+        // 1. Fetch booking to verify ticket ownership and access
+        const { data: booking, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, bus_ticket_id, boarding_status, status')
+            .eq('id', id)
+            .maybeSingle();
+
+        if (bErr || !booking) {
+            return res.status(404).json({ error: 'Бронирование не найдено' });
+        }
+
+        const ticketId = booking.bus_ticket_id;
+
+        // 2. Strict tenant isolation & role access verification (handles owners, dispatchers, and assigned drivers)
+        const hasAccess = await verifyTicketAccess(req.carrier, ticketId);
+        if (!hasAccess) {
+            return res.status(403).json({ 
+                error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика или не назначен вам' 
+            });
+        }
+
+        const oldStatus = booking.boarding_status || 'pending_boarding';
+        const authenticatedUserId = req.carrier.user_id;
+        const now = new Date().toISOString();
+
+        // 3. Prepare payload according to status model
+        const updatePayload = {
+            boarding_status: boarding_status,
+            boarded_at: boarding_status === 'boarded' ? now : null,
+            boarded_by_user_id: authenticatedUserId
+        };
+
+        const { data: updatedBooking, error: uErr } = await supabase
+            .from('bus_ticket_bookings')
+            .update(updatePayload)
+            .eq('id', id)
+            .select('id, bus_ticket_id, boarding_status, boarded_at, boarded_by_user_id')
+            .single();
+
+        if (uErr) {
+            console.error('[BusAdmin Boarding] Update error:', uErr);
+            throw uErr;
+        }
+
+        // 4. Log change in booking_audit_logs table
+        try {
+            await supabase
+                .from('booking_audit_logs')
+                .insert([{
+                    booking_id: booking.id,
+                    action: 'boarding_status_update',
+                    old_status: oldStatus,
+                    new_status: boarding_status,
+                    performed_by_user_id: authenticatedUserId,
+                    details: {
+                        previous_boarding_status: oldStatus,
+                        new_boarding_status: boarding_status,
+                        boarded_at: updatePayload.boarded_at,
+                        carrier_id: req.carrier.carrier_id,
+                        carrier_role: req.carrier.role
+                    }
+                }]);
+        } catch (auditErr) {
+            console.error('[BusAdmin Boarding] Audit log insertion error (non-fatal):', auditErr);
+        }
+
+        res.json({
+            success: true,
+            booking: updatedBooking
+        });
+    } catch (err) {
+        console.error('[BusAdmin Boarding] Fatal error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка обновления статуса посадки' });
     }
 });
 

@@ -153,9 +153,15 @@ async function verifyTicketAccess(carrier, ticketId) {
         return false;
     }
 
-    // If role is agent, check if assigned to this ticket
-    if (carrier.role === 'agent' && carrier.assignedTicketIds?.length > 0) {
-        return carrier.assignedTicketIds.includes(parseInt(ticketId, 10));
+    // If role is agent or driver, verify ticket assignment
+    if (['agent', 'driver'].includes(carrier.role)) {
+        if (Array.isArray(carrier.assignedTicketIds) && carrier.assignedTicketIds.length > 0) {
+            return carrier.assignedTicketIds.includes(parseInt(ticketId, 10));
+        }
+        // If driver has no assigned tickets, reject access to unassigned tickets
+        if (carrier.role === 'driver') {
+            return false;
+        }
     }
 
     return true;
