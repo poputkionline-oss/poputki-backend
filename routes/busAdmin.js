@@ -445,7 +445,21 @@ router.post('/bookings/manual', async (req, res) => {
         const conflict = (seat_numbers || []).some(s => reserved.includes(s));
         if (conflict) return res.status(400).json({ error: 'Одно или несколько мест уже заняты' });
 
-        // Insert booking with authenticated carrier as manager
+        // Calculate full fare matching online booking pricing logic (including premium seats)
+        const premiumSeatNums = ticket.bus_type === 'double' ? [1, 2, 3, 4, 69, 70, 71, 72, 73, 74, 75, 76] : [];
+        const premiumPrice = Number(ticket.premium_price || ticket.price || 0);
+        const standardPrice = Number(ticket.price || 0);
+
+        let manualTotalPrice = 0;
+        for (const seatNum of (seat_numbers || [])) {
+            manualTotalPrice += premiumSeatNums.includes(Number(seatNum)) ? premiumPrice : standardPrice;
+        }
+
+        const commissionRate = 0;
+        const commissionAmount = 0;
+        const carrierAmount = manualTotalPrice;
+
+        // Insert booking with authenticated carrier as manager and complete financial snapshot
         const { data: booking, error: bErr } = await supabase
             .from('bus_ticket_bookings')
             .insert([{
@@ -456,7 +470,10 @@ router.post('/bookings/manual', async (req, res) => {
                 passengers_data,
                 phone,
                 status: 'confirmed',
-                total_price: 0, // Manual booking
+                total_price: manualTotalPrice,
+                commission_rate: commissionRate,
+                commission_amount: commissionAmount,
+                carrier_amount: carrierAmount,
                 passenger_name: passenger_name,
                 pickup_city,
                 drop_off_city,
@@ -512,16 +529,18 @@ router.put('/bookings/:id', async (req, res) => {
             return res.status(403).json({ error: 'Доступ запрещен: бронирование принадлежит рейсу другого перевозчика' });
         }
 
+        const { data: ticket, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select('*')
+            .eq('id', ticketId)
+            .single();
+
+        if (tErr) throw tErr;
+
+        const seatsChanged = JSON.stringify(oldBooking.seat_numbers) !== JSON.stringify(seat_numbers);
+
         // 2. If seats changed, check for conflicts and update ticket.reserved_seats
-        if (JSON.stringify(oldBooking.seat_numbers) !== JSON.stringify(seat_numbers)) {
-            const { data: ticket, error: tErr } = await supabase
-                .from('bus_tickets')
-                .select('reserved_seats')
-                .eq('id', ticketId)
-                .single();
-
-            if (tErr) throw tErr;
-
+        if (seatsChanged) {
             const reserved = typeof ticket.reserved_seats === 'string' ? JSON.parse(ticket.reserved_seats || '[]') : (ticket.reserved_seats || []);
             
             // Remove old seats from the reserved list
@@ -540,18 +559,38 @@ router.put('/bookings/:id', async (req, res) => {
                 .eq('id', ticketId);
         }
 
+        const updatePayload = {
+            seat_numbers,
+            passenger_count: (seat_numbers || []).length,
+            passengers_data,
+            phone,
+            passenger_name,
+            pickup_city,
+            drop_off_city
+        };
+
+        // Snapshot Safety Guard:
+        // Only recalculate financial snapshot if seat_numbers actually changed on a manual booking with existing non-zero snapshot
+        const isManual = oldBooking.channel === 'manual' || oldBooking.source_type === 'manual' || oldBooking.source_type === 'carrier';
+        if (seatsChanged && isManual && oldBooking.total_price > 0 && ticket) {
+            const premiumSeatNums = ticket.bus_type === 'double' ? [1, 2, 3, 4, 69, 70, 71, 72, 73, 74, 75, 76] : [];
+            const premiumPrice = Number(ticket.premium_price || ticket.price || 0);
+            const standardPrice = Number(ticket.price || 0);
+
+            let newTotalPrice = 0;
+            for (const seatNum of (seat_numbers || [])) {
+                newTotalPrice += premiumSeatNums.includes(Number(seatNum)) ? premiumPrice : standardPrice;
+            }
+            updatePayload.total_price = newTotalPrice;
+            updatePayload.commission_rate = 0;
+            updatePayload.commission_amount = 0;
+            updatePayload.carrier_amount = newTotalPrice;
+        }
+
         // 3. Update the booking record
         const { error: updateErr } = await supabase
             .from('bus_ticket_bookings')
-            .update({
-                seat_numbers,
-                passenger_count: (seat_numbers || []).length,
-                passengers_data,
-                phone,
-                passenger_name,
-                pickup_city,
-                drop_off_city
-            })
+            .update(updatePayload)
             .eq('id', id);
 
         if (updateErr) throw updateErr;
@@ -889,6 +928,313 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
     } catch (err) {
         console.error('[BusAdmin Ticket Summary] Fatal error:', err);
         res.status(500).json({ error: err.message || 'Ошибка получения финансовой сводки рейса' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/finance:
+ *   get:
+ *     summary: Get carrier financial report, settlements and trip breakdown by period
+ *     tags: [Bus Admin]
+ */
+router.get('/finance', async (req, res) => {
+    // Security Gate 1: Drivers MUST NOT access financial reports
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ 
+            error: 'Доступ к финансовому разделу запрещен для роли водителя' 
+        });
+    }
+
+    const operatorId = req.carrier.carrier_id;
+
+    try {
+        // Parse date range (default to current month if omitted)
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const defaultFrom = `${year}-${month}-01`;
+        const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
+        const defaultTo = `${year}-${month}-${String(lastDay).padStart(2, '0')}`;
+
+        const fromDate = req.query.from || defaultFrom;
+        const toDate = req.query.to || defaultTo;
+
+        // 1. Fetch carrier tickets for the period
+        let tQuery = supabase
+            .from('bus_tickets')
+            .select('id, operator_id, from_city, to_city, departure_date, departure_time, price, total_seats, status')
+            .eq('operator_id', operatorId)
+            .gte('departure_date', fromDate)
+            .lte('departure_date', toDate);
+
+        if (req.query.ticket_id) {
+            tQuery = tQuery.eq('id', req.query.ticket_id);
+        }
+
+        const { data: tickets, error: tErr } = await tQuery.order('departure_date', { ascending: false });
+
+        if (tErr) {
+            console.error('[BusAdmin Finance] Error fetching tickets:', tErr);
+            throw tErr;
+        }
+
+        const periodTickets = tickets || [];
+        const ticketIds = periodTickets.map(t => t.id);
+
+        if (ticketIds.length === 0) {
+            return res.json({
+                period: { from: fromDate, to: toDate },
+                totals: {
+                    confirmed_gross: 0,
+                    pending_amount: 0,
+                    service_commission: 0,
+                    carrier_amount: 0,
+                    online_amount: 0,
+                    manual_amount: 0,
+                    online_bookings: 0,
+                    manual_bookings: 0,
+                    refunds_amount: 0,
+                    refund_needed_amount: 0
+                },
+                booking_counts: {
+                    confirmed: 0,
+                    pending_payment: 0,
+                    cancelled: 0,
+                    refund_needed: 0
+                },
+                boarding: {
+                    total: 0,
+                    boarded: 0,
+                    pending: 0,
+                    no_show: 0
+                },
+                source_breakdown: [],
+                trips: []
+            });
+        }
+
+        // 2. Fetch all bookings for these tickets
+        const { data: bookings, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select(`
+                id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, phone, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
+                boarding_status, boarded_at, boarded_by_user_id,
+                channel, source_type, source_id, created_by_user_id,
+                commission_rate, commission_amount, carrier_amount
+            `)
+            .in('bus_ticket_id', ticketIds);
+
+        if (bErr) {
+            console.error('[BusAdmin Finance] Error fetching bookings:', bErr);
+            throw bErr;
+        }
+
+        const allBookings = bookings || [];
+
+        // Source classification buckets
+        const sourceMap = {
+            web: { key: 'web', label: 'Платформа (Web)', count: 0, gross: 0, commission: 0, carrier_amount: 0 },
+            telegram: { key: 'telegram', label: 'Telegram Bot', count: 0, gross: 0, commission: 0, carrier_amount: 0 },
+            carrier_link: { key: 'carrier_link', label: 'Ссылка перевозчика', count: 0, gross: 0, commission: 0, carrier_amount: 0 },
+            partner_link: { key: 'partner_link', label: 'Партнерская ссылка', count: 0, gross: 0, commission: 0, carrier_amount: 0 },
+            manual: { key: 'manual', label: 'Ручная бронь', count: 0, gross: 0, commission: 0, carrier_amount: 0 },
+            legacy_unknown: { key: 'legacy_unknown', label: 'Legacy / Неизвестно', count: 0, gross: 0, commission: 0, carrier_amount: 0 }
+        };
+
+        let totalConfirmedGross = 0;
+        let totalPendingAmount = 0;
+        let totalServiceCommission = 0;
+        let totalCarrierAmount = 0;
+        let totalOnlineAmount = 0;
+        let totalManualAmount = 0;
+        let totalOnlineBookings = 0;
+        let totalManualBookings = 0;
+
+        let countConfirmed = 0;
+        let countPending = 0;
+        let countCancelled = 0;
+
+        let boardingTotal = 0;
+        let boardingBoarded = 0;
+        let boardingPending = 0;
+        let boardingNoShow = 0;
+
+        // Process trip breakdowns
+        const trips = periodTickets.map(ticket => {
+            const tripBookings = allBookings.filter(b => b.bus_ticket_id === ticket.id);
+            const capacity = ticket.total_seats || 53;
+
+            const confirmedBookings = tripBookings.filter(b => b.status === 'confirmed');
+            const pendingBookings = tripBookings.filter(b => b.status === 'pending_payment');
+            const cancelledBookings = tripBookings.filter(b => b.status === 'cancelled');
+
+            // Unique occupied seats for non-cancelled
+            const activeBookings = tripBookings.filter(b => b.status !== 'cancelled');
+            const uniqueSeats = new Set();
+            activeBookings.forEach(b => {
+                let seats = [];
+                try {
+                    seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                    if (!Array.isArray(seats)) seats = seats ? [seats] : [];
+                } catch(e) {}
+                seats.forEach(s => uniqueSeats.add(s));
+            });
+
+            const bookedSeatsCount = uniqueSeats.size;
+            const freeSeatsCount = Math.max(0, capacity - bookedSeatsCount);
+            const fillRate = capacity > 0 ? parseFloat(((bookedSeatsCount / capacity) * 100).toFixed(1)) : 0;
+
+            let tripConfirmedGross = 0;
+            let tripPendingAmount = 0;
+            let tripServiceCommission = 0;
+            let tripCarrierAmount = 0;
+            let tripOnlineBookings = 0;
+            let tripManualBookings = 0;
+
+            let tripBoarded = 0;
+            let tripPending = 0;
+            let tripNoShow = 0;
+
+            // Aggregate confirmed bookings for this trip
+            confirmedBookings.forEach(b => {
+                const totalPrice = Number(b.total_price || 0);
+                const isManual = b.channel === 'manual' || b.source_type === 'manual' || b.source_type === 'carrier';
+                const commRate = Number(b.commission_rate ?? (isManual ? 0 : 10));
+                const commAmount = Number(b.commission_amount > 0 ? b.commission_amount : (isManual ? 0 : Math.round(totalPrice * (commRate / 100))));
+                const carrierAmount = Number(b.carrier_amount > 0 ? b.carrier_amount : Math.max(0, totalPrice - commAmount));
+
+                tripConfirmedGross += totalPrice;
+                tripServiceCommission += commAmount;
+                tripCarrierAmount += carrierAmount;
+
+                if (isManual) {
+                    tripManualBookings += 1;
+                    totalManualAmount += totalPrice;
+                    totalManualBookings += 1;
+                } else {
+                    tripOnlineBookings += 1;
+                    totalOnlineAmount += totalPrice;
+                    totalOnlineBookings += 1;
+                }
+
+                // Source breakdown attribution
+                let sKey = 'legacy_unknown';
+                if (isManual) sKey = 'manual';
+                else if (b.source_type === 'carrier_link') sKey = 'carrier_link';
+                else if (b.source_type === 'partner_link') sKey = 'partner_link';
+                else if (b.channel === 'telegram') sKey = 'telegram';
+                else if (b.channel === 'web' || b.source_type === 'platform') sKey = 'web';
+
+                sourceMap[sKey].count += 1;
+                sourceMap[sKey].gross += totalPrice;
+                sourceMap[sKey].commission += commAmount;
+                sourceMap[sKey].carrier_amount += carrierAmount;
+
+                // Boarding count
+                const pCount = b.passenger_count || (Array.isArray(b.passengers_data) ? b.passengers_data.length : 1) || 1;
+                const bStatus = b.boarding_status || 'pending_boarding';
+                if (bStatus === 'boarded') {
+                    tripBoarded += pCount;
+                } else if (bStatus === 'no_show') {
+                    tripNoShow += pCount;
+                } else {
+                    tripPending += pCount;
+                }
+            });
+
+            // Pending bookings
+            pendingBookings.forEach(b => {
+                tripPendingAmount += Number(b.total_price || 0);
+            });
+
+            // Accumulate to overall totals
+            totalConfirmedGross += tripConfirmedGross;
+            totalPendingAmount += tripPendingAmount;
+            totalServiceCommission += tripServiceCommission;
+            totalCarrierAmount += tripCarrierAmount;
+
+            countConfirmed += confirmedBookings.length;
+            countPending += pendingBookings.length;
+            countCancelled += cancelledBookings.length;
+
+            boardingBoarded += tripBoarded;
+            boardingPending += tripPending;
+            boardingNoShow += tripNoShow;
+            boardingTotal += (tripBoarded + tripPending + tripNoShow);
+
+            return {
+                ticket_id: ticket.id,
+                from_city: ticket.from_city,
+                to_city: ticket.to_city,
+                departure_date: ticket.departure_date,
+                departure_time: ticket.departure_time,
+                price: ticket.price,
+                capacity: capacity,
+                booked_seats: bookedSeatsCount,
+                free_seats: freeSeatsCount,
+                fill_rate: fillRate,
+
+                confirmed_gross: tripConfirmedGross,
+                service_commission: tripServiceCommission,
+                carrier_amount: tripCarrierAmount,
+                pending_amount: tripPendingAmount,
+
+                bookings_total: tripBookings.length,
+                confirmed_bookings: confirmedBookings.length,
+                pending_bookings: pendingBookings.length,
+                cancelled_bookings: cancelledBookings.length,
+
+                online_bookings: tripOnlineBookings,
+                manual_bookings: tripManualBookings,
+
+                boarding: {
+                    total: tripBoarded + tripPending + tripNoShow,
+                    boarded: tripBoarded,
+                    pending: tripPending,
+                    no_show: tripNoShow
+                }
+            };
+        });
+
+        const sourceBreakdownList = Object.values(sourceMap).filter(s => s.count > 0);
+
+        res.json({
+            period: {
+                from: fromDate,
+                to: toDate
+            },
+            totals: {
+                confirmed_gross: totalConfirmedGross,
+                pending_amount: totalPendingAmount,
+                service_commission: totalServiceCommission,
+                carrier_amount: totalCarrierAmount,
+                online_amount: totalOnlineAmount,
+                manual_amount: totalManualAmount,
+                online_bookings: totalOnlineBookings,
+                manual_bookings: totalManualBookings,
+                refunds_amount: 0,
+                refund_needed_amount: 0
+            },
+            booking_counts: {
+                confirmed: countConfirmed,
+                pending_payment: countPending,
+                cancelled: countCancelled,
+                refund_needed: 0
+            },
+            boarding: {
+                total: boardingTotal,
+                boarded: boardingBoarded,
+                pending: boardingPending,
+                no_show: boardingNoShow
+            },
+            source_breakdown: sourceBreakdownList,
+            trips: trips
+        });
+
+    } catch (err) {
+        console.error('[BusAdmin Finance] Fatal error in /finance:', err);
+        res.status(500).json({ error: err.message || 'Ошибка формирования финансового отчета' });
     }
 });
 
