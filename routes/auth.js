@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../db');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const { verifyAndMigrateDurable, hashPassword } = require('../utils/passwordSecurity');
 
 // Professional Telegram initData verification
 // Use environment variable for bot token
@@ -141,18 +142,20 @@ router.post('/login', async (req, res) => {
             });
         }
 
-        // Case 3: User exists and has a password (legacy auth method)
-        // For web/mobile clients: always allow login via phone, ignore password
-        // Password is only checked if explicitly provided and differs
-        if (password !== undefined && user.password && user.password !== password) {
-            console.log('[Auth/Login] Password provided but incorrect for user:', user.id);
-            return res.status(401).json({ error: 'Неверный пароль. Пожалуйста, попробуйте снова.' });
+        // Case 3: User exists and has a password (durable lazy migration supported)
+        // For web/mobile clients: password is only checked if explicitly provided
+        if (password !== undefined && user.password) {
+            const isMatch = await verifyAndMigrateDurable(supabase, user, password);
+            if (!isMatch) {
+                return res.status(401).json({ error: 'Неверный пароль. Пожалуйста, попробуйте снова.' });
+            }
         }
 
-        // User exists - return them regardless of password status
-        console.log('[Auth/Login] Returning existing user:', user.id);
-        user.isNew = !user.phone || !user.age || !user.name || user.age <= 0;
-        return res.json({ user, token: 'mock-token-' + user.id });
+        // User exists - return sanitized user object (never expose password or hash)
+        const sanitizedUser = { ...user };
+        delete sanitizedUser.password;
+        sanitizedUser.isNew = !sanitizedUser.phone || !sanitizedUser.age || !sanitizedUser.name || sanitizedUser.age <= 0;
+        return res.json({ user: sanitizedUser, token: 'mock-token-' + user.id });
     } catch (err) {
         console.error('[Auth/Login] Catch error:', err);
         res.status(500).json({ error: 'Ошибка входа: ' + err.message });
@@ -193,9 +196,16 @@ router.post('/register-mobile', async (req, res) => {
         return res.status(400).json({ error: 'Phone, password, and name are required' });
     }
 
+    if (String(password).length < 6) {
+        return res.status(400).json({ error: 'Пароль должен содержать не менее 6 символов' });
+    }
+
     phone = phone.replace(/[^\d+]/g, '');
 
     try {
+        // Always hash password before persisting
+        const hashedPassword = await hashPassword(password);
+
         // Check if user already exists
         let { data: existingUser, error: findError } = await supabase
             .from('users')
@@ -212,11 +222,11 @@ router.post('/register-mobile', async (req, res) => {
                 return res.status(400).json({ error: 'Пользователь с таким телефоном уже зарегистрирован. Пожалуйста, войдите.' });
             }
             
-            // Upgrade the existing skeleton user with password and details
+            // Upgrade the existing skeleton user with hashed password and details
             const { data: updatedUser, error: updateError } = await supabase
                 .from('users')
                 .update({
-                    password,
+                    password: hashedPassword,
                     name,
                     age: parseInt(age) || null,
                     sex: sex || null
@@ -228,12 +238,12 @@ router.post('/register-mobile', async (req, res) => {
             if (updateError) throw updateError;
             user = updatedUser;
         } else {
-            // Create a completely new user
+            // Create a completely new user with hashed password
             const { data: newUser, error: insertError } = await supabase
                 .from('users')
                 .insert([{
                     phone,
-                    password,
+                    password: hashedPassword,
                     name,
                     age: parseInt(age) || null,
                     sex: sex || null,
@@ -246,9 +256,12 @@ router.post('/register-mobile', async (req, res) => {
             user = newUser;
         }
 
+        const sanitizedUser = { ...user };
+        delete sanitizedUser.password;
+
         res.json({ 
             success: true,
-            user, 
+            user: sanitizedUser,
             token: 'mock-token-' + user.id 
         });
     } catch (err) {
@@ -342,10 +355,16 @@ router.post('/bus-login', async (req, res) => {
             .from('users')
             .select('*')
             .eq('phone', phone)
-            .eq('password', password)
             .maybeSingle();
 
-        if (error || !user) {
+        if (error || !user || !user.password) {
+            return res.status(401).json({ error: 'Неверный телефон, пароль или нет прав доступа' });
+        }
+
+        // Verify password (supports bcrypt hash and legacy plaintext with durable awaited rehash)
+        const isMatch = await verifyAndMigrateDurable(supabase, user, password);
+
+        if (!isMatch) {
             return res.status(401).json({ error: 'Неверный телефон, пароль или нет прав доступа' });
         }
 

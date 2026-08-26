@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
+const { hashPassword } = require('../utils/passwordSecurity');
 
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE;
 const ADMIN_SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN;
@@ -349,9 +350,11 @@ router.post('/bus-drivers', async (req, res) => {
             return res.status(400).json({ error: 'Пользователь с таким номером уже существует' });
         }
 
+        const hashedPassword = await hashPassword(password);
+
         const { error } = await supabase
             .from('users')
-            .insert([{ phone, name, surname, password, role: 'bus_driver' }]);
+            .insert([{ phone, name, surname, password: hashedPassword, role: 'bus_driver' }]);
 
         if (error) throw error;
         res.json({ success: true });
