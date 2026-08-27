@@ -22,7 +22,7 @@ describe('Security P1.2: Final Migration Safety Gate Suite', () => {
         { id: 102, phone: '+992900000002', name: 'Dispatcher', password: 'legacy_plain_pass_2', role: 'passenger', is_blocked: false },
         { id: 103, phone: '+992900000003', name: 'Driver', password: 'legacy_plain_pass_3', role: 'passenger', is_blocked: false },
         { id: 104, phone: '+992900000004', name: 'Accountant', password: 'legacy_plain_pass_4', role: 'passenger', is_blocked: false },
-        { id: 105, phone: '+992900000005', name: 'HashedUser', password: hashPasswordSync('already_hashed_pwd'), role: 'passenger', is_blocked: false },
+        { id: 105, phone: '+992900000005', name: 'HashedUser', password: hashPasswordSync('already_hashed_pwd'), role: 'bus_driver', is_blocked: false },
         { id: 106, phone: '+992900000006', name: 'NoPasswordUser', password: null, role: 'passenger', is_blocked: false }
     ];
 

@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../db');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinaryUtils');
 const { carrierAuth, verifyTicketAccess } = require('../utils/carrierAuth');
+const { aggregateCarrierCustomers, getCustomerDetails } = require('../utils/crmHelper');
 
 /**
  * @swagger
@@ -1753,6 +1754,120 @@ router.delete('/members/:id', async (req, res) => {
     } catch (err) {
         console.error('[BusAdmin Team] Error deactivating member:', err);
         res.status(500).json({ error: err.message || 'Ошибка при отключении сотрудника' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/customers:
+ *   get:
+ *     summary: Get aggregated customer list and CRM analytics for carrier
+ *     tags: [Bus Admin CRM]
+ */
+router.get('/customers', async (req, res) => {
+    // Role guards: only owner and dispatcher allowed
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ error: 'Водителям запрещен доступ к CRM-базе пассажиров' });
+    }
+    if (req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Доступ бухгалтера к CRM пассажиров ограничен' });
+    }
+
+    const carrierId = req.carrier.carrier_id;
+
+    try {
+        // 1. Fetch carrier tickets to isolate tenant
+        const { data: tickets, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select('id, operator_id, from_city, to_city, from_address, to_address, departure_date, departure_time, price, status')
+            .eq('operator_id', carrierId);
+
+        if (tErr) throw tErr;
+
+        const ticketIds = (tickets || []).map(t => t.id);
+        if (ticketIds.length === 0) {
+            return res.json({
+                customers: [],
+                pagination: { page: 1, limit: 50, total: 0, totalPages: 1 },
+                summary: { total_customers: 0, repeat_customers: 0, total_no_shows: 0, total_revenue: 0 }
+            });
+        }
+
+        // 2. Fetch all bookings for carrier's tickets
+        const { data: bookings, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, bus_ticket_id, passenger_id, phone, passenger_name, passengers_data, seat_numbers, passenger_count, pickup_city, drop_off_city, status, boarding_status, channel, source_type, total_price, created_at')
+            .in('bus_ticket_id', ticketIds);
+
+        if (bErr) throw bErr;
+
+        const result = aggregateCarrierCustomers(bookings || [], tickets || [], {
+            carrierId,
+            search: req.query.search,
+            from: req.query.from,
+            to: req.query.to,
+            source: req.query.source,
+            loyalty: req.query.loyalty,
+            sort: req.query.sort,
+            page: req.query.page,
+            limit: req.query.limit
+        });
+
+        res.json(result);
+    } catch (err) {
+        console.error('[BusAdmin CRM] Error fetching customers (carrierId: %s):', carrierId, err.message);
+        res.status(500).json({ error: 'Ошибка загрузки базы клиентов' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/customers/{customerKey}:
+ *   get:
+ *     summary: Get single customer profile, statistics, and booking history
+ *     tags: [Bus Admin CRM]
+ */
+router.get('/customers/:customerKey', async (req, res) => {
+    // Role guards
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ error: 'Водителям запрещен доступ к карточке клиента' });
+    }
+    if (req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Доступ бухгалтера к CRM пассажиров ограничен' });
+    }
+
+    const carrierId = req.carrier.carrier_id;
+    const { customerKey } = req.params;
+
+    try {
+        const { data: tickets, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select('id, operator_id, from_city, to_city, from_address, to_address, departure_date, departure_time, price, status')
+            .eq('operator_id', carrierId);
+
+        if (tErr) throw tErr;
+
+        const ticketIds = (tickets || []).map(t => t.id);
+        if (ticketIds.length === 0) {
+            return res.status(404).json({ error: 'Клиент не найден в вашей базе' });
+        }
+
+        const { data: bookings, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, bus_ticket_id, passenger_id, phone, passenger_name, passengers_data, seat_numbers, passenger_count, pickup_city, drop_off_city, status, boarding_status, channel, source_type, total_price, created_at')
+            .in('bus_ticket_id', ticketIds);
+
+        if (bErr) throw bErr;
+
+        const details = getCustomerDetails(bookings || [], tickets || [], customerKey, carrierId);
+        if (!details) {
+            return res.status(404).json({ error: 'Клиент с указанным идентификатором не найден' });
+        }
+
+        res.json(details);
+    } catch (err) {
+        console.error('[BusAdmin CRM] Error fetching customer details (carrierId: %s):', carrierId, err.message);
+        res.status(500).json({ error: 'Ошибка загрузки карточки клиента' });
     }
 });
 
