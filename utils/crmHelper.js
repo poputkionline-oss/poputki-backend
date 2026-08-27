@@ -193,9 +193,9 @@ function aggregateCarrierCustomers(bookings = [], tickets = [], options = {}) {
         }
 
         c.total_trips++;
-        const isConfirmed = b.status === 'confirmed' || b.status === 'paid';
+        const isConfirmed = b.status === 'confirmed';
         const isCancelled = b.status === 'cancelled';
-        const isNoShow = b.boarding_status === 'no_show';
+        const isNoShow = isConfirmed && b.boarding_status === 'no_show';
 
         if (isConfirmed && !isCancelled) {
             c.confirmed_trips++;
@@ -209,6 +209,7 @@ function aggregateCarrierCustomers(bookings = [], tickets = [], options = {}) {
 
         if (isCancelled) c.cancelled_count++;
         if (isNoShow) c.no_show_count++;
+
 
         if (b.created_at && b.created_at < c.first_seen_at) c.first_seen_at = b.created_at;
         if (b.created_at && b.created_at > c.last_seen_at) c.last_seen_at = b.created_at;
@@ -514,9 +515,9 @@ function getCustomerDetails(bookings = [], tickets = [], customerKey = '', carri
     let totalBookingValue = 0;
 
     customerBookings.forEach(b => {
-        const isConfirmed = b.status === 'confirmed' || b.status === 'paid';
+        const isConfirmed = b.status === 'confirmed';
         const isCancelled = b.status === 'cancelled';
-        const isNoShow = b.boarding_status === 'no_show';
+        const isNoShow = isConfirmed && b.boarding_status === 'no_show';
 
         if (isConfirmed && !isCancelled) {
             confirmedTrips++;
@@ -526,6 +527,7 @@ function getCustomerDetails(bookings = [], tickets = [], customerKey = '', carri
         if (isCancelled) cancelledCount++;
         if (isNoShow) noShowCount++;
     });
+
 
     let primarySource = 'web';
     let maxSCount = -1;

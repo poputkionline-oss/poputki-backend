@@ -976,7 +976,15 @@ router.patch('/bookings/:id/boarding', async (req, res) => {
             return res.status(404).json({ error: 'Бронирование не найдено' });
         }
 
+        // Security Gate: Boarding operations are strictly allowed ONLY for confirmed bookings
+        if (booking.status !== 'confirmed') {
+            return res.status(400).json({ 
+                error: 'Посадка доступна только для подтвержденной брони' 
+            });
+        }
+
         const ticketId = booking.bus_ticket_id;
+
 
         // 2. Strict tenant isolation & role access verification (handles owners, dispatchers, and assigned drivers)
         const hasAccess = await verifyTicketAccess(req.carrier, ticketId);
@@ -1110,24 +1118,49 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
         // Count unique booked seats from non-cancelled bookings
         const activeBookings = allBookings.filter(b => b.status !== 'cancelled');
         const uniqueReservedSeats = new Set();
-
-        activeBookings.forEach(b => {
-            let seats = [];
-            try {
-                seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
-                if (!Array.isArray(seats)) seats = seats ? [seats] : [];
-            } catch(e) { }
-            seats.forEach(s => uniqueReservedSeats.add(s));
-        });
-
-        const bookedSeatsCount = uniqueReservedSeats.size;
-        const freeSeatsCount = Math.max(0, capacity - bookedSeatsCount);
-        const fillRate = capacity > 0 ? parseFloat(((bookedSeatsCount / capacity) * 100).toFixed(1)) : 0;
+        const confirmedSeats = new Set();
+        const heldSeats = new Set();
 
         // Categorize bookings
         const confirmedBookings = allBookings.filter(b => b.status === 'confirmed');
         const pendingBookings = allBookings.filter(b => b.status === 'pending_payment');
         const cancelledBookings = allBookings.filter(b => b.status === 'cancelled');
+
+        confirmedBookings.forEach(b => {
+            let seats = [];
+            try {
+                seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                if (!Array.isArray(seats)) seats = seats ? [seats] : [];
+            } catch(e) { }
+            seats.forEach(s => {
+                uniqueReservedSeats.add(s);
+                confirmedSeats.add(s);
+            });
+        });
+
+        pendingBookings.forEach(b => {
+            let seats = [];
+            try {
+                seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                if (!Array.isArray(seats)) seats = seats ? [seats] : [];
+            } catch(e) { }
+            seats.forEach(s => {
+                uniqueReservedSeats.add(s);
+                heldSeats.add(s);
+            });
+        });
+
+        let pendingPassengersCount = 0;
+        pendingBookings.forEach(b => {
+            const count = b.passenger_count || (Array.isArray(b.passengers_data) ? b.passengers_data.length : 1) || 1;
+            pendingPassengersCount += count;
+        });
+
+        const bookedSeatsCount = uniqueReservedSeats.size;
+        const confirmedSeatsCount = confirmedSeats.size;
+        const heldSeatsCount = heldSeats.size;
+        const freeSeatsCount = Math.max(0, capacity - bookedSeatsCount);
+        const fillRate = capacity > 0 ? parseFloat(((bookedSeatsCount / capacity) * 100).toFixed(1)) : 0;
 
         const onlineBookings = confirmedBookings.filter(b => b.channel !== 'manual' && b.source_type !== 'manual');
         const manualBookings = confirmedBookings.filter(b => b.channel === 'manual' || b.source_type === 'manual' || b.source_type === 'carrier');
@@ -1165,7 +1198,7 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
         // 3. Gross amount represents confirmed sales (or total expected)
         const grossAmount = paidAmount;
 
-        // Boarding counters across confirmed passengers
+        // Boarding counters across confirmed passengers ONLY
         let boardingPending = 0;
         let boardingBoarded = 0;
         let boardingNoShow = 0;
@@ -1195,20 +1228,26 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
 
             capacity: capacity,
             booked_seats: bookedSeatsCount,
+            occupied_or_held_seats: bookedSeatsCount,
+            confirmed_seats: confirmedSeatsCount,
+            held_seats: heldSeatsCount,
             free_seats: freeSeatsCount,
             fill_rate: fillRate,
+
 
             bookings_total: allBookings.length,
             confirmed_bookings: confirmedBookings.length,
             pending_bookings: pendingBookings.length,
             cancelled_bookings: cancelledBookings.length,
 
+            pending_payment_passengers: pendingPassengersCount,
             online_bookings: onlineBookings.length,
             manual_bookings: manualBookings.length,
 
             gross_amount: grossAmount,
             paid_amount: paidAmount,
             unpaid_amount: unpaidAmount,
+            pending_payment_amount: unpaidAmount,
 
             service_commission: serviceCommission,
             carrier_amount: carrierAmount,
@@ -1220,6 +1259,7 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
                 no_show: boardingNoShow
             }
         });
+
     } catch (err) {
         console.error('[BusAdmin Ticket Summary] Fatal error:', err);
         res.status(500).json({ error: err.message || 'Ошибка получения финансовой сводки рейса' });

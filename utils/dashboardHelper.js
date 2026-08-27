@@ -102,9 +102,13 @@ function calculateTripFillStats(ticket, bookings = []) {
 
     // Collect unique booked seats from non-cancelled bookings
     const uniqueSeats = new Set();
-    let totalPassengers = 0;
+    const confirmedSeats = new Set();
+    const heldSeats = new Set();
+
+    let totalPassengers = 0; // Confirmed passengers only
     let confirmedCount = 0;
     let pendingPaymentCount = 0;
+    let pendingPaymentPassengers = 0;
     let boardedCount = 0;
     let pendingBoardingCount = 0;
     let noShowCount = 0;
@@ -112,13 +116,19 @@ function calculateTripFillStats(ticket, bookings = []) {
     for (const b of activeBookings) {
         const isConfirmed = b.status === 'confirmed';
         const isPending = b.status === 'pending_payment';
+        const pCount = getBookingPassengerCount(b);
 
-        if (isConfirmed) confirmedCount++;
-        if (isPending) pendingPaymentCount++;
+        if (isConfirmed) {
+            confirmedCount++;
+            totalPassengers += pCount;
 
-        if (b.boarding_status === 'boarded') boardedCount++;
-        else if (b.boarding_status === 'no_show') noShowCount++;
-        else pendingBoardingCount++;
+            if (b.boarding_status === 'boarded') boardedCount++;
+            else if (b.boarding_status === 'no_show') noShowCount++;
+            else pendingBoardingCount++;
+        } else if (isPending) {
+            pendingPaymentCount++;
+            pendingPaymentPassengers += pCount;
+        }
 
         // Seats normalization (12 === "12")
         const seats = Array.isArray(b.seat_numbers) ? b.seat_numbers : [];
@@ -126,29 +136,35 @@ function calculateTripFillStats(ticket, bookings = []) {
             const norm = normalizeSeat(s);
             if (norm !== null) {
                 uniqueSeats.add(norm);
+                if (isConfirmed) confirmedSeats.add(norm);
+                if (isPending) heldSeats.add(norm);
             }
         }
-
-        // Passengers
-        totalPassengers += getBookingPassengerCount(b);
     }
 
     const bookedSeats = uniqueSeats.size;
+    const confirmedSeatsCount = confirmedSeats.size;
+    const heldSeatsCount = heldSeats.size;
     const freeSeats = Math.max(0, capacity - bookedSeats);
     const fillRate = capacity > 0 ? Math.min(100, Math.round((bookedSeats / capacity) * 1000) / 10) : 0;
 
     return {
         capacity,
         booked_seats: bookedSeats,
+        occupied_or_held_seats: bookedSeats,
+        confirmed_seats: confirmedSeatsCount,
+        held_seats: heldSeatsCount,
         free_seats: freeSeats,
         fill_rate: fillRate,
-        passengers_count: totalPassengers,
+        passengers_count: totalPassengers, // Confirmed passengers only
         confirmed_bookings: confirmedCount,
         pending_payment_count: pendingPaymentCount,
+        pending_payment_passengers: pendingPaymentPassengers,
         boarded_count: boardedCount,
         pending_boarding_count: pendingBoardingCount,
         no_show_count: noShowCount
     };
+
 }
 
 /**
@@ -161,6 +177,7 @@ function buildTodaySummary(todayTickets = [], todayBookings = []) {
 
     let confirmedBookings = 0;
     let pendingPaymentBookings = 0;
+    let pendingPaymentPassengers = 0;
     let cancelledBookings = 0;
 
     let onlineConfirmed = 0;
@@ -214,6 +231,7 @@ function buildTodaySummary(todayTickets = [], todayBookings = []) {
         } else if (b.status === 'pending_payment') {
             pendingPaymentBookings++;
             pendingPaymentGross += Number(b.total_price || 0);
+            pendingPaymentPassengers += pCount;
         } else if (b.status === 'cancelled') {
             cancelledBookings++;
         }
@@ -234,6 +252,7 @@ function buildTodaySummary(todayTickets = [], todayBookings = []) {
 
         confirmed_bookings: confirmedBookings,
         pending_payment: pendingPaymentBookings,
+        pending_payment_passengers: pendingPaymentPassengers,
         cancelled: cancelledBookings,
 
         online_bookings: onlineConfirmed,
@@ -244,13 +263,21 @@ function buildTodaySummary(todayTickets = [], todayBookings = []) {
         gross_amount: grossAmount,
         service_commission: serviceCommission,
         carrier_amount: carrierAmount,
+        pending_payment_gross: pendingPaymentGross,
         pending_payment_amount: pendingPaymentGross,
 
         boarded: boardedPassengers,
         pending_boarding: pendingBoardingPassengers,
-        no_show: noShowPassengers
+        no_show: noShowPassengers,
+
+        boarding: {
+            boarded: boardedPassengers,
+            pending_boarding: pendingBoardingPassengers,
+            no_show: noShowPassengers
+        }
     };
 }
+
 
 /**
  * Detects attention items based on deterministic business rules.
