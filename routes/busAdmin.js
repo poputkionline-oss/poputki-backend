@@ -5,6 +5,14 @@ const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinar
 const { carrierAuth, verifyTicketAccess } = require('../utils/carrierAuth');
 const { aggregateCarrierCustomers, getCustomerDetails } = require('../utils/crmHelper');
 const { AUDIT_ACTIONS, AUDIT_ENTITY_TYPES, logCarrierActivity } = require('../utils/auditHelper');
+const {
+    getBusinessLocalDate,
+    getBusinessLocalTime,
+    buildTodaySummary,
+    detectAttentionItems,
+    buildUpcomingTripsList
+} = require('../utils/dashboardHelper');
+
 
 /**
  * @swagger
@@ -2099,6 +2107,7 @@ router.get('/activity', async (req, res) => {
             return res.status(500).json({ error: 'Ошибка загрузки журнала активности' });
         }
 
+
         res.json({
             activity: logs || [],
             pagination: {
@@ -2114,5 +2123,103 @@ router.get('/activity', async (req, res) => {
     }
 });
 
+
+/**
+ * @swagger
+ * /api/bus-admin/dashboard:
+ *   get:
+ *     summary: Aggregated Owner Dashboard data (Today KPI, Finances, Upcoming trips, Attention items, Recent team activity)
+ *     tags: [Bus Admin Dashboard]
+ */
+router.get('/dashboard', async (req, res) => {
+    // Role guard: Owner only
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании имеет доступ к управленческому дашборду' });
+    }
+
+    const carrierId = req.carrier.carrier_id;
+    const businessToday = getBusinessLocalDate();
+    const businessLocalTime = getBusinessLocalTime();
+
+    try {
+        // 1. Fetch carrier's active / non-deleted tickets
+        const { data: tickets, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select('*')
+            .eq('operator_id', carrierId)
+            .neq('status', 'deleted');
+
+        if (tErr) throw tErr;
+
+        const allTickets = tickets || [];
+
+        // Partition tickets into today and strictly upcoming (date > today OR (date == today AND time >= now))
+        const todayTickets = allTickets.filter(t => t.departure_date === businessToday);
+        const todayTicketIds = new Set(todayTickets.map(t => t.id));
+
+        const upcomingTickets = allTickets
+            .filter(t => {
+                if (t.status !== 'active') return false;
+                if (t.departure_date > businessToday) return true;
+                if (t.departure_date === businessToday) {
+                    const depTime = (t.departure_time || '23:59').slice(0, 5);
+                    return depTime >= businessLocalTime;
+                }
+                return false;
+            })
+            .sort((a, b) => {
+                const dateCmp = (a.departure_date || '').localeCompare(b.departure_date || '');
+                if (dateCmp !== 0) return dateCmp;
+                return (a.departure_time || '').localeCompare(b.departure_time || '');
+            });
+
+        // 2. Fetch scoped bookings ONLY for relevant operational trips (today + upcoming)
+        const relevantTicketIds = Array.from(new Set([...todayTickets, ...upcomingTickets].map(t => t.id)));
+
+        // 3 parallel queries for zero N+1 latency
+        const [bookingsRes, driversRes, activityRes] = await Promise.all([
+            relevantTicketIds.length > 0 
+                ? supabase.from('bus_ticket_bookings').select('*').in('bus_ticket_id', relevantTicketIds)
+                : Promise.resolve({ data: [] }),
+            supabase.from('carrier_members').select('id, role, is_active, assigned_ticket_ids').eq('carrier_id', carrierId).eq('role', 'driver').eq('is_active', true),
+            supabase.from('carrier_activity_logs').select('id, created_at, actor_role, actor_name, action, entity_type, entity_id, entity_label').eq('carrier_id', carrierId).order('created_at', { ascending: false }).limit(5)
+        ]);
+
+        if (bookingsRes.error) throw bookingsRes.error;
+
+        const allRelevantBookings = bookingsRes.data || [];
+        const activeDrivers = driversRes.data || [];
+        const recentActivity = activityRes.data || [];
+
+        const todayBookings = allRelevantBookings.filter(b => todayTicketIds.has(b.bus_ticket_id));
+
+        // 3. Compute structured sections
+        const todaySummary = buildTodaySummary(todayTickets, todayBookings);
+        const attentionItems = detectAttentionItems(todayTickets, upcomingTickets, allRelevantBookings, activeDrivers);
+        const upcomingTrips = buildUpcomingTripsList(upcomingTickets, allRelevantBookings, activeDrivers);
+
+        res.json({
+            business_date: businessToday,
+            timezone: 'Asia/Dushanbe',
+            today: todaySummary,
+            money: {
+                confirmed_gross: todaySummary.gross_amount,
+                service_commission: todaySummary.service_commission,
+                carrier_receivable: todaySummary.carrier_amount,
+                pending_payment_amount: todaySummary.pending_payment_amount
+            },
+            upcoming_trips: upcomingTrips,
+            attention: attentionItems,
+            recent_activity: recentActivity
+        });
+
+    } catch (err) {
+        console.error('[BusAdmin Dashboard] Exception:', err);
+        res.status(500).json({ error: 'Ошибка загрузки дашборда перевозчика' });
+    }
+});
+
+
 module.exports = router;
+
 
