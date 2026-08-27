@@ -112,6 +112,27 @@ router.post('/', async (req, res) => {
 
         if (error) throw error;
 
+        // Audit logging (non-blocking)
+        await logCarrierActivity({
+            supabase,
+            carrierContext: { carrier_id: operator_id, user_id: operator_id, role: 'owner' },
+            action: AUDIT_ACTIONS.TICKET_CREATED,
+            entityType: AUDIT_ENTITY_TYPES.TICKET,
+            entityId: ticket.id,
+            entityLabel: `Рейс ${from_city} → ${to_city} #${ticket.id}`,
+            newData: {
+                from_city,
+                to_city,
+                departure_date,
+                departure_time,
+                arrival_date,
+                arrival_time,
+                price,
+                total_seats: total_seats || 53,
+                bus_type: bus_type || 'single'
+            }
+        });
+
         res.json({ id: ticket.id, ...req.body });
 
         // Telegram Notifications

@@ -4,6 +4,7 @@ const supabase = require('../db');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinaryUtils');
 const { carrierAuth, verifyTicketAccess } = require('../utils/carrierAuth');
 const { aggregateCarrierCustomers, getCustomerDetails } = require('../utils/crmHelper');
+const { AUDIT_ACTIONS, AUDIT_ENTITY_TYPES, logCarrierActivity } = require('../utils/auditHelper');
 
 /**
  * @swagger
@@ -344,8 +345,8 @@ router.put('/tickets/:id', async (req, res) => {
     delete updateData.photos; // process and attach safely
 
     try {
-        // Fetch existing ticket to compare photos
-        const { data: oldTicket } = await supabase.from('bus_tickets').select('photos').eq('id', id).single();
+        // Fetch existing ticket to compare photos and audit diff
+        const { data: oldTicket } = await supabase.from('bus_tickets').select('*').eq('id', id).single();
         const oldPhotos = oldTicket?.photos || [];
 
         if (incomingPhotos !== undefined) {
@@ -381,6 +382,19 @@ router.put('/tickets/:id', async (req, res) => {
             .eq('id', id);
 
         if (error) throw error;
+
+        // Audit log ticket update
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.TICKET_UPDATED,
+            entityType: AUDIT_ENTITY_TYPES.TICKET,
+            entityId: id,
+            entityLabel: `Рейс ${oldTicket?.from_city || ''} → ${oldTicket?.to_city || ''} #${id}`,
+            oldData: oldTicket,
+            newData: { ...oldTicket, ...updateData }
+        });
+
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -409,8 +423,8 @@ router.delete('/tickets/:id', async (req, res) => {
     }
 
     try {
-        // Fetch to get photos before deleting
-        const { data: ticket } = await supabase.from('bus_tickets').select('photos').eq('id', id).single();
+        // Fetch to get photos and route info before deleting
+        const { data: ticket } = await supabase.from('bus_tickets').select('*').eq('id', id).single();
         const photos = ticket?.photos || [];
 
         const { error } = await supabase
@@ -419,6 +433,18 @@ router.delete('/tickets/:id', async (req, res) => {
             .eq('id', id);
 
         if (error) throw error;
+
+        // Audit log ticket deletion
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.TICKET_DELETED,
+            entityType: AUDIT_ENTITY_TYPES.TICKET,
+            entityId: id,
+            entityLabel: `Рейс ${ticket?.from_city || ''} → ${ticket?.to_city || ''} #${id}`,
+            oldData: ticket,
+            newData: { status: 'deleted' }
+        });
 
         // Cleanup Cloudinary only if no other ticket is referencing this photo public_id (FAIL-CLOSED)
         for (const photo of photos) {
@@ -557,6 +583,17 @@ router.post('/tickets/:id/duplicate', async (req, res) => {
 
         if (insertErr) throw insertErr;
 
+        // Audit log duplication / reverse (exactly ONE logical event)
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: is_reverse ? AUDIT_ACTIONS.TICKET_REVERSED : AUDIT_ACTIONS.TICKET_DUPLICATED,
+            entityType: AUDIT_ENTITY_TYPES.TICKET,
+            entityId: newTicket.id,
+            entityLabel: `Рейс ${fromCity} → ${toCity} #${newTicket.id} (${is_reverse ? 'Обратный от #' + id : 'Копия #' + id})`,
+            newData: newTicketData
+        });
+
         res.status(201).json({
             success: true,
             id: newTicket.id,
@@ -657,6 +694,25 @@ router.post('/bookings/manual', async (req, res) => {
             .from('bus_tickets')
             .update({ reserved_seats: newReserved })
             .eq('id', bus_ticket_id);
+
+        // Audit log manual booking creation
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BOOKING_CREATED_MANUAL,
+            entityType: AUDIT_ENTITY_TYPES.BOOKING,
+            entityId: booking.id,
+            entityLabel: `Бронь #${booking.id} (${ticket.from_city || ''} → ${ticket.to_city || ''})`,
+            newData: {
+                seat_numbers,
+                passenger_count: (seat_numbers || []).length,
+                total_price: manualTotalPrice,
+                status: 'confirmed',
+                boarding_status: 'pending_boarding',
+                pickup_city,
+                drop_off_city
+            }
+        });
 
         res.json({ success: true, id: booking.id });
     } catch (err) {
@@ -764,6 +820,30 @@ router.put('/bookings/:id', async (req, res) => {
 
         if (updateErr) throw updateErr;
 
+        // Audit log booking update
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BOOKING_UPDATED,
+            entityType: AUDIT_ENTITY_TYPES.BOOKING,
+            entityId: id,
+            entityLabel: `Бронь #${id} (${ticket.from_city || ''} → ${ticket.to_city || ''})`,
+            oldData: {
+                seat_numbers: oldBooking.seat_numbers,
+                pickup_city: oldBooking.pickup_city,
+                drop_off_city: oldBooking.drop_off_city,
+                status: oldBooking.status,
+                total_price: oldBooking.total_price
+            },
+            newData: {
+                seat_numbers: updatePayload.seat_numbers,
+                pickup_city: updatePayload.pickup_city,
+                drop_off_city: updatePayload.drop_off_city,
+                status: oldBooking.status,
+                total_price: updatePayload.total_price !== undefined ? updatePayload.total_price : oldBooking.total_price
+            }
+        });
+
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -829,6 +909,23 @@ router.delete('/bookings/:id', async (req, res) => {
                 .update({ reserved_seats: newReserved })
                 .eq('id', ticketId);
         }
+
+        // Audit log booking cancellation
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BOOKING_CANCELLED,
+            entityType: AUDIT_ENTITY_TYPES.BOOKING,
+            entityId: id,
+            entityLabel: `Бронь #${id}`,
+            oldData: {
+                seat_numbers: seatsToRelease,
+                status: 'confirmed'
+            },
+            newData: {
+                status: 'cancelled'
+            }
+        });
 
         res.json({ success: true });
     } catch (err) {
@@ -904,7 +1001,7 @@ router.patch('/bookings/:id/boarding', async (req, res) => {
             throw uErr;
         }
 
-        // 4. Log change in booking_audit_logs table
+        // 4. Log change in legacy booking_audit_logs and carrier_activity_logs (Dual-write)
         try {
             await supabase
                 .from('booking_audit_logs')
@@ -923,8 +1020,19 @@ router.patch('/bookings/:id/boarding', async (req, res) => {
                     }
                 }]);
         } catch (auditErr) {
-            console.error('[BusAdmin Boarding] Audit log insertion error (non-fatal):', auditErr);
+            console.error('[BusAdmin Boarding] Legacy audit log insertion error (non-fatal):', auditErr);
         }
+
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BOARDING_STATUS_CHANGED,
+            entityType: AUDIT_ENTITY_TYPES.BOOKING,
+            entityId: id,
+            entityLabel: `Бронь #${id} (Места: ${(booking.seat_numbers || []).join(', ')})`,
+            oldData: { boarding_status: oldStatus },
+            newData: { boarding_status: boarding_status }
+        });
 
         res.json({
             success: true,
@@ -1588,6 +1696,21 @@ router.post('/members', async (req, res) => {
 
         if (mErr) throw mErr;
 
+        // Audit log member addition (Strict Privacy: No phone/name in entityLabel)
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.MEMBER_ADDED,
+            entityType: AUDIT_ENTITY_TYPES.MEMBER,
+            entityId: newMember.id,
+            entityLabel: `Сотрудник #${newMember.id} (${role})`,
+            newData: {
+                role: role,
+                is_active: true,
+                assigned_ticket_ids: validAssignedTickets
+            }
+        });
+
         res.status(201).json({
             success: true,
             member: {
@@ -1665,6 +1788,35 @@ router.patch('/members/:id', async (req, res) => {
             .single();
 
         if (uErr) throw uErr;
+
+        // Determine specific audit action
+        let memberAuditAction = AUDIT_ACTIONS.MEMBER_ROLE_CHANGED;
+        if (role !== undefined && role !== member.role) {
+            memberAuditAction = AUDIT_ACTIONS.MEMBER_ROLE_CHANGED;
+        } else if (assigned_ticket_ids !== undefined) {
+            memberAuditAction = AUDIT_ACTIONS.DRIVER_ASSIGNMENT_CHANGED;
+        } else if (is_active !== undefined) {
+            memberAuditAction = is_active ? AUDIT_ACTIONS.MEMBER_REACTIVATED : AUDIT_ACTIONS.MEMBER_DEACTIVATED;
+        }
+
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: memberAuditAction,
+            entityType: AUDIT_ENTITY_TYPES.MEMBER,
+            entityId: id,
+            entityLabel: `Сотрудник #${id}`,
+            oldData: {
+                role: member.role,
+                is_active: member.is_active,
+                assigned_ticket_ids: member.assigned_ticket_ids
+            },
+            newData: {
+                role: updatedMember.role,
+                is_active: updatedMember.is_active,
+                assigned_ticket_ids: updatedMember.assigned_ticket_ids
+            }
+        });
 
         res.json({ success: true, member: updatedMember });
     } catch (err) {
@@ -1749,6 +1901,18 @@ router.delete('/members/:id', async (req, res) => {
             .eq('id', id);
 
         if (uErr) throw uErr;
+
+        // Audit log member deactivation
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.MEMBER_DEACTIVATED,
+            entityType: AUDIT_ENTITY_TYPES.MEMBER,
+            entityId: id,
+            entityLabel: `Сотрудник #${id}`,
+            oldData: { is_active: true },
+            newData: { is_active: false }
+        });
 
         res.json({ success: true, message: 'Доступ сотрудника отключен' });
     } catch (err) {
@@ -1868,6 +2032,85 @@ router.get('/customers/:customerKey', async (req, res) => {
     } catch (err) {
         console.error('[BusAdmin CRM] Error fetching customer details (carrierId: %s):', carrierId, err.message);
         res.status(500).json({ error: 'Ошибка загрузки карточки клиента' });
+    }
+});
+
+
+
+/**
+ * @swagger
+ * /api/bus-admin/activity:
+ *   get:
+ *     summary: Query append-only carrier activity audit history (Owner only)
+ *     tags: [Bus Admin Audit]
+ */
+router.get('/activity', async (req, res) => {
+    // Role guard: Only owner has access to carrier audit logs
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании имеет доступ к журналу аудита' });
+    }
+
+    const carrierId = req.carrier.carrier_id;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    const { from, to, actor_user_id, action, entity_type, entity_id } = req.query;
+
+    try {
+        let query = supabase
+            .from('carrier_activity_logs')
+            .select('*', { count: 'exact' })
+            .eq('carrier_id', carrierId)
+            .order('created_at', { ascending: false });
+
+        if (action) query = query.eq('action', action);
+        if (entity_type) query = query.eq('entity_type', entity_type);
+        if (actor_user_id) query = query.eq('actor_user_id', parseInt(actor_user_id, 10));
+        if (entity_id) query = query.eq('entity_id', String(entity_id));
+        if (from) query = query.gte('created_at', from);
+        if (to) {
+            const toStr = to.includes('T') ? to : `${to}T23:59:59.999Z`;
+            query = query.lte('created_at', toStr);
+        }
+
+        const offset = (page - 1) * limit;
+        query = query.range(offset, offset + limit - 1);
+
+        const { data: logs, count, error } = await query;
+
+        if (error) {
+            console.error('[BusAdmin Activity] Error querying activity logs:', error);
+            const isTableMissing = error.code === '42P01' || 
+                (typeof error.message === 'string' && (error.message.includes('carrier_activity_logs') || error.message.includes('schema cache')));
+
+            if (isTableMissing) {
+                // Controlled pre-migration grace path: return clean empty structure
+                return res.json({
+                    activity: [],
+                    pagination: {
+                        page,
+                        limit,
+                        total: 0,
+                        totalPages: 1
+                    }
+                });
+            }
+
+            // Real DB/connection/auth error: fail with 500
+            return res.status(500).json({ error: 'Ошибка загрузки журнала активности' });
+        }
+
+        res.json({
+            activity: logs || [],
+            pagination: {
+                page,
+                limit,
+                total: count !== null ? count : (logs || []).length,
+                totalPages: Math.ceil((count || 0) / limit) || 1
+            }
+        });
+    } catch (err) {
+        console.error('[BusAdmin Activity] Exception:', err);
+        res.status(500).json({ error: 'Ошибка загрузки журнала активности' });
     }
 });
 
