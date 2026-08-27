@@ -69,6 +69,25 @@ function getBookingPassengerCount(booking) {
 }
 
 /**
+ * Robustly extracts an array of seat numbers from arrays, JSON strings, or numbers.
+ */
+function extractSeatNumbers(seatNumbers) {
+    if (Array.isArray(seatNumbers)) return seatNumbers;
+    if (typeof seatNumbers === 'string') {
+        const trimmed = seatNumbers.trim();
+        if (trimmed.startsWith('[')) {
+            try {
+                const parsed = JSON.parse(trimmed);
+                if (Array.isArray(parsed)) return parsed;
+            } catch (e) {}
+        }
+        if (trimmed !== '') return [trimmed];
+    }
+    if (typeof seatNumbers === 'number') return [seatNumbers];
+    return [];
+}
+
+/**
  * Normalizes seat number to string representation for unique set deduplication ("12" === 12).
  */
 function normalizeSeat(seat) {
@@ -83,13 +102,12 @@ function normalizeSeat(seat) {
 function classifyBookingSource(channel, sourceType) {
     const raw = String(channel || sourceType || '').toLowerCase().trim();
     if (!raw) return 'unknown';
-
-    const onlineKeywords = ['web', 'telegram', 'carrier_link', 'partner_link', 'online', 'tg', 'bot'];
-    const manualKeywords = ['manual', 'carrier', 'cash', 'driver', 'cashier', 'office'];
-
-    if (onlineKeywords.some(k => raw.includes(k))) return 'online';
-    if (manualKeywords.some(k => raw.includes(k))) return 'manual';
-
+    if (raw === 'web' || raw === 'telegram' || raw === 'platform' || raw === 'carrier_link' || raw === 'partner_link') {
+        return 'online';
+    }
+    if (raw === 'manual' || raw === 'carrier' || raw === 'cash' || raw === 'dispatcher' || raw === 'driver') {
+        return 'manual';
+    }
     return 'unknown';
 }
 
@@ -130,8 +148,8 @@ function calculateTripFillStats(ticket, bookings = []) {
             pendingPaymentPassengers += pCount;
         }
 
-        // Seats normalization (12 === "12")
-        const seats = Array.isArray(b.seat_numbers) ? b.seat_numbers : [];
+        // Seats normalization (handles array, JSON string "[70]", or single number)
+        const seats = extractSeatNumbers(b.seat_numbers);
         for (const s of seats) {
             const norm = normalizeSeat(s);
             if (norm !== null) {
