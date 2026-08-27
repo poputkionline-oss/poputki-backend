@@ -4,6 +4,8 @@ const supabase = require('../db');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { verifyAndMigrateDurable, hashPassword } = require('../utils/passwordSecurity');
+const { resolveCarrierRole } = require('../utils/carrierAuth');
+
 
 // Professional Telegram initData verification
 // Use environment variable for bot token
@@ -372,30 +374,27 @@ router.post('/bus-login', async (req, res) => {
             return res.status(403).json({ error: 'Аккаунт заблокирован администратором' });
         }
 
-        let carrierId = user.id;
-        let memberRole = user.role === 'bus_driver' ? 'owner' : null;
-
         // Check carrier_members if user is an employee
+        let member = null;
         try {
-            const { data: member } = await supabase
+            const { data: mData } = await supabase
                 .from('carrier_members')
                 .select('carrier_id, role, is_active')
                 .eq('user_id', user.id)
                 .maybeSingle();
-
-            if (member) {
-                if (!member.is_active) {
-                    return res.status(403).json({ error: 'Доступ сотрудника отключен владельцем перевозчика' });
-                }
-                carrierId = member.carrier_id;
-                memberRole = member.role;
-            }
+            member = mData;
         } catch (mErr) {
             // graceful fallback if carrier_members not present
         }
 
-        // If neither bus_driver nor carrier_member
-        if (!memberRole && user.role !== 'bus_driver') {
+        // Canonical role resolution
+        const resolved = resolveCarrierRole({ user, member, carrierId: user.id });
+
+        if (resolved.isDeactivated) {
+            return res.status(403).json({ error: 'Доступ сотрудника отключен владельцем перевозчика' });
+        }
+
+        if (!resolved.role) {
             return res.status(403).json({ error: 'У пользователя нет прав доступа к кабинету перевозчика' });
         }
 
@@ -409,8 +408,8 @@ router.post('/bus-login', async (req, res) => {
         const token = jwt.sign(
             {
                 sub: String(user.id),
-                carrierId: carrierId,
-                role: memberRole || 'owner',
+                carrierId: resolved.carrierId,
+                role: resolved.role,
                 phone: user.phone
             },
             jwtSecret,
@@ -427,12 +426,13 @@ router.post('/bus-login', async (req, res) => {
                 id: user.id,
                 name: user.name,
                 phone: user.phone,
-                role: user.role,
-                carrierId,
-                memberRole: memberRole || 'owner'
+                role: resolved.role,
+                carrierId: resolved.carrierId,
+                memberRole: resolved.role
             },
             token
         });
+
     } catch (err) {
         console.error('[bus-login error]', err);
         res.status(500).json({ error: err.message });

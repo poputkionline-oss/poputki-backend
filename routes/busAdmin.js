@@ -1762,6 +1762,11 @@ router.patch('/members/:id', async (req, res) => {
             return res.status(404).json({ error: 'Сотрудник не найден в вашей компании' });
         }
 
+        // Owner protection: cannot edit owner's own record via employee API
+        if (member.user_id === req.carrier.user_id || member.role === 'owner') {
+            return res.status(400).json({ error: 'Нельзя изменять статус или роль владельца компании' });
+        }
+
         const updateData = {};
         const effectiveRole = role !== undefined ? role : member.role;
 
@@ -1852,13 +1857,18 @@ router.patch('/members/:id/status', async (req, res) => {
     try {
         const { data: member, error: mErr } = await supabase
             .from('carrier_members')
-            .select('id, user_id, carrier_id')
+            .select('id, user_id, carrier_id, role')
             .eq('id', id)
             .eq('carrier_id', carrierId)
             .single();
 
         if (mErr || !member) {
             return res.status(404).json({ error: 'Сотрудник не найден в вашей компании' });
+        }
+
+        // Owner protection
+        if (member.user_id === req.carrier.user_id || member.role === 'owner') {
+            return res.status(400).json({ error: 'Нельзя отключить доступ владельцу компании' });
         }
 
         const { error: uErr } = await supabase
@@ -1893,7 +1903,7 @@ router.delete('/members/:id', async (req, res) => {
     try {
         const { data: member, error: mErr } = await supabase
             .from('carrier_members')
-            .select('id')
+            .select('id, user_id, role')
             .eq('id', id)
             .eq('carrier_id', carrierId)
             .single();
@@ -1901,6 +1911,12 @@ router.delete('/members/:id', async (req, res) => {
         if (mErr || !member) {
             return res.status(404).json({ error: 'Сотрудник не найден в вашей компании' });
         }
+
+        // Owner protection
+        if (member.user_id === req.carrier.user_id || member.role === 'owner') {
+            return res.status(400).json({ error: 'Нельзя удалить владельца компании из системы' });
+        }
+
 
         // Soft-deactivate to preserve historical integrity (referential safety)
         const { error: uErr } = await supabase

@@ -2,6 +2,82 @@ const supabase = require('../db');
 const jwt = require('jsonwebtoken');
 
 /**
+ * Canonical Carrier Role Resolver
+ * 
+ * Deterministic Rules (Positive Ownership Proof):
+ * 1. Positive Root Owner Proof:
+ *    User has user.role === 'bus_driver' AND targetCarrierId matches user.id (the user is the carrier operator).
+ *    -> Effective role is ALWAYS 'owner'.
+ *    -> Anti-downgrade protection: A self-referencing or legacy carrier_members row (e.g. role='dispatcher' where user_id === carrier_id) CANNOT downgrade the owner.
+ * 2. Explicit Owner Member:
+ *    Member record exists for target carrier, member.role === 'owner', and member.is_active is true.
+ *    -> Effective role is 'owner'.
+ * 3. Hired Team Member (Positive Membership Proof):
+ *    Member record exists for target carrier with user_id !== carrier_id:
+ *    -> If !member.is_active -> blocked (isDeactivated: true).
+ *    -> If member.is_active -> effective role is member.role ('dispatcher' | 'driver' | 'accountant').
+ * 4. No Positive Ownership or Membership Proof:
+ *    -> Effective role is null (access denied).
+ */
+function resolveCarrierRole({ user, member, carrierId }) {
+    if (!user) return { role: null, carrierId: null, isOwner: false, isDeactivated: false, assignedTicketIds: [] };
+
+    // Resolve target carrier ID
+    let targetCarrierId = null;
+    if (carrierId !== undefined && carrierId !== null) {
+        targetCarrierId = parseInt(carrierId, 10);
+    } else if (member?.carrier_id) {
+        targetCarrierId = parseInt(member.carrier_id, 10);
+    }
+
+    const userId = parseInt(user.id, 10);
+
+    // 1. Positive Root Owner Proof: user has bus_driver role AND is operating their own carrier (userId === targetCarrierId)
+    const isProvenRootOwner = user.role === 'bus_driver' && targetCarrierId !== null && userId === targetCarrierId;
+    
+    // Explicit owner assignment in carrier_members
+    const hasExplicitOwnerRole = member && member.role === 'owner' && member.is_active && targetCarrierId !== null && parseInt(member.carrier_id, 10) === targetCarrierId;
+
+    if (isProvenRootOwner || hasExplicitOwnerRole) {
+        return {
+            role: 'owner',
+            carrierId: targetCarrierId,
+            isOwner: true,
+            isDeactivated: false,
+            assignedTicketIds: []
+        };
+    }
+
+    // 2. Positive Employee Membership Proof in carrier_members
+    if (member && targetCarrierId !== null && parseInt(member.carrier_id, 10) === targetCarrierId) {
+        if (!member.is_active) {
+            return {
+                role: null,
+                carrierId: targetCarrierId,
+                isOwner: false,
+                isDeactivated: true,
+                assignedTicketIds: []
+            };
+        }
+
+        const validRoles = ['dispatcher', 'driver', 'accountant'];
+        if (validRoles.includes(member.role)) {
+            return {
+                role: member.role,
+                carrierId: targetCarrierId,
+                isOwner: false,
+                isDeactivated: false,
+                assignedTicketIds: member.assigned_ticket_ids || []
+            };
+        }
+    }
+
+    // 3. Fallback: No positive ownership or membership proof -> No Access
+    return { role: null, carrierId: null, isOwner: false, isDeactivated: false, assignedTicketIds: [] };
+}
+
+
+/**
  * Middleware to authenticate Carrier / Operator requests.
  * ONLY accepts valid, cryptographically signed JWT tokens:
  * - Authorization: Bearer <jwt>
@@ -12,6 +88,7 @@ const jwt = require('jsonwebtoken');
  * - Validates cryptographic signature using process.env.JWT_SECRET (HS256).
  * - Validates issuer ('poputki.online'), audience ('poputki-carrier').
  * - Queries database in real-time on every sensitive request to verify user is NOT blocked.
+ * - Resolves canonical effective role server-side (prevents stale JWT downgrades).
  */
 async function carrierAuth(req, res, next) {
     try {
@@ -86,42 +163,42 @@ async function carrierAuth(req, res, next) {
             return res.status(403).json({ error: 'Аккаунт перевозчика заблокирован администратором' });
         }
 
-        let carrierId = decoded.carrierId ? parseInt(decoded.carrierId, 10) : user.id;
-        let memberRole = decoded.role || (user.role === 'bus_driver' ? 'owner' : null);
-        let assignedTicketIds = [];
-
         // Check carrier_members table if present
+        let member = null;
         try {
-            const { data: member } = await supabase
+            const { data: mData } = await supabase
                 .from('carrier_members')
                 .select('carrier_id, role, assigned_ticket_ids, is_active')
                 .eq('user_id', user.id)
                 .maybeSingle();
-
-            if (member) {
-                if (!member.is_active) {
-                    return res.status(403).json({ error: 'Доступ сотрудника отключен владельцем перевозчика' });
-                }
-                carrierId = member.carrier_id;
-                memberRole = member.role;
-                assignedTicketIds = member.assigned_ticket_ids || [];
-            }
+            member = mData;
         } catch (mErr) {
             // carrier_members table might not exist in early environments; fallback gracefully
         }
 
-        if (!memberRole && user.role !== 'bus_driver') {
+        // Canonical server-side role resolution
+        const resolved = resolveCarrierRole({
+            user,
+            member,
+            carrierId: decoded.carrierId ? parseInt(decoded.carrierId, 10) : user.id
+        });
+
+        if (resolved.isDeactivated) {
+            return res.status(403).json({ error: 'Доступ сотрудника отключен владельцем перевозчика' });
+        }
+
+        if (!resolved.role) {
             return res.status(403).json({ error: 'Пользователь не имеет активных прав перевозчика' });
         }
 
         req.carrier = {
             id: user.id,
-            carrier_id: carrierId || user.id,
+            carrier_id: resolved.carrierId,
             user_id: user.id,
-            role: memberRole || 'owner',
+            role: resolved.role,
             name: user.name,
             phone: user.phone,
-            assignedTicketIds: assignedTicketIds,
+            assignedTicketIds: resolved.assignedTicketIds || [],
             service_fee_percent: user.service_fee_percent ?? 10
         };
 
@@ -147,24 +224,27 @@ async function verifyTicketAccess(carrier, ticketId) {
 
     if (error || !ticket) return false;
 
-    const carrierTargetId = carrier.carrier_id || carrier.id;
-    // Must belong to this carrier organization
-    if (ticket.operator_id !== carrierTargetId && ticket.operator_id !== carrier.id) {
+    // Must belong to the carrier operator
+    if (ticket.operator_id !== carrier.carrier_id) {
         return false;
     }
 
-    // If role is agent or driver, verify ticket assignment
-    if (['agent', 'driver'].includes(carrier.role)) {
-        if (Array.isArray(carrier.assignedTicketIds) && carrier.assignedTicketIds.length > 0) {
-            return carrier.assignedTicketIds.includes(parseInt(ticketId, 10));
-        }
-        // If driver has no assigned tickets, reject access to unassigned tickets
-        if (carrier.role === 'driver') {
+    // Role-specific operational access:
+    // If role is driver, they MUST be assigned to this specific ticket
+    if (carrier.role === 'driver') {
+        const assigned = Array.isArray(carrier.assignedTicketIds) ? carrier.assignedTicketIds : [];
+        const isAssigned = assigned.some(id => String(id) === String(ticketId));
+        if (!isAssigned) {
             return false;
         }
     }
 
+    // Owner, Dispatcher, Accountant have company-wide access to operator's tickets
     return true;
 }
 
-module.exports = { carrierAuth, verifyTicketAccess };
+module.exports = {
+    carrierAuth,
+    verifyTicketAccess,
+    resolveCarrierRole
+};
