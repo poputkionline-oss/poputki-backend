@@ -285,6 +285,56 @@ async function getBusActiveTickets(supabaseClient, carrierId, busId) {
     return tickets;
 }
 
+/**
+ * Detects schedule conflicts for a bus on given dates and times
+ * Non-blocking check: returns list of conflicting active tickets without passenger PII
+ */
+async function checkBusScheduleConflict(supabaseClient, carrierId, busId, departureDate, departureTime, arrivalDate, arrivalTime) {
+    if (!busId || !departureDate) return [];
+
+    const { data: activeTickets, error } = await supabaseClient
+        .from('bus_tickets')
+        .select('id, from_city, to_city, departure_date, departure_time, arrival_date, arrival_time')
+        .eq('operator_id', carrierId)
+        .eq('bus_id', busId)
+        .eq('status', 'active');
+
+    if (error || !activeTickets || activeTickets.length === 0) return [];
+
+    const proposedStart = new Date(`${departureDate}T${departureTime || '00:00:00'}`).getTime();
+    const arrDate = arrivalDate || departureDate;
+    const arrTime = arrivalTime || departureTime || '23:59:59';
+    const proposedEnd = new Date(`${arrDate}T${arrTime}`).getTime();
+
+    if (isNaN(proposedStart) || isNaN(proposedEnd)) return [];
+
+    const conflicts = [];
+    for (const t of activeTickets) {
+        if (!t.departure_date) continue;
+        const existStart = new Date(`${t.departure_date}T${t.departure_time || '00:00:00'}`).getTime();
+        const existArrDate = t.arrival_date || t.departure_date;
+        const existArrTime = t.arrival_time || t.departure_time || '23:59:59';
+        const existEnd = new Date(`${existArrDate}T${existArrTime}`).getTime();
+
+        if (isNaN(existStart) || isNaN(existEnd)) continue;
+
+        // Interval overlap: ProposedStart < ExistEnd AND ProposedEnd > ExistStart
+        if (proposedStart < existEnd && proposedEnd > existStart) {
+            conflicts.push({
+                ticket_id: t.id,
+                from_city: t.from_city,
+                to_city: t.to_city,
+                departure_date: t.departure_date,
+                departure_time: t.departure_time,
+                arrival_date: t.arrival_date,
+                arrival_time: t.arrival_time
+            });
+        }
+    }
+
+    return conflicts;
+}
+
 module.exports = {
     CANONICAL_AMENITIES,
     VALID_BUS_TYPES,
@@ -295,5 +345,6 @@ module.exports = {
     validateBusPayload,
     checkDuplicatePlate,
     verifyBusAccess,
-    getBusActiveTickets
+    getBusActiveTickets,
+    checkBusScheduleConflict
 };

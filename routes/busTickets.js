@@ -1,8 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
+const jwt = require('jsonwebtoken');
 const { sendBroadcast } = require('../utils/telegramBot');
 const { uploadToCloudinary } = require('../utils/cloudinaryUtils');
+const { verifyBusAccess, checkBusScheduleConflict } = require('../utils/busHelper');
+const { logCarrierActivity, AUDIT_ACTIONS, AUDIT_ENTITY_TYPES } = require('../utils/auditHelper');
 
 /**
  * @swagger
@@ -14,6 +17,8 @@ const { uploadToCloudinary } = require('../utils/cloudinaryUtils');
  *         id:
  *           type: integer
  *         operator_id:
+ *           type: integer
+ *         bus_id:
  *           type: integer
  *         transport_company:
  *           type: string
@@ -63,31 +68,116 @@ router.post('/', async (req, res) => {
         departure_date, departure_time, arrival_date, arrival_time,
         duration_minutes, price, total_seats,
         bus_type, passenger_comments, intermediate_stops,
-        floor1_seats, floor2_seats, premium_price, photos
+        floor1_seats, floor2_seats, premium_price, photos,
+        bus_id, allow_bus_conflict
     } = req.body;
     try {
+        // Authenticate verified carrier context if Bearer token present
+        let verifiedCarrierId = null;
+        let verifiedRole = 'owner';
+        let verifiedUserId = null;
+        const authHeader = req.headers['authorization'];
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            try {
+                const token = authHeader.split(' ')[1];
+                const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+                    issuer: 'poputki.online',
+                    audience: 'poputki-carrier'
+                });
+                verifiedCarrierId = parseInt(decoded.carrierId || decoded.sub, 10);
+                verifiedRole = decoded.role || 'owner';
+                verifiedUserId = parseInt(decoded.sub, 10);
+            } catch (e) {
+                // Ignore token decode error for unauthenticated/legacy fallback
+            }
+        }
+
+        const effectiveOperatorId = verifiedCarrierId || parseInt(operator_id, 10);
+        if (!effectiveOperatorId) {
+            return res.status(400).json({ error: 'Не указан идентификатор перевозчика' });
+        }
+
         // Check if operator is blocked
         const { data: operator } = await supabase
             .from('users')
             .select('is_blocked')
-            .eq('id', operator_id)
+            .eq('id', effectiveOperatorId)
             .single();
 
         if (operator?.is_blocked) {
             return res.status(403).json({ error: 'Ваш аккаунт заблокирован. Вы не можете создавать новые рейсы.' });
         }
 
-        let photoResults = [];
-        if (photos && Array.isArray(photos)) {
-            for (const photo of photos) {
-                if (typeof photo === 'string' && photo.startsWith('data:image')) {
-                    try {
-                        const r = await uploadToCloudinary(photo, { folder: 'poputki/bus_photos' });
-                        photoResults.push({ url: r.url, public_id: r.public_id });
-                    } catch(e) { console.error('Cloudinary upload error:', e); }
-                } else if (typeof photo === 'object' && photo.url && photo.public_id) {
-                    // Already uploaded from frontend
-                    photoResults.push(photo);
+        let effectiveBusId = null;
+        let effectiveBusType = bus_type || 'single';
+        let effectiveTotalSeats = total_seats || 53;
+        let effectiveFloor1Seats = floor1_seats || null;
+        let effectiveFloor2Seats = floor2_seats || null;
+        let effectivePhotos = [];
+
+        // FLEET MODE: When bus_id is supplied, backend master data is the ultimate source of truth
+        if (bus_id) {
+            const bus = await verifyBusAccess({ carrier_id: effectiveOperatorId, role: verifiedRole }, bus_id, { allowArchived: false });
+            if (!bus) {
+                return res.status(403).json({ error: 'BUS_NOT_FOUND', message: 'Автобус не найден или доступ запрещен' });
+            }
+
+            if (bus.status !== 'active') {
+                return res.status(409).json({ error: 'BUS_NOT_AVAILABLE', message: 'Выбранный автобус недоступен для рейса (находится на ТО, неактивен или в архиве)' });
+            }
+
+            // Master capacity verification
+            const masterTotal = Number(bus.total_seats);
+            if (!masterTotal || masterTotal <= 0) {
+                return res.status(400).json({ error: 'INVALID_BUS_CAPACITY', message: 'Некорректная вместимость автобуса в базе данных' });
+            }
+
+            if (bus.bus_type === 'double') {
+                const f1 = Number(bus.floor1_seats);
+                const f2 = Number(bus.floor2_seats);
+                if (!f1 || !f2 || (f1 + f2 !== masterTotal)) {
+                    return res.status(400).json({ error: 'INVALID_BUS_FLOORS', message: 'Некорректное распределение мест по этажам в карточке автобуса' });
+                }
+            }
+
+            // Schedule conflict check (non-blocking: overrideable by authorized carrier)
+            const conflicts = await checkBusScheduleConflict(
+                supabase,
+                effectiveOperatorId,
+                bus.id,
+                departure_date,
+                departure_time,
+                arrival_date,
+                arrival_time
+            );
+
+            if (conflicts.length > 0 && !allow_bus_conflict) {
+                return res.status(409).json({
+                    error: 'BUS_SCHEDULE_CONFLICT',
+                    message: 'Этот автобус уже назначен на другой рейс в указанный интервал времени',
+                    conflicts
+                });
+            }
+
+            // Snapshot values from master bus record
+            effectiveBusId = bus.id;
+            effectiveBusType = bus.bus_type || 'single';
+            effectiveTotalSeats = masterTotal;
+            effectiveFloor1Seats = effectiveBusType === 'double' ? Number(bus.floor1_seats) : null;
+            effectiveFloor2Seats = effectiveBusType === 'double' ? Number(bus.floor2_seats) : null;
+            effectivePhotos = Array.isArray(bus.photos) ? bus.photos : [];
+        } else {
+            // LEGACY / MANUAL MODE: Process uploaded or passed photos
+            if (photos && Array.isArray(photos)) {
+                for (const photo of photos) {
+                    if (typeof photo === 'string' && photo.startsWith('data:image')) {
+                        try {
+                            const r = await uploadToCloudinary(photo, { folder: 'poputki/bus_photos' });
+                            effectivePhotos.push({ url: r.url, public_id: r.public_id });
+                        } catch(e) { console.error('Cloudinary upload error:', e); }
+                    } else if (typeof photo === 'object' && photo.url && photo.public_id) {
+                        effectivePhotos.push(photo);
+                    }
                 }
             }
         }
@@ -95,17 +185,22 @@ router.post('/', async (req, res) => {
         const { data: ticket, error } = await supabase
             .from('bus_tickets')
             .insert([{
-                operator_id, transport_company,
+                operator_id: effectiveOperatorId,
+                transport_company,
                 from_city, from_address, to_city, to_address,
                 departure_date, departure_time, arrival_date, arrival_time,
-                duration_minutes, price, total_seats: total_seats || 53,
-                reserved_seats: [], status: 'active',
-                bus_type: bus_type || 'single', passenger_comments,
+                duration_minutes, price,
+                total_seats: effectiveTotalSeats,
+                reserved_seats: [],
+                status: 'active',
+                bus_type: effectiveBusType,
+                passenger_comments,
                 intermediate_stops: intermediate_stops || [],
-                floor1_seats: floor1_seats || null,
-                floor2_seats: floor2_seats || null,
+                floor1_seats: effectiveFloor1Seats,
+                floor2_seats: effectiveFloor2Seats,
                 premium_price: premium_price || null,
-                photos: photoResults
+                photos: effectivePhotos,
+                bus_id: effectiveBusId
             }])
             .select('id')
             .single();
@@ -115,7 +210,7 @@ router.post('/', async (req, res) => {
         // Audit logging (non-blocking)
         await logCarrierActivity({
             supabase,
-            carrierContext: { carrier_id: operator_id, user_id: operator_id, role: 'owner' },
+            carrierContext: { carrier_id: effectiveOperatorId, user_id: verifiedUserId || effectiveOperatorId, role: verifiedRole },
             action: AUDIT_ACTIONS.TICKET_CREATED,
             entityType: AUDIT_ENTITY_TYPES.TICKET,
             entityId: ticket.id,
@@ -128,12 +223,13 @@ router.post('/', async (req, res) => {
                 arrival_date,
                 arrival_time,
                 price,
-                total_seats: total_seats || 53,
-                bus_type: bus_type || 'single'
+                total_seats: effectiveTotalSeats,
+                bus_type: effectiveBusType,
+                bus_id: effectiveBusId
             }
         });
 
-        res.json({ id: ticket.id, ...req.body });
+        res.json({ id: ticket.id, bus_id: effectiveBusId, ...req.body });
 
         // Telegram Notifications
         const dateStr = departure_date;
