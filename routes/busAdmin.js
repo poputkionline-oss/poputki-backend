@@ -12,6 +12,11 @@ const {
     detectAttentionItems,
     buildUpcomingTripsList
 } = require('../utils/dashboardHelper');
+const {
+    isSeatLockedByBooking,
+    isPendingHoldActive,
+    expirePendingPaymentBookings
+} = require('../utils/paymentExpirationHelper');
 
 
 /**
@@ -161,11 +166,11 @@ router.get('/tickets', async (req, res) => {
             return res.json([]);
         }
 
-        // Fetch all relevant bookings to calculate accurate reserved seats (including pending_payment)
+        // Fetch all relevant bookings to calculate accurate reserved seats (including active pending_payment)
         const ticketIds = filteredTickets.map(t => t.id);
         const { data: allBookings, error: bErr } = await supabase
             .from('bus_ticket_bookings')
-            .select('bus_ticket_id, seat_numbers, status')
+            .select('id, bus_ticket_id, seat_numbers, status, created_at, hold_expires_at')
             .in('bus_ticket_id', ticketIds)
             .neq('status', 'cancelled');
 
@@ -174,22 +179,25 @@ router.get('/tickets', async (req, res) => {
         }
 
         const result = tickets.map(t => {
-            // We count both 'confirmed' and 'pending_payment' as reserved to prevent double booking
+            // We count 'confirmed' and active 'pending_payment' as reserved to prevent double booking
             const ticketBookings = (allBookings || []).filter(b => b.bus_ticket_id === t.id);
             const actuallyReserved = [];
             
             ticketBookings.forEach(b => {
-                try {
-                    const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
-                    if (Array.isArray(seats)) {
-                        actuallyReserved.push(...seats);
-                    } else if (seats) {
-                        actuallyReserved.push(seats);
+                if (isSeatLockedByBooking(b)) {
+                    try {
+                        const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                        if (Array.isArray(seats)) {
+                            actuallyReserved.push(...seats);
+                        } else if (seats) {
+                            actuallyReserved.push(seats);
+                        }
+                    } catch (e) {
+                        console.error(`[BusAdmin] Error parsing seat_numbers for booking ${b.id}:`, e);
                     }
-                } catch (e) {
-                    console.error(`[BusAdmin] Error parsing seat_numbers for booking ${b.id}:`, e);
                 }
             });
+
 
             // Clean formatting for frontend
             return {
@@ -1123,8 +1131,8 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
 
         // Categorize bookings
         const confirmedBookings = allBookings.filter(b => b.status === 'confirmed');
-        const pendingBookings = allBookings.filter(b => b.status === 'pending_payment');
-        const cancelledBookings = allBookings.filter(b => b.status === 'cancelled');
+        const pendingBookings = allBookings.filter(b => b.status === 'pending_payment' && isPendingHoldActive(b));
+        const cancelledBookings = allBookings.filter(b => b.status === 'cancelled' || (b.status === 'pending_payment' && !isPendingHoldActive(b)));
 
         confirmedBookings.forEach(b => {
             let seats = [];
@@ -1149,6 +1157,7 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
                 heldSeats.add(s);
             });
         });
+
 
         let pendingPassengersCount = 0;
         pendingBookings.forEach(b => {

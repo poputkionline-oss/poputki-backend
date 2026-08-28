@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 const { sendPersonalMessage } = require('../utils/telegramBot');
+const { isSeatLockedByBooking, DEFAULT_HOLD_TTL_SECONDS } = require('../utils/paymentExpirationHelper');
 
 const SMARTPAY_API_KEY = process.env.SMARTPAY_API_KEY;
 const SMARTPAY_BASE_URL = 'https://ecomm.smartpay.tj/api/merchant';
@@ -14,12 +15,13 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://poputki.online';
 async function processSuccessfulPayment(booking) {
     const ticketId = booking.bus_ticket_id;
 
-    // Check for seat conflicts before confirming
+    // Check for seat conflicts before confirming (excluding current booking)
     const { data: confirmedBookings } = await supabase
         .from('bus_ticket_bookings')
-        .select('seat_numbers')
+        .select('id, seat_numbers')
         .eq('bus_ticket_id', ticketId)
-        .eq('status', 'confirmed');
+        .eq('status', 'confirmed')
+        .neq('id', booking.id);
 
     const takenSeats = [];
     (confirmedBookings || []).forEach(b => {
@@ -52,6 +54,7 @@ async function processSuccessfulPayment(booking) {
         .from('bus_tickets')
         .update({ reserved_seats: allTakenSeats })
         .eq('id', ticketId);
+
 
     // Send Telegram notifications (fire-and-forget)
     const ticket = booking.bus_tickets;
@@ -145,17 +148,19 @@ router.post('/create-invoice', async (req, res) => {
             }
         }
 
-        // Check seat availability against actual confirmed bookings only
+        // Check seat availability against active seat locks (confirmed OR active pending hold)
         const { data: existingBookings } = await supabase
             .from('bus_ticket_bookings')
-            .select('seat_numbers')
+            .select('seat_numbers, status, created_at, hold_expires_at')
             .eq('bus_ticket_id', bus_ticket_id)
-            .eq('status', 'confirmed');
+            .neq('status', 'cancelled');
 
         const takenSeats = [];
         (existingBookings || []).forEach(b => {
-            const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
-            takenSeats.push(...seats);
+            if (isSeatLockedByBooking(b)) {
+                const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                takenSeats.push(...seats);
+            }
         });
 
         const conflict = seat_numbers.some(s => takenSeats.includes(s));
@@ -200,6 +205,8 @@ router.post('/create-invoice', async (req, res) => {
             }
         }
 
+        const holdExpiresAt = new Date(Date.now() + DEFAULT_HOLD_TTL_SECONDS * 1000).toISOString();
+
         // Create booking with pending_payment status and verified attribution
         const { data: booking, error: insertError } = await supabase
             .from('bus_ticket_bookings')
@@ -211,6 +218,7 @@ router.post('/create-invoice', async (req, res) => {
                 passengers_data,
                 phone,
                 status: 'pending_payment',
+                hold_expires_at: holdExpiresAt,
                 total_price: totalPrice,
                 pickup_city,
                 drop_off_city,
@@ -222,6 +230,7 @@ router.post('/create-invoice', async (req, res) => {
             }])
             .select('id')
             .single();
+
 
         if (insertError) throw insertError;
 

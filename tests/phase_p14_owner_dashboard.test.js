@@ -151,7 +151,7 @@ describe('Phase P1.4: Carrier Owner Dashboard Aggregation & Semantics Suite', ()
         const tickets = [{ id: 101, total_seats: 50 }];
         const bookings = [
             { bus_ticket_id: 101, status: 'confirmed', total_price: 300, commission_amount: 15, carrier_amount: 285 },
-            { bus_ticket_id: 101, status: 'pending_payment', total_price: 150 }
+            { bus_ticket_id: 101, status: 'pending_payment', total_price: 150, created_at: new Date().toISOString() }
         ];
 
         const summary = buildTodaySummary(tickets, bookings);
@@ -346,7 +346,7 @@ describe('Phase P1.4: Carrier Owner Dashboard Aggregation & Semantics Suite', ()
         const bookings = [
             { bus_ticket_id: 1, status: 'confirmed', seat_numbers: [1, 2, 3, 4], total_price: 400, commission_amount: 20, carrier_amount: 380, channel: 'web' },
             { bus_ticket_id: 2, status: 'confirmed', seat_numbers: [10, 11, 12], total_price: 300, commission_amount: 15, carrier_amount: 285, channel: 'manual' },
-            { bus_ticket_id: 2, status: 'pending_payment', seat_numbers: [20], total_price: 100 }
+            { bus_ticket_id: 2, status: 'pending_payment', seat_numbers: [20], total_price: 100, created_at: new Date().toISOString() }
         ];
 
         const summary = buildTodaySummary(tickets, bookings);

@@ -39,7 +39,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     // 1. pending_payment is not counted as confirmed passenger in calculateTripFillStats
     it('1. pending_payment booking is not counted in passengers_count (confirmed only)', () => {
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 2, seat_numbers: [1, 2] },
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 2, seat_numbers: [1, 2], created_at: new Date().toISOString() },
             { id: 410, bus_ticket_id: 52, status: 'confirmed', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [3] }
         ];
 
@@ -50,9 +50,9 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     // 2. pending_payment does not increment boarding counters in calculateTripFillStats
     it('2. pending_payment booking does not increment boarded_count, pending_boarding_count, or no_show_count', () => {
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [1] },
-            { id: 408, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'boarded', passenger_count: 1, seat_numbers: [2] },
-            { id: 409, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'no_show', passenger_count: 1, seat_numbers: [3] }
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [1], created_at: new Date().toISOString() },
+            { id: 408, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'boarded', passenger_count: 1, seat_numbers: [2], created_at: new Date().toISOString() },
+            { id: 409, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'no_show', passenger_count: 1, seat_numbers: [3], created_at: new Date().toISOString() }
         ];
 
         const stats = calculateTripFillStats(sampleTicket, bookings);
@@ -65,8 +65,8 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     // 3. pending_payment correctly increments pending_payment_count and pending_payment_passengers
     it('3. pending_payment booking correctly increments pending_payment_count and pending_payment_passengers', () => {
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', passenger_count: 3, seat_numbers: [1, 2, 3] },
-            { id: 408, bus_ticket_id: 52, status: 'pending_payment', passenger_count: 2, seat_numbers: [4, 5] }
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', passenger_count: 3, seat_numbers: [1, 2, 3], created_at: new Date().toISOString() },
+            { id: 408, bus_ticket_id: 52, status: 'pending_payment', passenger_count: 2, seat_numbers: [4, 5], created_at: new Date().toISOString() }
         ];
 
         const stats = calculateTripFillStats(sampleTicket, bookings);
@@ -77,7 +77,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     // 4. pending_payment seats are tracked in held_seats and total booked_seats, but NOT confirmed_seats
     it('4. pending_payment seats are tracked in held_seats and booked_seats, but NOT confirmed_seats', () => {
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', seat_numbers: [1, 2] },
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', seat_numbers: [1, 2], created_at: new Date().toISOString() },
             { id: 410, bus_ticket_id: 52, status: 'confirmed', seat_numbers: [3, 4] }
         ];
 
@@ -143,7 +143,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     it('9. buildTodaySummary isolates confirmed gross_amount from pending_payment_gross', () => {
         const tickets = [sampleTicket];
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', total_price: 800, passenger_count: 1, seat_numbers: [1] },
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', total_price: 800, passenger_count: 1, seat_numbers: [1], created_at: new Date().toISOString() },
             { id: 408, bus_ticket_id: 52, status: 'confirmed', total_price: 1600, commission_amount: 160, carrier_amount: 1440, passenger_count: 2, seat_numbers: [2, 3] }
         ];
 
@@ -158,7 +158,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     it('10. buildTodaySummary calculates service_commission and carrier_amount strictly from confirmed bookings', () => {
         const tickets = [sampleTicket];
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', total_price: 800, commission_amount: 80, carrier_amount: 720, passenger_count: 1, seat_numbers: [1] },
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', total_price: 800, commission_amount: 80, carrier_amount: 720, passenger_count: 1, seat_numbers: [1], created_at: new Date().toISOString() },
             { id: 408, bus_ticket_id: 52, status: 'confirmed', total_price: 1000, commission_amount: 100, carrier_amount: 900, passenger_count: 1, seat_numbers: [2] }
         ];
 
@@ -171,7 +171,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     it('11. buildTodaySummary boarding counters include exclusively confirmed passengers', () => {
         const tickets = [sampleTicket];
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'boarded', passenger_count: 1, seat_numbers: [1] },
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'boarded', passenger_count: 1, seat_numbers: [1], created_at: new Date().toISOString() },
             { id: 408, bus_ticket_id: 52, status: 'confirmed', boarding_status: 'boarded', passenger_count: 2, seat_numbers: [2, 3] },
             { id: 409, bus_ticket_id: 52, status: 'confirmed', boarding_status: 'no_show', passenger_count: 1, seat_numbers: [4] }
         ];
@@ -186,7 +186,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
     it('12. buildTodaySummary tracks pending_payment_passengers accurately', () => {
         const tickets = [sampleTicket];
         const bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', passenger_count: 4, seat_numbers: [1, 2, 3, 4] }
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', passenger_count: 4, seat_numbers: [1, 2, 3, 4], created_at: new Date().toISOString() }
         ];
 
         const summary = buildTodaySummary(tickets, bookings);
@@ -316,7 +316,8 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
                 boarding_status: 'pending_boarding',
                 passenger_count: 3,
                 seat_numbers: [10, 11, 12],
-                total_price: 2400
+                total_price: 2400,
+                created_at: new Date().toISOString()
             },
             {
                 id: 410,
@@ -373,9 +374,9 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
         };
 
         const trip52Bookings = [
-            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [70], total_price: 800 },
-            { id: 408, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [1], total_price: 800 },
-            { id: 409, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [5], total_price: 800 }
+            { id: 407, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [70], total_price: 800, created_at: new Date().toISOString() },
+            { id: 408, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [1], total_price: 800, created_at: new Date().toISOString() },
+            { id: 409, bus_ticket_id: 52, status: 'pending_payment', boarding_status: 'pending_boarding', passenger_count: 1, seat_numbers: [5], total_price: 800, created_at: new Date().toISOString() }
         ];
 
         const stats = calculateTripFillStats(trip52Ticket, trip52Bookings);
@@ -405,7 +406,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
         const ticket = { id: 1, total_seats: 50 };
         const bookings = [
             { bus_ticket_id: 1, status: 'confirmed', seat_numbers: [1, 2, 3] },
-            { bus_ticket_id: 1, status: 'pending_payment', seat_numbers: [4, 5] },
+            { bus_ticket_id: 1, status: 'pending_payment', seat_numbers: [4, 5], created_at: new Date().toISOString() },
             { bus_ticket_id: 1, status: 'cancelled', seat_numbers: [6, 7] }
         ];
 

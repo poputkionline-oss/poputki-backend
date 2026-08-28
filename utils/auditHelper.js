@@ -15,6 +15,7 @@ const AUDIT_ACTIONS = Object.freeze({
     BOOKING_CREATED_MANUAL: 'booking_created_manual',
     BOOKING_UPDATED: 'booking_updated',
     BOOKING_CANCELLED: 'booking_cancelled',
+    BOOKING_PAYMENT_EXPIRED: 'booking_payment_expired',
     BOARDING_STATUS_CHANGED: 'boarding_status_changed',
 
     // Ticket / Trip Actions

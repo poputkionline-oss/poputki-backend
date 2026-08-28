@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
+const { isSeatLockedByBooking } = require('../utils/paymentExpirationHelper');
 const { sendPersonalMessage } = require('../utils/telegramBot');
 
 /**
@@ -62,14 +63,16 @@ router.post('/', async (req, res) => {
 
         const { data: existingBookings } = await supabase
             .from('bus_ticket_bookings')
-            .select('seat_numbers')
+            .select('seat_numbers, status, created_at, hold_expires_at')
             .eq('bus_ticket_id', bus_ticket_id)
-            .in('status', ['confirmed', 'pending_payment']);
+            .neq('status', 'cancelled');
 
         const takenSeats = [];
         (existingBookings || []).forEach(b => {
-            const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
-            takenSeats.push(...seats);
+            if (isSeatLockedByBooking(b)) {
+                const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                takenSeats.push(...seats);
+            }
         });
 
         const conflict = seat_numbers.some(s => takenSeats.includes(s));

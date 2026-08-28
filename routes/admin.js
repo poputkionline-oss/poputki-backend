@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 const { hashPassword } = require('../utils/passwordSecurity');
+const { expirePendingPaymentBookings } = require('../utils/paymentExpirationHelper');
 
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE;
 const ADMIN_SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN;
@@ -914,5 +915,27 @@ router.post('/polls/trigger', adminAuth, async (req, res) => {
     }
 });
 
-module.exports = router;
+/**
+ * POST /api/admin/bookings/expire-pending
+ *
+ * Centralized cleanup endpoint to expire stale pending_payment bookings and release held seats.
+ * Supports query parameter:
+ * - ?dry_run=true: Preview which bookings would be cancelled without modifying state
+ */
+router.post('/bookings/expire-pending', adminAuth, async (req, res) => {
+    try {
+        const dryRun = req.query.dry_run === 'true' || req.body?.dry_run === true;
+        const result = await expirePendingPaymentBookings(supabase, { dryRun });
 
+        res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            ...result
+        });
+    } catch (err) {
+        console.error('[Admin Expire Pending] Error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка обработки просроченных бронирований' });
+    }
+});
+
+module.exports = router;
