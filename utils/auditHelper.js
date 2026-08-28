@@ -30,16 +30,22 @@ const AUDIT_ACTIONS = Object.freeze({
     MEMBER_ROLE_CHANGED: 'member_role_changed',
     MEMBER_DEACTIVATED: 'member_deactivated',
     MEMBER_REACTIVATED: 'member_reactivated',
-    DRIVER_ASSIGNMENT_CHANGED: 'driver_assignment_changed'
+    DRIVER_ASSIGNMENT_CHANGED: 'driver_assignment_changed',
+
+    // Fleet / Bus Actions
+    BUS_CREATED: 'bus_created',
+    BUS_UPDATED: 'bus_updated',
+    BUS_ARCHIVED: 'bus_archived'
 });
 
 const AUDIT_ENTITY_TYPES = Object.freeze({
     BOOKING: 'booking',
     TICKET: 'ticket',
-    MEMBER: 'member'
+    MEMBER: 'member',
+    BUS: 'bus'
 });
 
-// Strict field whitelists for diffing (MEMBER contains ZERO PII: no phone, no name)
+// Strict field whitelists for diffing (MEMBER contains ZERO PII: no phone, no name; BUS contains NO VIN, NO license plate, NO photos, NO notes)
 const WHITELIST_FIELDS = Object.freeze({
     [AUDIT_ENTITY_TYPES.BOOKING]: new Set([
         'seat_numbers', 'pickup_city', 'drop_off_city', 'status', 
@@ -52,6 +58,10 @@ const WHITELIST_FIELDS = Object.freeze({
     ]),
     [AUDIT_ENTITY_TYPES.MEMBER]: new Set([
         'role', 'is_active', 'assigned_ticket_ids'
+    ]),
+    [AUDIT_ENTITY_TYPES.BUS]: new Set([
+        'name', 'brand', 'model', 'bus_type', 'total_seats',
+        'floor1_seats', 'floor2_seats', 'year_built', 'color', 'status', 'amenities'
     ])
 });
 

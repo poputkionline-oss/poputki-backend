@@ -243,8 +243,36 @@ async function verifyTicketAccess(carrier, ticketId) {
     return true;
 }
 
+/**
+ * Check if the carrier has access to a specific bus in the fleet
+ */
+async function verifyBusAccess(carrier, busId, { allowArchived = false } = {}) {
+    if (!busId || !carrier) return null;
+    const carrierId = carrier.carrier_id || carrier.id;
+    if (!carrierId) return null;
+
+    const { data: bus, error } = await supabase
+        .from('carrier_buses')
+        .select('*')
+        .eq('id', busId)
+        .maybeSingle();
+
+    if (error || !bus) return null;
+
+    if (parseInt(bus.carrier_id, 10) !== parseInt(carrierId, 10)) {
+        return null;
+    }
+
+    if (!allowArchived && bus.status === 'archived') {
+        return null;
+    }
+
+    return bus;
+}
+
 module.exports = {
     carrierAuth,
     verifyTicketAccess,
+    verifyBusAccess,
     resolveCarrierRole
 };

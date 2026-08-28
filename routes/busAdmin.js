@@ -17,6 +17,13 @@ const {
     isPendingHoldActive,
     expirePendingPaymentBookings
 } = require('../utils/paymentExpirationHelper');
+const {
+    validateBusPayload,
+    checkDuplicatePlate,
+    verifyBusAccess,
+    getBusActiveTickets
+} = require('../utils/busHelper');
+
 
 
 /**
@@ -2284,7 +2291,298 @@ router.get('/dashboard', async (req, res) => {
     }
 });
 
+// ============================================================================
+// CARRIER FLEET / МОЙ АВТОПАРК (PHASE A+B)
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/bus-admin/buses:
+ *   get:
+ *     summary: List buses belonging to authenticated carrier
+ *     tags: [Bus Admin Fleet]
+ */
+router.get('/buses', async (req, res) => {
+    // Security Gate: Drivers do not have fleet management access
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ error: 'Водители не имеют доступа к автопарку' });
+    }
+
+    const carrierId = req.carrier.carrier_id;
+
+    try {
+        let query = supabase
+            .from('carrier_buses')
+            .select('*')
+            .eq('carrier_id', carrierId);
+
+        if (req.query.include_archived !== 'true') {
+            query = query.neq('status', 'archived');
+        }
+
+        const { data: buses, error } = await query.order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        res.json(buses || []);
+    } catch (err) {
+        console.error('[BusAdmin Fleet] Error fetching buses:', err);
+        res.status(500).json({ error: 'Ошибка загрузки списка автобусов' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/buses/{id}:
+ *   get:
+ *     summary: Get single bus details with ownership verification
+ *     tags: [Bus Admin Fleet]
+ */
+router.get('/buses/:id', async (req, res) => {
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ error: 'Водители не имеют доступа к автопарку' });
+    }
+
+    const busId = req.params.id;
+
+    try {
+        const bus = await verifyBusAccess(req.carrier, busId, { allowArchived: true });
+        if (!bus) {
+            return res.status(404).json({ error: 'Автобус не найден или доступ запрещен' });
+        }
+
+        // Fetch active tickets count for operational awareness
+        const activeTickets = await getBusActiveTickets(supabase, req.carrier.carrier_id, bus.id);
+
+        res.json({
+            ...bus,
+            active_tickets: activeTickets,
+            active_tickets_count: activeTickets.length
+        });
+    } catch (err) {
+        console.error('[BusAdmin Fleet] Error fetching bus details:', err);
+        res.status(500).json({ error: 'Ошибка получения данных автобуса' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/buses:
+ *   post:
+ *     summary: Add a new bus to the carrier fleet
+ *     tags: [Bus Admin Fleet]
+ */
+router.post('/buses', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot add buses
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ error: 'Водители не имеют доступа к автопарку' });
+    }
+    if (req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Бухгалтеры имеют доступ только для чтения' });
+    }
+
+    // Input Validation
+    const validation = validateBusPayload(req.body, { isUpdate: false });
+    if (!validation.valid) {
+        return res.status(400).json({ error: validation.error });
+    }
+
+    // Tenant Isolation: carrier_id taken exclusively from verified JWT
+    const carrierId = req.carrier.carrier_id;
+
+    try {
+        // Uniqueness check for active plate
+        const isDuplicate = await checkDuplicatePlate(supabase, carrierId, validation.sanitizedData.license_plate);
+        if (isDuplicate) {
+            return res.status(400).json({ error: 'Автобус с таким госномером уже зарегистрирован в вашем автопарке' });
+        }
+
+        const newBusData = {
+            ...validation.sanitizedData,
+            carrier_id: carrierId,
+            status: validation.sanitizedData.status || 'active'
+        };
+
+        const { data: newBus, error } = await supabase
+            .from('carrier_buses')
+            .insert([newBusData])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // Activity Audit Logging (safe diff with zero secrets / PII)
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BUS_CREATED,
+            entityType: AUDIT_ENTITY_TYPES.BUS,
+            entityId: newBus.id,
+            entityLabel: `Автобус ${newBus.brand} ${newBus.model} (${newBus.name})`,
+            newData: newBus
+        });
+
+        res.status(201).json({
+            success: true,
+            bus: newBus
+        });
+    } catch (err) {
+        console.error('[BusAdmin Fleet] Error creating bus:', err);
+        res.status(500).json({ error: err.message || 'Ошибка добавления автобуса' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/buses/{id}:
+ *   patch:
+ *     summary: Update bus attributes with ownership verification
+ *     tags: [Bus Admin Fleet]
+ */
+router.patch('/buses/:id', async (req, res) => {
+    // Security Gate: Drivers and Accountants cannot edit buses
+    if (req.carrier.role === 'driver') {
+        return res.status(403).json({ error: 'Водители не имеют доступа к автопарку' });
+    }
+    if (req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Бухгалтеры имеют доступ только для чтения' });
+    }
+
+    const busId = req.params.id;
+
+    try {
+        const oldBus = await verifyBusAccess(req.carrier, busId, { allowArchived: false });
+        if (!oldBus) {
+            return res.status(404).json({ error: 'Автобус не найден, заархивирован или доступ запрещен' });
+        }
+
+        const validation = validateBusPayload(req.body, { isUpdate: true });
+        if (!validation.valid) {
+            return res.status(400).json({ error: validation.error });
+        }
+
+        // Check duplicate plate if license_plate was modified
+        if (validation.sanitizedData.license_plate && validation.sanitizedData.license_plate !== oldBus.license_plate) {
+            const isDuplicate = await checkDuplicatePlate(supabase, req.carrier.carrier_id, validation.sanitizedData.license_plate, oldBus.id);
+            if (isDuplicate) {
+                return res.status(400).json({ error: 'Автобус с таким госномером уже зарегистрирован в вашем автопарке' });
+            }
+        }
+
+        const updatePayload = {
+            ...validation.sanitizedData,
+            updated_at: new Date().toISOString()
+        };
+
+        const { data: updatedBus, error } = await supabase
+            .from('carrier_buses')
+            .update(updatePayload)
+            .eq('id', busId)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // Activity Audit Logging
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BUS_UPDATED,
+            entityType: AUDIT_ENTITY_TYPES.BUS,
+            entityId: busId,
+            entityLabel: `Автобус ${updatedBus.brand} ${updatedBus.model} (${updatedBus.name})`,
+            oldData: oldBus,
+            newData: updatedBus
+        });
+
+        res.json({
+            success: true,
+            bus: updatedBus
+        });
+    } catch (err) {
+        console.error('[BusAdmin Fleet] Error updating bus:', err);
+        res.status(500).json({ error: err.message || 'Ошибка обновления данных автобуса' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/buses/{id}/archive:
+ *   post:
+ *     summary: Archive a bus (Owner only, non-destructive soft archive)
+ *     tags: [Bus Admin Fleet]
+ */
+router.post('/buses/:id/archive', async (req, res) => {
+    // Security Gate: Only Owner can archive buses
+    if (req.carrier.role !== 'owner') {
+        return res.status(403).json({ error: 'Только владелец компании может архивировать автобус' });
+    }
+
+    const busId = req.params.id;
+
+    try {
+        const oldBus = await verifyBusAccess(req.carrier, busId, { allowArchived: true });
+        if (!oldBus) {
+            return res.status(404).json({ error: 'Автобус не найден или доступ запрещен' });
+        }
+
+        if (oldBus.status === 'archived') {
+            return res.json({ success: true, message: 'Автобус уже находится в архиве', bus: oldBus });
+        }
+
+        // Check active / future tickets (Strict Policy: Cannot archive bus with active future trips)
+        const activeTickets = await getBusActiveTickets(supabase, req.carrier.carrier_id, busId);
+        if (activeTickets.length > 0) {
+            return res.status(409).json({
+                error: 'BUS_HAS_ACTIVE_TRIPS',
+                message: `Невозможно архивировать автобус: назначено активных рейсов — ${activeTickets.length}`,
+                active_tickets_count: activeTickets.length
+            });
+        }
+
+        const { data: archivedBus, error } = await supabase
+            .from('carrier_buses')
+            .update({
+                status: 'archived',
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', busId)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // Activity Audit Logging (only emitted if archive succeeded)
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BUS_ARCHIVED,
+            entityType: AUDIT_ENTITY_TYPES.BUS,
+            entityId: busId,
+            entityLabel: `Автобус ${oldBus.brand} ${oldBus.model} (${oldBus.name}) [Архив]`,
+            oldData: oldBus,
+            newData: archivedBus
+        });
+
+        res.json({
+            success: true,
+            message: 'Автобус успешно заархивирован',
+            active_tickets_count: 0,
+            bus: archivedBus
+        });
+    } catch (err) {
+        console.error('[BusAdmin Fleet] Error archiving bus:', err);
+        res.status(500).json({ error: err.message || 'Ошибка архивации автобуса' });
+    }
+});
+
+/**
+ * Physical DELETE is disabled to prevent data corruption and foreign key integrity errors
+ */
+router.delete('/buses/:id', (req, res) => {
+    res.status(405).json({
+        error: 'Физическое удаление автобуса запрещено. Используйте архивацию POST /api/bus-admin/buses/:id/archive'
+    });
+});
 
 module.exports = router;
-
-
