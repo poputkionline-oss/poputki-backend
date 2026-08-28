@@ -3,6 +3,8 @@
  * Phase: P1.4 Owner Dashboard (Hardened & Performance-Optimized)
  */
 
+const { isPendingHoldActive } = require('./paymentExpirationHelper');
+
 /**
  * Calculates current business local date in YYYY-MM-DD format and local time HH:mm (Asia/Dushanbe UTC+5).
  */
@@ -114,7 +116,7 @@ function classifyBookingSource(channel, sourceType) {
 /**
  * Calculates unique booked seats and fill rate for a trip.
  */
-function calculateTripFillStats(ticket, bookings = []) {
+function calculateTripFillStats(ticket, bookings = [], now = new Date()) {
     const capacity = Number(ticket.total_seats) || 53;
     const activeBookings = (bookings || []).filter(b => String(b.bus_ticket_id) === String(ticket.id) && b.status !== 'cancelled');
 
@@ -134,6 +136,7 @@ function calculateTripFillStats(ticket, bookings = []) {
     for (const b of activeBookings) {
         const isConfirmed = b.status === 'confirmed';
         const isPending = b.status === 'pending_payment';
+        const isHoldActive = isPending && isPendingHoldActive(b, now);
         const pCount = getBookingPassengerCount(b);
 
         if (isConfirmed) {
@@ -143,22 +146,25 @@ function calculateTripFillStats(ticket, bookings = []) {
             if (b.boarding_status === 'boarded') boardedCount++;
             else if (b.boarding_status === 'no_show') noShowCount++;
             else pendingBoardingCount++;
-        } else if (isPending) {
+        } else if (isHoldActive) {
             pendingPaymentCount++;
             pendingPaymentPassengers += pCount;
         }
 
         // Seats normalization (handles array, JSON string "[70]", or single number)
-        const seats = extractSeatNumbers(b.seat_numbers);
-        for (const s of seats) {
-            const norm = normalizeSeat(s);
-            if (norm !== null) {
-                uniqueSeats.add(norm);
-                if (isConfirmed) confirmedSeats.add(norm);
-                if (isPending) heldSeats.add(norm);
+        if (isConfirmed || isHoldActive) {
+            const seats = extractSeatNumbers(b.seat_numbers);
+            for (const s of seats) {
+                const norm = normalizeSeat(s);
+                if (norm !== null) {
+                    uniqueSeats.add(norm);
+                    if (isConfirmed) confirmedSeats.add(norm);
+                    if (isHoldActive) heldSeats.add(norm);
+                }
             }
         }
     }
+
 
     const bookedSeats = uniqueSeats.size;
     const confirmedSeatsCount = confirmedSeats.size;
@@ -188,8 +194,9 @@ function calculateTripFillStats(ticket, bookings = []) {
 /**
  * Aggregates summary KPI for Today's operations.
  */
-function buildTodaySummary(todayTickets = [], todayBookings = []) {
+function buildTodaySummary(todayTickets = [], todayBookings = [], now = new Date()) {
     let totalCapacity = 0;
+
     let totalBookedSeats = 0;
     let totalPassengers = 0;
 
@@ -214,7 +221,7 @@ function buildTodaySummary(todayTickets = [], todayBookings = []) {
     // Per-ticket fill stats
     for (const ticket of todayTickets) {
         const ticketBookings = todayBookings.filter(b => String(b.bus_ticket_id) === String(ticket.id));
-        const stats = calculateTripFillStats(ticket, ticketBookings);
+        const stats = calculateTripFillStats(ticket, ticketBookings, now);
         totalCapacity += stats.capacity;
         totalBookedSeats += stats.booked_seats;
     }
@@ -247,15 +254,20 @@ function buildTodaySummary(todayTickets = [], todayBookings = []) {
             else pendingBoardingPassengers += pCount;
 
         } else if (b.status === 'pending_payment') {
-            pendingPaymentBookings++;
-            pendingPaymentGross += Number(b.total_price || 0);
-            pendingPaymentPassengers += pCount;
+            if (isPendingHoldActive(b, now)) {
+                pendingPaymentBookings++;
+                pendingPaymentGross += Number(b.total_price || 0);
+                pendingPaymentPassengers += pCount;
+            } else {
+                cancelledBookings++;
+            }
         } else if (b.status === 'cancelled') {
             cancelledBookings++;
         }
     }
 
     const freeSeats = Math.max(0, totalCapacity - totalBookedSeats);
+
     const avgFillRate = totalCapacity > 0 ? Math.min(100, Math.round((totalBookedSeats / totalCapacity) * 1000) / 10) : 0;
     const onlineDenominator = onlineConfirmed + manualConfirmed;
     const onlineShare = onlineDenominator > 0 ? Math.round((onlineConfirmed / onlineDenominator) * 1000) / 10 : 0;
@@ -298,11 +310,32 @@ function buildTodaySummary(todayTickets = [], todayBookings = []) {
 
 
 /**
+ * Resolves exact departure timestamp for a ticket in milliseconds (UTC).
+ * Supports ISO date + time with canonical timezone offset (default +05:00 for Asia/Dushanbe).
+ */
+function getTicketDepartureTimestamp(ticket, timeZoneOffset = '+05:00') {
+    if (!ticket || !ticket.departure_date) return null;
+    const dateStr = String(ticket.departure_date).trim();
+    let timeStr = String(ticket.departure_time || '00:00:00').trim();
+    if (timeStr.length === 5) timeStr += ':00';
+    if (!/^\d{2}:\d{2}:\d{2}$/.test(timeStr)) timeStr = '00:00:00';
+    
+    if (dateStr.includes('T')) {
+        const ts = new Date(dateStr).getTime();
+        return isNaN(ts) ? null : ts;
+    }
+
+    const isoString = `${dateStr}T${timeStr}${timeZoneOffset}`;
+    const ts = new Date(isoString).getTime();
+    return isNaN(ts) ? null : ts;
+}
+
+/**
  * Detects attention items based on deterministic business rules.
  */
-function detectAttentionItems(todayTickets = [], upcomingTickets = [], allRelevantBookings = [], activeDrivers = []) {
+function detectAttentionItems(todayTickets = [], upcomingTickets = [], allRelevantBookings = [], activeDrivers = [], now = Date.now()) {
     const attention = [];
-    const now = Date.now();
+    const nowMs = typeof now === 'number' ? now : (now instanceof Date ? now.getTime() : Date.now());
     const thirtyMinutesMs = 30 * 60 * 1000;
 
     // Normalizing assigned_ticket_ids to strings for type-safety ("123" === 123)
@@ -321,7 +354,7 @@ function detectAttentionItems(todayTickets = [], upcomingTickets = [], allReleva
     const stalePending = allRelevantBookings.filter(b => 
         b.status === 'pending_payment' && 
         b.created_at && 
-        new Date(b.created_at).getTime() <= (now - thirtyMinutesMs)
+        new Date(b.created_at).getTime() <= (nowMs - thirtyMinutesMs)
     );
 
     if (stalePending.length > 0) {
@@ -337,20 +370,63 @@ function detectAttentionItems(todayTickets = [], upcomingTickets = [], allReleva
     }
 
     // 2. Upcoming trips without assigned driver
-    const tripsNear = [...todayTickets, ...upcomingTickets.slice(0, 5)];
+    // Rule:
+    // departure > 24 hours: do not show in attention
+    // departure <= 24 hours and > 6 hours: WARNING
+    // departure <= 6 hours: CRITICAL
+    // active driver assigned: alert disappears
+    const tripsNear = [...todayTickets, ...upcomingTickets];
     const uniqueTripsNear = Array.from(new Map(tripsNear.map(t => [String(t.id), t])).values());
 
-    const unassignedTrips = uniqueTripsNear.filter(t => !assignedTicketIds.has(String(t.id)));
-    if (unassignedTrips.length > 0) {
-        attention.push({
-            id: 'unassigned_drivers',
-            type: 'WARNING',
-            icon: '👤',
-            title: `Рейсы без назначенного водителя (${unassignedTrips.length})`,
-            message: `На ближайшие рейсы (${unassignedTrips.map(t => `#${t.id}`).join(', ')}) еще не назначен водитель для проведения посадки.`,
-            action_url: '/bus-admin?tab=team',
-            count: unassignedTrips.length
-        });
+    const unassignedWithUrgency = [];
+    for (const t of uniqueTripsNear) {
+        if (!assignedTicketIds.has(String(t.id))) {
+            const depTs = getTicketDepartureTimestamp(t);
+            let diffHours;
+            if (depTs !== null) {
+                diffHours = (depTs - nowMs) / (1000 * 60 * 60);
+            } else {
+                // Fallback for mocks without departure_date
+                const isToday = todayTickets.some(tt => String(tt.id) === String(t.id));
+                diffHours = isToday ? 2 : 12;
+            }
+
+            // Exclude trips departing > 24 hours away or long passed (<-4h)
+            if (diffHours <= 24 && diffHours >= -4) {
+                unassignedWithUrgency.push({
+                    ticket: t,
+                    diffHours,
+                    isCritical: diffHours <= 6
+                });
+            }
+        }
+    }
+
+    if (unassignedWithUrgency.length > 0) {
+        const hasCritical = unassignedWithUrgency.some(u => u.isCritical);
+        const ticketIdsStr = unassignedWithUrgency.map(u => `#${u.ticket.id}`).join(', ');
+
+        if (hasCritical) {
+            attention.push({
+                id: 'unassigned_drivers',
+                type: 'CRITICAL',
+                icon: '🚨',
+                title: `Срочно: рейсы без водителя (${unassignedWithUrgency.length})`,
+                message: `До отправления рейсов (${ticketIdsStr}) осталось менее 6 часов. Срочно назначьте водителя для проведения посадки.`,
+                action_url: '/bus-admin?tab=team',
+                count: unassignedWithUrgency.length
+            });
+        } else {
+            attention.push({
+                id: 'unassigned_drivers',
+                type: 'WARNING',
+                icon: '👤',
+                title: `Рейсы без назначенного водителя (${unassignedWithUrgency.length})`,
+                message: `На рейсы с отправлением в течение 24 часов (${ticketIdsStr}) еще не назначен водитель.`,
+                action_url: '/bus-admin?tab=team',
+                count: unassignedWithUrgency.length
+            });
+        }
     }
 
     // 3. Today's trips with pending boarding
@@ -447,5 +523,6 @@ module.exports = {
     calculateTripFillStats,
     buildTodaySummary,
     detectAttentionItems,
-    buildUpcomingTripsList
+    buildUpcomingTripsList,
+    getTicketDepartureTimestamp
 };
