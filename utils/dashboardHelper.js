@@ -3,7 +3,39 @@
  * Phase: P1.4 Owner Dashboard (Hardened & Performance-Optimized)
  */
 
-const { isPendingHoldActive } = require('./paymentExpirationHelper');
+const PAYMENT_HOLD_TTL_MS = 30 * 60 * 1000;
+
+function isPendingHoldActive(booking, now = new Date()) {
+    if (!booking || booking.status !== 'pending_payment') {
+        return false;
+    }
+
+    let expiresAt = null;
+
+    if (booking.hold_expires_at) {
+        const parsed = new Date(booking.hold_expires_at);
+        if (!Number.isNaN(parsed.getTime())) {
+            expiresAt = parsed;
+        }
+    }
+
+    // Legacy bookings: SmartPay invoice lifetime = 30 minutes.
+    if (!expiresAt && booking.created_at) {
+        const createdAt = new Date(booking.created_at);
+        if (!Number.isNaN(createdAt.getTime())) {
+            expiresAt = new Date(createdAt.getTime() + PAYMENT_HOLD_TTL_MS);
+        }
+    }
+
+    if (!expiresAt) {
+        return false;
+    }
+
+    const currentTime =
+        now instanceof Date ? now.getTime() : new Date(now).getTime();
+
+    return expiresAt.getTime() > currentTime;
+}
 
 /**
  * Calculates current business local date in YYYY-MM-DD format and local time HH:mm (Asia/Dushanbe UTC+5).
@@ -81,7 +113,7 @@ function extractSeatNumbers(seatNumbers) {
             try {
                 const parsed = JSON.parse(trimmed);
                 if (Array.isArray(parsed)) return parsed;
-            } catch (e) {}
+            } catch (e) { }
         }
         if (trimmed !== '') return [trimmed];
     }
@@ -236,8 +268,8 @@ function buildTodaySummary(todayTickets = [], todayBookings = [], now = new Date
 
             const gross = Number(b.total_price || 0);
             const comm = Number(b.commission_amount || 0);
-            const net = b.carrier_amount !== undefined && b.carrier_amount !== null 
-                ? Number(b.carrier_amount) 
+            const net = b.carrier_amount !== undefined && b.carrier_amount !== null
+                ? Number(b.carrier_amount)
                 : (gross - comm);
 
             grossAmount += gross;
@@ -319,7 +351,7 @@ function getTicketDepartureTimestamp(ticket, timeZoneOffset = '+05:00') {
     let timeStr = String(ticket.departure_time || '00:00:00').trim();
     if (timeStr.length === 5) timeStr += ':00';
     if (!/^\d{2}:\d{2}:\d{2}$/.test(timeStr)) timeStr = '00:00:00';
-    
+
     if (dateStr.includes('T')) {
         const ts = new Date(dateStr).getTime();
         return isNaN(ts) ? null : ts;
@@ -351,9 +383,9 @@ function detectAttentionItems(todayTickets = [], upcomingTickets = [], allReleva
     }
 
     // 1. Stale pending payments (> 30 min) on relevant active trips
-    const stalePending = allRelevantBookings.filter(b => 
-        b.status === 'pending_payment' && 
-        b.created_at && 
+    const stalePending = allRelevantBookings.filter(b =>
+        b.status === 'pending_payment' &&
+        b.created_at &&
         new Date(b.created_at).getTime() <= (nowMs - thirtyMinutesMs)
     );
 
@@ -431,9 +463,9 @@ function detectAttentionItems(todayTickets = [], upcomingTickets = [], allReleva
 
     // 3. Today's trips with pending boarding
     const todayTicketIds = new Set(todayTickets.map(t => String(t.id)));
-    const todayPendingBoarding = allRelevantBookings.filter(b => 
-        todayTicketIds.has(String(b.bus_ticket_id)) && 
-        b.status === 'confirmed' && 
+    const todayPendingBoarding = allRelevantBookings.filter(b =>
+        todayTicketIds.has(String(b.bus_ticket_id)) &&
+        b.status === 'confirmed' &&
         (!b.boarding_status || b.boarding_status === 'pending_boarding')
     );
 
@@ -450,8 +482,8 @@ function detectAttentionItems(todayTickets = [], upcomingTickets = [], allReleva
     }
 
     // 4. No-show passengers detected today
-    const todayNoShows = allRelevantBookings.filter(b => 
-        todayTicketIds.has(String(b.bus_ticket_id)) && 
+    const todayNoShows = allRelevantBookings.filter(b =>
+        todayTicketIds.has(String(b.bus_ticket_id)) &&
         b.boarding_status === 'no_show'
     );
 
