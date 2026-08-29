@@ -7,6 +7,11 @@ const { uploadToCloudinary } = require('../utils/cloudinaryUtils');
 const { verifyBusAccess, checkBusScheduleConflict } = require('../utils/busHelper');
 const { buildPublicBusDetails } = require('../utils/publicBusHelper');
 const { logCarrierActivity, AUDIT_ACTIONS, AUDIT_ENTITY_TYPES } = require('../utils/auditHelper');
+const {
+    extractBookingIdFromToken,
+    verifyTicketToken,
+    buildPassengerTicketProjection
+} = require('../utils/ticketHelper');
 
 /**
  * @swagger
@@ -430,6 +435,77 @@ router.get('/:id', async (req, res) => {
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-tickets/verify/{token}:
+ *   get:
+ *     summary: Public verification of a passenger ticket via QR token
+ *     tags: [Bus Tickets]
+ */
+router.get('/verify/:token', async (req, res) => {
+    const { token } = req.params;
+
+    const bookingId = extractBookingIdFromToken(token);
+    if (!bookingId) {
+        return res.status(404).json({ valid: false, error: 'Билет не найден или некорректный QR-код' });
+    }
+
+    try {
+        const { data: booking, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select(`
+                id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
+                boarding_status, boarded_at,
+                commission_rate, commission_amount, carrier_amount,
+                users:passenger_id (name)
+            `)
+            .eq('id', bookingId)
+            .maybeSingle();
+
+        if (bErr || !booking) {
+            return res.status(404).json({ valid: false, error: 'Билет не найден' });
+        }
+
+        const isTokenValid = verifyTicketToken(token, booking.id, booking.created_at || '');
+        if (!isTokenValid) {
+            return res.status(403).json({ valid: false, error: 'Недействительный или поддельный токен билета' });
+        }
+
+        const { data: ticket, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select(`
+                *,
+                operator:users!operator_id (transport_company_name)
+            `)
+            .eq('id', booking.bus_ticket_id)
+            .maybeSingle();
+
+        if (tErr || !ticket) {
+            return res.status(404).json({ valid: false, error: 'Рейс не найден' });
+        }
+
+        let busMaster = null;
+        if (ticket.bus_id) {
+            const { data: bData } = await supabase
+                .from('carrier_buses')
+                .select('*')
+                .eq('id', ticket.bus_id)
+                .maybeSingle();
+            busMaster = bData || null;
+        }
+
+        const projection = buildPassengerTicketProjection(booking, ticket, busMaster, { isPublic: true });
+
+        res.json({
+            valid: true,
+            ticket: projection
+        });
+    } catch (err) {
+        console.error('[Public Ticket Verify] Error:', err);
+        res.status(500).json({ valid: false, error: 'Ошибка проверки билета' });
     }
 });
 

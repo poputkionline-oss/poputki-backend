@@ -30,7 +30,7 @@ describe('PHASE UNPAID BOOKING SEMANTICS TEST SUITE', () => {
         operator_id: 11,
         total_seats: 50,
         price: 800,
-        departure_date: '2026-08-28',
+        departure_date: '2026-09-28',
         departure_time: '10:00',
         from_city: 'Нижневартовск',
         to_city: 'Канибадам'

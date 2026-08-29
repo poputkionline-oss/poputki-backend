@@ -24,6 +24,10 @@ const {
     getBusActiveTickets,
     validateBusReplacement
 } = require('../utils/busHelper');
+const {
+    buildPassengerTicketProjection,
+    buildTripPrintManifest
+} = require('../utils/ticketHelper');
 
 
 
@@ -1331,6 +1335,149 @@ router.get('/tickets/:ticketId/summary', async (req, res) => {
         res.status(500).json({ error: err.message || 'Ошибка получения финансовой сводки рейса' });
     }
 });
+
+/**
+ * @swagger
+ * /api/bus-admin/tickets/{ticketId}/print-manifest:
+ *   get:
+ *     summary: Get bulk printable tickets manifest for a trip sorted by seat number
+ *     tags: [Bus Admin]
+ */
+router.get('/tickets/:ticketId/print-manifest', async (req, res) => {
+    const { ticketId } = req.params;
+
+    try {
+        const hasAccess = await verifyTicketAccess(req.carrier, ticketId);
+        if (!hasAccess) {
+            return res.status(403).json({ error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+        }
+
+        const { data: ticket, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select(`
+                *,
+                operator:users!operator_id (id, name, phone)
+            `)
+            .eq('id', ticketId)
+            .maybeSingle();
+
+        if (tErr || !ticket) {
+            return res.status(404).json({ error: 'Рейс не найден' });
+        }
+
+        // Fetch master bus vehicle if bus_id is present
+        let busMaster = null;
+        if (ticket.bus_id) {
+            const { data: bData } = await supabase
+                .from('carrier_buses')
+                .select('*')
+                .eq('id', ticket.bus_id)
+                .maybeSingle();
+            busMaster = bData || null;
+        }
+
+        // Fetch all bookings for this ticket
+        const { data: bookings, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select(`
+                id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, phone, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
+                boarding_status, boarded_at, boarded_by_user_id,
+                channel, source_type, source_id, created_by_user_id,
+                commission_rate, commission_amount, carrier_amount,
+                users:passenger_id (name, phone)
+            `)
+            .eq('bus_ticket_id', ticketId)
+            .eq('status', 'confirmed');
+
+        if (bErr) throw bErr;
+
+        const tickets = buildTripPrintManifest(ticket, bookings || [], busMaster);
+
+        res.json({
+            tripId: Number(ticketId),
+            fromCity: ticket.from_city,
+            toCity: ticket.to_city,
+            departureDate: ticket.departure_date,
+            departureTime: ticket.departure_time ? ticket.departure_time.substring(0, 5) : '',
+            bus: busMaster ? {
+                brand: busMaster.brand,
+                model: busMaster.model,
+                licensePlate: busMaster.license_plate,
+                busType: ticket.bus_type || 'single'
+            } : null,
+            totalConfirmedTickets: tickets.length,
+            tickets
+        });
+    } catch (err) {
+        console.error('[BusAdmin Print Manifest] Error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка генерации списка билетов' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/bookings/{bookingId}/ticket:
+ *   get:
+ *     summary: Get single electronic/printable passenger ticket projection
+ *     tags: [Bus Admin]
+ */
+router.get('/bookings/:bookingId/ticket', async (req, res) => {
+    const { bookingId } = req.params;
+
+    try {
+        const { data: booking, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select(`
+                id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, phone, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
+                boarding_status, boarded_at, boarded_by_user_id,
+                channel, source_type, source_id, created_by_user_id,
+                commission_rate, commission_amount, carrier_amount,
+                users:passenger_id (name, phone)
+            `)
+            .eq('id', bookingId)
+            .maybeSingle();
+
+        if (bErr || !booking) {
+            return res.status(404).json({ error: 'Бронирование не найдено' });
+        }
+
+        const hasAccess = await verifyTicketAccess(req.carrier, booking.bus_ticket_id);
+        if (!hasAccess) {
+            return res.status(403).json({ error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+        }
+
+        const { data: ticket, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select(`
+                *,
+                operator:users!operator_id (id, name, phone)
+            `)
+            .eq('id', booking.bus_ticket_id)
+            .maybeSingle();
+
+        if (tErr || !ticket) {
+            return res.status(404).json({ error: 'Рейс не найден' });
+        }
+
+        let busMaster = null;
+        if (ticket.bus_id) {
+            const { data: bData } = await supabase
+                .from('carrier_buses')
+                .select('*')
+                .eq('id', ticket.bus_id)
+                .maybeSingle();
+            busMaster = bData || null;
+        }
+
+        const ticketProjection = buildPassengerTicketProjection(booking, ticket, busMaster, { includeCarrierPhone: true });
+
+        res.json(ticketProjection);
+    } catch (err) {
+        console.error('[BusAdmin Single Ticket] Error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка формирования билета' });
+    }
+});
+
 
 /**
  * @swagger

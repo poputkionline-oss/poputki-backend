@@ -123,17 +123,18 @@ router.post('/', async (req, res) => {
             passengersList += `\n${idx + 1}. ${p.lastName || ''} ${p.firstName || ''} (${genderStr}) - Место: ${seat_numbers[idx] || '—'} [${p.docType || 'Док'}: ${p.docNumber || '—'}]`;
         });
 
-        const ticketMsg = `🎫 <b>ЭЛЕКТРОННЫЙ БИЛЕТ НА АВТОБУС</b> 🎫\n\n` +
+        const ticketNumber = `POP-${String(booking.id).padStart(6, '0')}`;
+        const ticketMsg = `🎫 <b>ЭЛЕКТРОННЫЙ БИЛЕТ POPUTKI.ONLINE</b> 🎫\n\n` +
+            `№ билета: <b>${ticketNumber}</b>\n` +
             `✅ <b>Статус:</b> Забронировано\n` +
             `🚌 <b>Рейс:</b> ${ticket.from_city} ➡ ${ticket.to_city}\n` +
             `📍 <b>Маршрут:</b> ${pickup_city || ticket.from_city} ➡ ${drop_off_city || ticket.to_city}\n` +
             `🗓 <b>Дата и время:</b> ${dateStr} в ${timeStr}\n\n` +
-            `📞 <b>Покупатель:</b> ${phone}\n` +
             `💺 <b>Количество мест:</b> ${seat_numbers.length} (Места: ${seat_numbers.join(', ')})\n` +
             `👥 <b>Пассажиры:</b>${passengersList}\n\n` +
             `💰 <b>Общая стоимость:</b> ${totalPrice} сом\n\n` +
             `<i>Пожалуйста, сохраните этот билет. Счастливого пути!</i>\n\n` +
-            `Poputki.online — это информационный сервис (агрегатор), а не перевозчик`;
+            `POPUTKI.ONLINE — информационный сервис (агрегатор), а не перевозчик`;
 
         sendPersonalMessage(passenger_id, ticketMsg);
 
