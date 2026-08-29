@@ -280,4 +280,50 @@ describe('TICKET MODULE V1 — CORE TEST SUITE', () => {
         assert.equal(formatTicketNumber(139), 'POP-000139');
         assert.equal(formatTicketNumber(10245), 'POP-010245');
     });
+
+    it('16. Verification Flow: valid token with valid booking and valid trip produces valid projection', () => {
+        const token = generateTicketVerificationToken(sampleOnlineBooking.id);
+        const bookingId = extractBookingIdFromToken(token);
+        assert.equal(bookingId, sampleOnlineBooking.id);
+        assert.equal(verifyTicketToken(token, sampleOnlineBooking.id), true);
+
+        // Canonical FK check
+        assert.equal(sampleOnlineBooking.bus_ticket_id, sampleTicket.id);
+
+        const proj = buildPassengerTicketProjection(sampleOnlineBooking, sampleTicket, sampleBusMaster, { isPublic: true });
+        assert.ok(proj);
+        assert.equal(proj.ticketNumber, 'POP-000139');
+        assert.equal(proj.status, 'confirmed');
+        assert.equal(proj.isValid, true);
+    });
+
+    it('17. Verification Flow: tampered token is rejected with false (403 forbidden semantics)', () => {
+        const token = generateTicketVerificationToken(139);
+        // Alter single character in signature
+        const tamperedToken = token.slice(0, -1) + (token.endsWith('a') ? 'b' : 'a');
+        assert.equal(verifyTicketToken(tamperedToken, 139), false);
+    });
+
+    it('18. Verification Flow: non-numeric or malformed token returns null bookingId (safe 404 semantics)', () => {
+        assert.equal(extractBookingIdFromToken(''), null);
+        assert.equal(extractBookingIdFromToken('abc-12345'), null);
+        assert.equal(extractBookingIdFromToken('999'), null);
+    });
+
+    it('19. Verification Flow: public projection excludes PII and operator internal contacts', () => {
+        const proj = buildPassengerTicketProjection(sampleOnlineBooking, sampleTicket, sampleBusMaster, { isPublic: true });
+        assert.equal(proj.carrier.operatorPhone, null);
+        assert.equal(proj.passenger.items[0].docNumber, undefined);
+        assert.equal(proj.passenger.items[0].docType, undefined);
+        assert.equal(proj.bus.vin, undefined);
+        assert.equal(proj.bus.notes, undefined);
+    });
+
+    it('20. Verification Flow: legacy trip without Fleet bus projection works cleanly', () => {
+        const legacyTicket = { ...sampleTicket, bus_id: null };
+        const proj = buildPassengerTicketProjection(sampleOnlineBooking, legacyTicket, null, { isPublic: true });
+        assert.ok(proj);
+        assert.equal(proj.bus.id, null);
+        assert.equal(proj.isValid, true);
+    });
 });

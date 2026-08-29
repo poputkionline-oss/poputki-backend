@@ -469,17 +469,14 @@ router.get('/verify/:token', async (req, res) => {
             return res.status(404).json({ valid: false, error: 'Билет не найден' });
         }
 
-        const isTokenValid = verifyTicketToken(token, booking.id, booking.created_at || '');
+        const isTokenValid = verifyTicketToken(token, booking.id);
         if (!isTokenValid) {
             return res.status(403).json({ valid: false, error: 'Недействительный или поддельный токен билета' });
         }
 
         const { data: ticket, error: tErr } = await supabase
             .from('bus_tickets')
-            .select(`
-                *,
-                operator:users!operator_id (transport_company_name)
-            `)
+            .select('*')
             .eq('id', booking.bus_ticket_id)
             .maybeSingle();
 
