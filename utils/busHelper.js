@@ -237,14 +237,24 @@ async function checkDuplicatePlate(supabaseClient, carrierId, licensePlate, excl
  * @param {number|string} busId - Bus ID
  * @param {Object} options
  * @param {boolean} [options.allowArchived=false]
+/**
+ * Verifies carrier ownership and active status of a bus
+ * @param {Object|number|string} carrier
+ * @param {number|string} busId
+ * @param {Object} options
+ * @param {boolean} options.allowArchived
+ * @param {Object} options.client
  * @returns {Promise<Object|null>} Bus object if valid and accessible, null otherwise
  */
-async function verifyBusAccess(carrier, busId, { allowArchived = false } = {}) {
+async function verifyBusAccess(carrier, busId, { allowArchived = false, client = null } = {}) {
     if (!carrier || !busId) return null;
-    const carrierId = carrier.carrier_id || carrier.id;
+    const carrierId = typeof carrier === 'number' || typeof carrier === 'string'
+        ? carrier
+        : (carrier.carrier_id || carrier.id);
     if (!carrierId) return null;
 
-    const { data: bus, error } = await supabase
+    const db = client || supabase;
+    const { data: bus, error } = await db
         .from('carrier_buses')
         .select('*')
         .eq('id', busId)
@@ -289,15 +299,21 @@ async function getBusActiveTickets(supabaseClient, carrierId, busId) {
  * Detects schedule conflicts for a bus on given dates and times
  * Non-blocking check: returns list of conflicting active tickets without passenger PII
  */
-async function checkBusScheduleConflict(supabaseClient, carrierId, busId, departureDate, departureTime, arrivalDate, arrivalTime) {
+async function checkBusScheduleConflict(supabaseClient, carrierId, busId, departureDate, departureTime, arrivalDate, arrivalTime, excludeTicketId = null) {
     if (!busId || !departureDate) return [];
 
-    const { data: activeTickets, error } = await supabaseClient
+    let query = supabaseClient
         .from('bus_tickets')
         .select('id, from_city, to_city, departure_date, departure_time, arrival_date, arrival_time')
         .eq('operator_id', carrierId)
         .eq('bus_id', busId)
         .eq('status', 'active');
+
+    if (excludeTicketId) {
+        query = query.neq('id', excludeTicketId);
+    }
+
+    const { data: activeTickets, error } = await query;
 
     if (error || !activeTickets || activeTickets.length === 0) return [];
 
@@ -335,6 +351,181 @@ async function checkBusScheduleConflict(supabaseClient, carrierId, busId, depart
     return conflicts;
 }
 
+/**
+ * Calculates floor number (1, 2, or null) for a given seat number
+ * Canonical layout:
+ * - Single deck: Floor 1 (seats 1..total_seats)
+ * - Double deck: Floor 2 (seats 1..floor2_seats), Floor 1 (seats floor2_seats + 1..floor2_seats + floor1_seats)
+ */
+function getSeatFloor(seatNumber, busType, floor1Seats, floor2Seats, totalSeats) {
+    const seat = Number(seatNumber);
+    if (isNaN(seat) || seat <= 0) return null;
+
+    if (busType === 'double') {
+        const f2 = Number(floor2Seats) || 0;
+        const f1 = Number(floor1Seats) || 0;
+        if (seat <= f2) {
+            return 2;
+        } else if (seat <= f2 + f1) {
+            return 1;
+        }
+        return null;
+    }
+
+    // Single deck
+    const max = Number(totalSeats) || 0;
+    if (seat <= max) {
+        return 1;
+    }
+    return null;
+}
+
+/**
+ * Validates bus replacement on an existing trip.
+ * Enforces:
+ * - Tenant isolation
+ * - Bus active status
+ * - Existing bookings protection (confirmed + non-expired pending_payment)
+ * - Reserved seats bounds against new bus capacity
+ * - Schedule conflict detection with self-trip exclusion
+ * - Re-snapshots vehicle capacity and media from master
+ *
+ * @param {Object} supabaseClient
+ * @param {Object} carrierContext
+ * @param {number|string} ticketId
+ * @param {number|string|null} newBusId
+ * @param {Object} options
+ * @param {boolean} options.allowConflict
+ * @returns {Promise<{ valid: boolean, status?: number, error?: string, message?: string, conflicts?: Array, snapshot?: Object, oldTicket?: Object, newBus?: Object, reservedSeatCount?: number, incompatibleSeats?: Array, noOp?: boolean }>}
+ */
+async function validateBusReplacement(supabaseClient, carrierContext, ticketId, newBusId, { allowConflict = false } = {}) {
+    if (!ticketId) {
+        return { valid: false, status: 400, error: 'TICKET_ID_REQUIRED', message: 'ID рейса обязателен' };
+    }
+
+    const carrierId = carrierContext.carrier_id;
+
+    // 1. Fetch current ticket
+    const { data: oldTicket, error: tErr } = await supabaseClient
+        .from('bus_tickets')
+        .select('*')
+        .eq('id', ticketId)
+        .maybeSingle();
+
+    if (tErr || !oldTicket) {
+        return { valid: false, status: 404, error: 'TICKET_NOT_FOUND', message: 'Рейс не найден' };
+    }
+
+    if (parseInt(oldTicket.operator_id, 10) !== parseInt(carrierId, 10)) {
+        return { valid: false, status: 403, error: 'ACCESS_DENIED', message: 'Рейс не принадлежит вашему аккаунту перевозчика' };
+    }
+
+    // 2. Unassign policy: if oldTicket already has bus_id, unassign to null is forbidden
+    if (oldTicket.bus_id && (newBusId === null || newBusId === undefined || newBusId === '')) {
+        return { valid: false, status: 400, error: 'BUS_UNASSIGN_FORBIDDEN', message: 'Отвязка назначенного автобуса от рейса запрещена' };
+    }
+
+    // If newBusId is null/empty and oldTicket had no bus_id, no replacement needed
+    if (!newBusId) {
+        return { valid: true, noOp: true, oldTicket };
+    }
+
+    // If newBusId equals current oldTicket.bus_id, no replacement needed
+    if (oldTicket.bus_id && parseInt(oldTicket.bus_id, 10) === parseInt(newBusId, 10)) {
+        return { valid: true, noOp: true, oldTicket };
+    }
+
+    // 3. Verify new bus ownership & existence
+    const newBus = await verifyBusAccess(carrierContext, newBusId, { client: supabaseClient });
+    if (!newBus) {
+        return { valid: false, status: 403, error: 'BUS_NOT_FOUND', message: 'Выбранный автобус не найден или не принадлежит вашей компании' };
+    }
+
+    if (newBus.status !== 'active') {
+        return {
+            valid: false,
+            status: 409,
+            error: 'BUS_NOT_AVAILABLE',
+            message: `Автобус недоступен для назначения (текущий статус: ${newBus.status})`
+        };
+    }
+
+    if (!newBus.total_seats || Number(newBus.total_seats) <= 0) {
+        return { valid: false, status: 400, error: 'INVALID_BUS_CAPACITY', message: 'У выбранного автобуса некорректная вместимость' };
+    }
+
+    // 4. Check active bookings: replacement is only allowed if activeBookingCount === 0
+    const { data: bookings, error: bErr } = await supabaseClient
+        .from('bus_ticket_bookings')
+        .select('seat_numbers, status, created_at, hold_expires_at')
+        .eq('bus_ticket_id', ticketId);
+
+    if (bErr) throw bErr;
+
+    const now = new Date();
+    let activeBookingCount = 0;
+    for (const b of (bookings || [])) {
+        if (b.status === 'confirmed') {
+            activeBookingCount++;
+        } else if (b.status === 'pending_payment') {
+            const expiresAt = b.hold_expires_at ? new Date(b.hold_expires_at) : new Date(new Date(b.created_at).getTime() + 30 * 60 * 1000);
+            if (expiresAt > now) {
+                activeBookingCount++;
+            }
+        }
+    }
+
+    if (activeBookingCount > 0) {
+        return {
+            valid: false,
+            status: 409,
+            error: 'BUS_REPLACEMENT_HAS_BOOKINGS',
+            message: 'Автобус нельзя заменить, пока на рейсе есть активные бронирования.',
+            activeBookingCount
+        };
+    }
+
+    // 5. Check schedule conflict on other active trips of this bus (excluding current ticketId)
+    const conflicts = await checkBusScheduleConflict(
+        supabaseClient,
+        carrierId,
+        newBus.id,
+        oldTicket.departure_date,
+        oldTicket.departure_time,
+        oldTicket.arrival_date,
+        oldTicket.arrival_time,
+        ticketId
+    );
+
+    if (conflicts.length > 0 && !allowConflict) {
+        return {
+            valid: false,
+            status: 409,
+            error: 'BUS_SCHEDULE_CONFLICT',
+            message: 'Обнаружен конфликт расписания для выбранного автобуса',
+            conflicts
+        };
+    }
+
+    // 6. Build fresh snapshot from master bus
+    const snapshot = {
+        bus_id: newBus.id,
+        bus_type: newBus.bus_type || 'single',
+        total_seats: Number(newBus.total_seats),
+        floor1_seats: newBus.bus_type === 'double' ? Number(newBus.floor1_seats) : null,
+        floor2_seats: newBus.bus_type === 'double' ? Number(newBus.floor2_seats) : null,
+        photos: sanitizePhotos(newBus.photos || [])
+    };
+
+    return {
+        valid: true,
+        snapshot,
+        oldTicket,
+        newBus,
+        activeBookingCount: 0
+    };
+}
+
 module.exports = {
     CANONICAL_AMENITIES,
     VALID_BUS_TYPES,
@@ -346,5 +537,7 @@ module.exports = {
     checkDuplicatePlate,
     verifyBusAccess,
     getBusActiveTickets,
-    checkBusScheduleConflict
+    checkBusScheduleConflict,
+    validateBusReplacement,
+    getSeatFloor
 };

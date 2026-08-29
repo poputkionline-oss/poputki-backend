@@ -24,6 +24,7 @@ const AUDIT_ACTIONS = Object.freeze({
     TICKET_DUPLICATED: 'ticket_duplicated',
     TICKET_REVERSED: 'ticket_reversed',
     TICKET_DELETED: 'ticket_deleted',
+    TRIP_BUS_REPLACED: 'trip_bus_replaced',
 
     // Team / Member Actions
     MEMBER_ADDED: 'member_added',
@@ -54,7 +55,7 @@ const WHITELIST_FIELDS = Object.freeze({
     [AUDIT_ENTITY_TYPES.TICKET]: new Set([
         'from_city', 'to_city', 'from_address', 'to_address',
         'departure_date', 'departure_time', 'arrival_date', 'arrival_time',
-        'price', 'premium_price', 'total_seats', 'status', 'bus_type'
+        'price', 'premium_price', 'total_seats', 'status', 'bus_type', 'bus_id'
     ]),
     [AUDIT_ENTITY_TYPES.MEMBER]: new Set([
         'role', 'is_active', 'assigned_ticket_ids'

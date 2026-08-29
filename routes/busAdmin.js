@@ -21,7 +21,8 @@ const {
     validateBusPayload,
     checkDuplicatePlate,
     verifyBusAccess,
-    getBusActiveTickets
+    getBusActiveTickets,
+    validateBusReplacement
 } = require('../utils/busHelper');
 
 
@@ -352,7 +353,9 @@ router.put('/tickets/:id', async (req, res) => {
     }
 
     const { id } = req.params;
-    const updateData = req.body;
+    const updateData = { ...req.body };
+    const allowBusConflict = Boolean(updateData.allow_bus_conflict);
+    delete updateData.allow_bus_conflict;
     
     // Strict ownership verification
     const hasAccess = await verifyTicketAccess(req.carrier, id);
@@ -364,15 +367,53 @@ router.put('/tickets/:id', async (req, res) => {
     delete updateData.id;
     delete updateData.created_at;
     delete updateData.operator_id; // prevent changing owner
-    const incomingPhotos = updateData.photos;
-    delete updateData.photos; // process and attach safely
 
     try {
         // Fetch existing ticket to compare photos and audit diff
-        const { data: oldTicket } = await supabase.from('bus_tickets').select('*').eq('id', id).single();
+        const { data: oldTicket, error: otErr } = await supabase.from('bus_tickets').select('*').eq('id', id).single();
+        if (otErr || !oldTicket) {
+            return res.status(404).json({ error: 'Рейс не найден' });
+        }
         const oldPhotos = oldTicket?.photos || [];
 
-        if (incomingPhotos !== undefined) {
+        // Check if bus replacement / assignment is requested
+        // Check if bus replacement / assignment is requested
+        let busReplaced = false;
+        let newBusMaster = null;
+        if (updateData.bus_id !== undefined) {
+            const replacement = await validateBusReplacement(
+                supabase,
+                req.carrier,
+                id,
+                updateData.bus_id,
+                { allowConflict: allowBusConflict }
+            );
+
+            if (!replacement.valid) {
+                return res.status(replacement.status || 400).json({
+                    error: replacement.error,
+                    message: replacement.message,
+                    conflicts: replacement.conflicts,
+                    activeBookingCount: replacement.activeBookingCount
+                });
+            }
+
+            if (!replacement.noOp && replacement.snapshot) {
+                busReplaced = true;
+                newBusMaster = replacement.newBus;
+                // Apply authoritative vehicle snapshot from carrier_buses master
+                updateData.bus_id = replacement.snapshot.bus_id;
+                updateData.bus_type = replacement.snapshot.bus_type;
+                updateData.total_seats = replacement.snapshot.total_seats;
+                updateData.floor1_seats = replacement.snapshot.floor1_seats;
+                updateData.floor2_seats = replacement.snapshot.floor2_seats;
+                updateData.photos = replacement.snapshot.photos;
+            }
+        }
+
+        const incomingPhotos = updateData.photos;
+        if (incomingPhotos !== undefined && !busReplaced) {
+            delete updateData.photos; // process and attach safely
             let newPhotoResults = [];
             if (incomingPhotos && Array.isArray(incomingPhotos)) {
                 for (const photo of incomingPhotos) {
@@ -399,6 +440,8 @@ router.put('/tickets/:id', async (req, res) => {
             updateData.photos = newPhotoResults;
         }
 
+        // If bus was replaced via RPC, snapshot was already written atomically by RPC.
+        // Update any remaining ticket fields (route, dates, price, etc.)
         const { error } = await supabase
             .from('bus_tickets')
             .update(updateData)
@@ -410,15 +453,22 @@ router.put('/tickets/:id', async (req, res) => {
         await logCarrierActivity({
             supabase,
             carrierContext: req.carrier,
-            action: AUDIT_ACTIONS.TICKET_UPDATED,
+            action: busReplaced ? AUDIT_ACTIONS.TRIP_BUS_REPLACED : AUDIT_ACTIONS.TICKET_UPDATED,
             entityType: AUDIT_ENTITY_TYPES.TICKET,
             entityId: id,
             entityLabel: `Рейс ${oldTicket?.from_city || ''} → ${oldTicket?.to_city || ''} #${id}`,
             oldData: oldTicket,
-            newData: { ...oldTicket, ...updateData }
+            newData: { ...oldTicket, ...updateData },
+            metadata: busReplaced ? {
+                old_bus_id: oldTicket.bus_id,
+                new_bus_id: updateData.bus_id,
+                old_capacity: oldTicket.total_seats,
+                new_capacity: updateData.total_seats,
+                conflict_override: allowBusConflict
+            } : undefined
         });
 
-        res.json({ success: true });
+        res.json({ success: true, bus_replaced: busReplaced });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
