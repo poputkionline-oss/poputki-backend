@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const { sendBroadcast } = require('../utils/telegramBot');
 const { uploadToCloudinary } = require('../utils/cloudinaryUtils');
 const { verifyBusAccess, checkBusScheduleConflict } = require('../utils/busHelper');
+const { buildPublicBusDetails } = require('../utils/publicBusHelper');
 const { logCarrierActivity, AUDIT_ACTIONS, AUDIT_ENTITY_TYPES } = require('../utils/auditHelper');
 
 /**
@@ -287,14 +288,31 @@ router.get('/', async (req, res) => {
         const { data: tickets, error } = await query;
         if (error) throw error;
 
+        // Batch fetch master bus records to eliminate N+1 queries
+        const busIds = Array.from(new Set((tickets || []).map(t => t.bus_id).filter(Boolean)));
+        const busMap = new Map();
+        if (busIds.length > 0) {
+            const { data: buses, error: bErr } = await supabase
+                .from('carrier_buses')
+                .select('id, brand, model, license_plate, year_built, color, amenities')
+                .in('id', busIds);
+            if (!bErr && Array.isArray(buses)) {
+                buses.forEach(b => busMap.set(b.id, b));
+            }
+        }
+
         let result = tickets.map(t => {
             const stops = (typeof t.intermediate_stops === 'string' ? JSON.parse(t.intermediate_stops || '[]') : (t.intermediate_stops || [])).map(s => ({
                 ...s,
                 time: s.time ? s.time.substring(0, 5) : s.time
             }));
 
+            const busMaster = t.bus_id ? busMap.get(t.bus_id) : null;
+            const busDetails = buildPublicBusDetails(t, busMaster);
+
             return {
                 ...t,
+                bus: busDetails,
                 intermediate_stops: stops,
                 reserved_seats: typeof t.reserved_seats === 'string' ? JSON.parse(t.reserved_seats || '[]') : (t.reserved_seats || []),
                 departure_time: t.departure_time ? t.departure_time.substring(0, 5) : t.departure_time,
@@ -359,6 +377,17 @@ router.get('/:id', async (req, res) => {
         ticket.departure_time = ticket.departure_time ? ticket.departure_time.substring(0, 5) : ticket.departure_time;
         ticket.arrival_time = ticket.arrival_time ? ticket.arrival_time.substring(0, 5) : ticket.arrival_time;
 
+        // Fetch passenger-safe bus projection if bus_id is present
+        let busDetails = null;
+        if (ticket.bus_id) {
+            const { data: busMaster } = await supabase
+                .from('carrier_buses')
+                .select('id, brand, model, license_plate, year_built, color, amenities')
+                .eq('id', ticket.bus_id)
+                .maybeSingle();
+            busDetails = buildPublicBusDetails(ticket, busMaster);
+        }
+
         const { data: bookings, error: bookingsError } = await supabase
             .from('bus_ticket_bookings')
             .select('*')
@@ -391,6 +420,7 @@ router.get('/:id', async (req, res) => {
 
         res.json({ 
             ...ticket, 
+            bus: busDetails,
             operator_phone: ticket.operator?.phone,
             service_fee_percent: ticket.operator?.service_fee_percent ?? 10,
             bookings, 
