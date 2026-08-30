@@ -75,7 +75,8 @@ router.post('/', async (req, res) => {
         duration_minutes, price, total_seats,
         bus_type, passenger_comments, intermediate_stops,
         floor1_seats, floor2_seats, premium_price, photos,
-        bus_id, allow_bus_conflict
+        bus_id, allow_bus_conflict,
+        group_leader_name, group_leader_phone, group_leader_whatsapp
     } = req.body;
     try {
         // Authenticate verified carrier context if Bearer token present
@@ -206,7 +207,10 @@ router.post('/', async (req, res) => {
                 floor2_seats: effectiveFloor2Seats,
                 premium_price: premium_price || null,
                 photos: effectivePhotos,
-                bus_id: effectiveBusId
+                bus_id: effectiveBusId,
+                group_leader_name: group_leader_name ? String(group_leader_name).trim() : null,
+                group_leader_phone: group_leader_phone ? String(group_leader_phone).trim() : null,
+                group_leader_whatsapp: group_leader_whatsapp ? String(group_leader_whatsapp).trim() : null
             }])
             .select('id')
             .single();

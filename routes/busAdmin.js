@@ -649,7 +649,10 @@ router.post('/tickets/:id/duplicate', async (req, res) => {
             bus_type: sourceTicket.bus_type || 'single',
             passenger_comments: sourceTicket.passenger_comments || '',
             intermediate_stops: stops,
-            photos: clonedPhotos
+            photos: clonedPhotos,
+            group_leader_name: sourceTicket.group_leader_name || null,
+            group_leader_phone: sourceTicket.group_leader_phone || null,
+            group_leader_whatsapp: sourceTicket.group_leader_whatsapp || null
         };
 
         const { data: newTicket, error: insertErr } = await supabase

@@ -292,6 +292,13 @@ function buildPassengerTicketProjection(booking, ticket, busMaster = null, optio
             operatorPhone: options.includeCarrierPhone ? (ticket.operator?.phone || null) : null
         },
 
+        // Support / Group Leader Info (Escort on trip)
+        support: {
+            name: ticket.group_leader_name ? String(ticket.group_leader_name).trim() : null,
+            phone: ticket.group_leader_phone ? String(ticket.group_leader_phone).trim() : null,
+            whatsapp: ticket.group_leader_whatsapp ? String(ticket.group_leader_whatsapp).trim() : null
+        },
+
         createdAt: booking.created_at
     };
 }
