@@ -2,9 +2,16 @@
 -- Migration: 20260831_claim_atomicity_hotfix.sql
 -- Description: Harden Phase E claim RPC atomicity, session validation and grants
 -- Project: POPUTKI.ONLINE
+-- Note: Production already had fn_claim_booking_auto with the same arguments but
+--       a legacy bus_ticket_bookings return type, so it must be dropped before
+--       recreating the JSONB RPC expected by the Phase E.2B backend.
 -- ==============================================================================
 
-CREATE OR REPLACE FUNCTION public.fn_claim_booking_auto(
+BEGIN;
+
+DROP FUNCTION IF EXISTS public.fn_claim_booking_auto(INTEGER, INTEGER, UUID);
+
+CREATE FUNCTION public.fn_claim_booking_auto(
     p_booking_id INTEGER,
     p_user_id INTEGER,
     p_session_id UUID DEFAULT NULL
@@ -18,7 +25,6 @@ DECLARE
     v_updated_booking RECORD;
     v_session_id UUID;
 BEGIN
-    -- Validate and lock the supplied session before mutating the booking.
     IF p_session_id IS NOT NULL THEN
         SELECT id INTO v_session_id
         FROM public.booking_claim_sessions
@@ -29,14 +35,10 @@ BEGIN
         FOR UPDATE;
 
         IF v_session_id IS NULL THEN
-            RETURN jsonb_build_object(
-                'success', false,
-                'error', 'SESSION_INVALID_EXPIRED_OR_CONSUMED'
-            );
+            RETURN jsonb_build_object('success', false, 'error', 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
         END IF;
     END IF;
 
-    -- Exactly one claimant can win, and cancellation wins if it happened first.
     UPDATE public.bus_ticket_bookings
     SET claim_status = 'claimed',
         claimed_by_user_id = p_user_id,
@@ -48,13 +50,9 @@ BEGIN
     RETURNING * INTO v_updated_booking;
 
     IF v_updated_booking.id IS NULL THEN
-        RETURN jsonb_build_object(
-            'success', false,
-            'error', 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED'
-        );
+        RETURN jsonb_build_object('success', false, 'error', 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED');
     END IF;
 
-    -- Consume the already validated/locked session in the same transaction.
     IF p_session_id IS NOT NULL THEN
         UPDATE public.booking_claim_sessions
         SET consumed_at = NOW()
@@ -65,7 +63,6 @@ BEGIN
         RETURNING id INTO v_session_id;
 
         IF v_session_id IS NULL THEN
-            -- Any unexpected session race must roll back the booking claim.
             RAISE EXCEPTION 'CLAIM_SESSION_CONSUME_FAILED';
         END IF;
     END IF;
@@ -76,10 +73,7 @@ BEGIN
     WHERE booking_id = p_booking_id
       AND status = 'pending';
 
-    RETURN jsonb_build_object(
-        'success', true,
-        'booking_id', v_updated_booking.id
-    );
+    RETURN jsonb_build_object('success', true, 'booking_id', v_updated_booking.id);
 END;
 $$;
 
@@ -105,10 +99,7 @@ BEGIN
     FOR UPDATE;
 
     IF v_req.id IS NULL THEN
-        RETURN jsonb_build_object(
-            'success', false,
-            'error', 'REQUEST_NOT_FOUND_OR_ALREADY_REVIEWED'
-        );
+        RETURN jsonb_build_object('success', false, 'error', 'REQUEST_NOT_FOUND_OR_ALREADY_REVIEWED');
     END IF;
 
     IF p_decision = 'approved' THEN
@@ -120,10 +111,7 @@ BEGIN
                 reviewed_at = NOW()
             WHERE id = p_request_id;
 
-            RETURN jsonb_build_object(
-                'success', false,
-                'error', 'REQUESTING_USER_MISSING'
-            );
+            RETURN jsonb_build_object('success', false, 'error', 'REQUESTING_USER_MISSING');
         END IF;
 
         UPDATE public.bus_ticket_bookings
@@ -144,10 +132,7 @@ BEGIN
                 reviewed_at = NOW()
             WHERE id = p_request_id;
 
-            RETURN jsonb_build_object(
-                'success', false,
-                'error', 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED'
-            );
+            RETURN jsonb_build_object('success', false, 'error', 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED');
         END IF;
 
         UPDATE public.booking_claim_requests
@@ -174,8 +159,7 @@ BEGIN
         WHERE id = p_request_id;
 
         IF NOT EXISTS (
-            SELECT 1
-            FROM public.booking_claim_requests
+            SELECT 1 FROM public.booking_claim_requests
             WHERE booking_id = v_req.booking_id
               AND status = 'pending'
         ) THEN
@@ -202,3 +186,12 @@ REVOKE ALL ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, TEXT, TEXT)
 REVOKE ALL ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, TEXT, TEXT) FROM anon;
 REVOKE ALL ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, TEXT, TEXT) FROM authenticated;
 GRANT EXECUTE ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, TEXT, TEXT) TO service_role;
+
+-- Lock down the legacy overload too. It is retained temporarily for compatibility,
+-- but is not callable by anon/authenticated clients.
+REVOKE ALL ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, BOOLEAN) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, BOOLEAN) FROM anon;
+REVOKE ALL ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, BOOLEAN) FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.fn_review_claim_request(UUID, INTEGER, BOOLEAN) TO service_role;
+
+COMMIT;
