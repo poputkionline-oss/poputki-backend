@@ -1,19 +1,20 @@
 /**
  * routes/claims.js
- * 
- * Offline Booking Claim & Passenger Onboarding API Routes (Phase E.1)
+ *
+ * Offline Booking Claim & Passenger Onboarding API Routes (Phase E.2B)
  * Project: POPUTKI.ONLINE
- * 
+ *
  * Security & Anti-Abuse:
  * - Rate limited by client IP and user context (HTTP 429)
  * - SHA-256 hash token lookup
  * - Public ticket verification token requirement
- * - Tenant-scoped carrier approval
+ * - Server-only service-role access for claim persistence
+ * - Tenant-scoped carrier approval, including strict legacy-trip ownership
  */
 
 const express = require('express');
 const router = express.Router();
-const supabase = require('../db');
+const { getServiceRoleClient } = require('../dbServiceRole');
 const { carrierAuth } = require('../utils/carrierAuth');
 const {
     generateClaimSession,
@@ -21,11 +22,11 @@ const {
     evaluateAutoClaimEligibility,
     executeAtomicClaim,
     createClaimRequest,
-    reviewClaimRequest
+    reviewClaimRequest,
+    tripBelongsToCarrier
 } = require('../utils/claimHelper');
 const { verifyTicketToken } = require('../utils/ticketHelper');
 
-// Sliding window in-memory rate limiter for claim operations
 const rateLimitMap = new Map();
 
 function claimRateLimiter(maxRequests = 10, windowMs = 60000) {
@@ -48,10 +49,6 @@ function claimRateLimiter(maxRequests = 10, windowMs = 60000) {
     };
 }
 
-/**
- * POST /api/claims/start-session
- * Public endpoint called by ticket verification page to generate a short-lived Telegram claim deep link.
- */
 router.post('/start-session', claimRateLimiter(15, 60000), async (req, res) => {
     try {
         const { ticketVerificationToken, bookingId } = req.body;
@@ -60,13 +57,12 @@ router.post('/start-session', claimRateLimiter(15, 60000), async (req, res) => {
             return res.status(400).json({ error: 'Параметры билета обязательны' });
         }
 
-        // Verify ticket authenticity via HMAC
-        const isValidToken = verifyTicketToken(ticketVerificationToken, bookingId);
-        if (!isValidToken) {
+        if (!verifyTicketToken(ticketVerificationToken, bookingId)) {
             return res.status(403).json({ error: 'Недействительный токен билета' });
         }
 
-        const { data: booking, error: bookErr } = await supabase
+        const claimDb = getServiceRoleClient();
+        const { data: booking, error: bookErr } = await claimDb
             .from('bus_ticket_bookings')
             .select('*')
             .eq('id', bookingId)
@@ -80,7 +76,7 @@ router.post('/start-session', claimRateLimiter(15, 60000), async (req, res) => {
             return res.status(400).json({ error: 'Бронирование неактивно или отменено' });
         }
 
-        if (booking.claim_status === 'claimed') {
+        if (booking.claim_status === 'claimed' || booking.claimed_by_user_id) {
             return res.status(400).json({ error: 'Билет уже подтвержден в Telegram', isClaimed: true });
         }
 
@@ -92,14 +88,11 @@ router.post('/start-session', claimRateLimiter(15, 60000), async (req, res) => {
             expiresAt: session.expiresAt
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('[Claims] start-session failed:', err.message);
+        res.status(500).json({ error: 'Не удалось создать сессию подтверждения билета' });
     }
 });
 
-/**
- * POST /api/claims/preview-trip
- * Called by bot upon /start claim_<token> to display safe trip summary before requesting contact.
- */
 router.post('/preview-trip', claimRateLimiter(20, 60000), async (req, res) => {
     try {
         const { sessionToken } = req.body;
@@ -113,7 +106,8 @@ router.post('/preview-trip', claimRateLimiter(20, 60000), async (req, res) => {
         }
 
         const booking = sessionResult.booking;
-        const { data: trip } = await supabase
+        const claimDb = getServiceRoleClient();
+        const { data: trip } = await claimDb
             .from('bus_tickets')
             .select('from_city, to_city, departure_date, departure_time, transport_company')
             .eq('id', booking.bus_ticket_id)
@@ -132,14 +126,11 @@ router.post('/preview-trip', claimRateLimiter(20, 60000), async (req, res) => {
             }
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('[Claims] preview-trip failed:', err.message);
+        res.status(500).json({ error: 'Не удалось открыть данные поездки' });
     }
 });
 
-/**
- * POST /api/claims/verify-and-claim
- * Called by bot when passenger confirms phone number via native Telegram contact.
- */
 router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) => {
     try {
         const { sessionToken, telegramUser, telegramContact, telegramSenderId } = req.body;
@@ -155,11 +146,11 @@ router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) =
 
         const booking = sessionResult.booking;
         const session = sessionResult.session;
+        const claimDb = getServiceRoleClient();
 
-        // Find or link platform user by telegram_id
         let platformUser = null;
         if (telegramUser && telegramUser.id) {
-            const { data: userRow } = await supabase
+            const { data: userRow } = await claimDb
                 .from('users')
                 .select('*')
                 .eq('telegram_id', telegramUser.id)
@@ -176,7 +167,6 @@ router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) =
         );
 
         if (evaluation.canAutoClaim && platformUser) {
-            // Auto-claim executed atomically
             const claimRes = await executeAtomicClaim(booking.id, platformUser.id, {
                 sessionId: session.id
             });
@@ -193,7 +183,6 @@ router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) =
             });
         }
 
-        // Needs carrier verification / review request
         if (platformUser) {
             const reqRes = await createClaimRequest(booking.id, platformUser.id, {
                 method: 'telegram_contact',
@@ -201,6 +190,10 @@ router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) =
             }, {
                 sessionId: session.id
             });
+
+            if (!reqRes.success) {
+                return res.status(409).json({ error: reqRes.error, code: 'CLAIM_REQUEST_FAILED' });
+            }
 
             return res.json({
                 success: true,
@@ -213,14 +206,11 @@ router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) =
 
         res.status(400).json({ error: 'Пользователь платформы не найден', code: 'USER_NOT_REGISTERED' });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('[Claims] verify-and-claim failed:', err.message);
+        res.status(500).json({ error: 'Не удалось подтвердить билет' });
     }
 });
 
-/**
- * GET /api/claims/carrier/requests
- * Carrier authenticated endpoint: List pending claim requests for carrier's trips.
- */
 router.get('/carrier/requests', carrierAuth, async (req, res) => {
     try {
         const carrierId = req.carrier?.carrier_id;
@@ -228,13 +218,14 @@ router.get('/carrier/requests', carrierAuth, async (req, res) => {
             return res.status(401).json({ error: 'Авторизация перевозчика обязательна' });
         }
 
-        const { data: requests, error } = await supabase
+        const claimDb = getServiceRoleClient();
+        const { data: requests, error } = await claimDb
             .from('booking_claim_requests')
             .select(`
                 *,
                 bus_ticket_bookings!inner (
                     id, passenger_name, seat_numbers, total_price, pickup_city, drop_off_city, phone, contact_role,
-                    bus_tickets!inner (id, from_city, to_city, departure_date, departure_time, carrier_id)
+                    bus_tickets!inner (id, from_city, to_city, departure_date, departure_time, carrier_id, created_by_user_id)
                 ),
                 users:requesting_user_id (name, phone)
             `)
@@ -243,42 +234,46 @@ router.get('/carrier/requests', carrierAuth, async (req, res) => {
 
         if (error) throw error;
 
-        // Tenant isolation: only trips where carrier is operator/creator
         const carrierRequests = (requests || []).filter(r => {
             const ticket = r.bus_ticket_bookings?.bus_tickets;
-            return ticket && (ticket.carrier_id === carrierId || !ticket.carrier_id);
+            return tripBelongsToCarrier(ticket, carrierId);
         });
 
         res.json({ success: true, requests: carrierRequests });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('[Claims] carrier requests failed:', err.message);
+        res.status(500).json({ error: 'Не удалось загрузить запросы подтверждения' });
     }
 });
 
-/**
- * POST /api/claims/carrier/requests/:id/review
- * Carrier authenticated endpoint: Approve or reject a claim request.
- */
 router.post('/carrier/requests/:id/review', carrierAuth, async (req, res) => {
     try {
         const carrierId = req.carrier?.carrier_id;
+        const reviewerUserId = req.carrier?.user_id;
         const { decision, reason } = req.body;
+
+        if (!carrierId || !reviewerUserId) {
+            return res.status(401).json({ error: 'Авторизация перевозчика обязательна' });
+        }
 
         if (!['approved', 'rejected'].includes(decision)) {
             return res.status(400).json({ error: 'Решение должно быть approved или rejected' });
         }
 
         const reviewRes = await reviewClaimRequest(req.params.id, carrierId, decision, {
-            reason
+            reason,
+            reviewerUserId
         });
 
         if (!reviewRes.success) {
-            return res.status(400).json({ error: reviewRes.error });
+            const status = reviewRes.error === 'TENANT_UNAUTHORIZED' ? 403 : 400;
+            return res.status(status).json({ error: reviewRes.error });
         }
 
         res.json({ success: true, status: reviewRes.status });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('[Claims] carrier review failed:', err.message);
+        res.status(500).json({ error: 'Не удалось обработать запрос подтверждения' });
     }
 });
 
