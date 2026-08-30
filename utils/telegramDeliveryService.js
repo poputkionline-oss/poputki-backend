@@ -1,14 +1,15 @@
 /**
  * telegramDeliveryService.js
  * 
- * Telegram Notification Delivery & Dry-Run Engine (Phase C & C.1)
+ * Telegram Notification Delivery Engine (Phase C.2 Limited Rollout)
  * Project: POPUTKI.ONLINE
  * 
  * Manages:
  * - Dual kill switch validation (NOTIFICATION_DELIVERY_ENABLED & TELEGRAM_NOTIFICATION_DELIVERY_ENABLED)
+ * - Controlled recipient role gate (TELEGRAM_NOTIFICATION_ALLOWED_RECIPIENT_TYPES: creator, coordinator, family_or_group)
+ * - Direct passenger identity delivery safety hold (PASSENGER_DIRECT_DELIVERY_NOT_ENABLED)
  * - Controlled test mode allowlist (NOTIFICATION_TEST_MODE & TELEGRAM_NOTIFICATION_TEST_USER_IDS)
  * - Safe dry-run processing (zero Bot API requests)
- * - Real delivery execution for allowlisted internal accounts during controlled testing
  * - Concurrency protection & atomic state transitions
  * - Error classification (temporary vs permanent)
  */
@@ -16,6 +17,8 @@
 const { renderTelegramNotification } = require('./telegramMessageRenderer');
 const { maskPhone } = require('./phoneHelper');
 const { sendMessage } = require('./telegramBot');
+
+const DEFAULT_ALLOWED_RECIPIENT_TYPES = ['creator', 'coordinator', 'family_or_group'];
 
 /**
  * Classifies an error response from Telegram Bot API into temporary vs permanent failure.
@@ -63,6 +66,21 @@ function isDeliveryEnabled() {
 }
 
 /**
+ * Checks if a recipient role is allowed under the current rollout stage.
+ * In Phase C.2: creator, coordinator, and family_or_group are allowed; passenger is held.
+ *
+ * @param {string} recipientType
+ * @returns {boolean}
+ */
+function isRecipientTypeAllowed(recipientType) {
+    const configured = process.env.TELEGRAM_NOTIFICATION_ALLOWED_RECIPIENT_TYPES;
+    const allowedList = configured
+        ? configured.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        : DEFAULT_ALLOWED_RECIPIENT_TYPES;
+    return allowedList.includes(String(recipientType || '').toLowerCase());
+}
+
+/**
  * Checks if recipient is in the internal test allowlist when test mode is enabled.
  * 
  * @param {number|string} [recipientUserId]
@@ -71,7 +89,7 @@ function isDeliveryEnabled() {
  */
 function isRecipientAllowlisted(recipientUserId, recipientTelegramId) {
     if (process.env.NOTIFICATION_TEST_MODE !== 'true') {
-        return true; // General mode (governed by delivery flags)
+        return true; // General mode (governed by role gates and delivery flags)
     }
     const rawAllowlist = process.env.TELEGRAM_NOTIFICATION_TEST_USER_IDS || '';
     const allowedIds = rawAllowlist.split(',').map(s => s.trim()).filter(Boolean);
@@ -83,7 +101,7 @@ function isRecipientAllowlisted(recipientUserId, recipientTelegramId) {
 }
 
 /**
- * Processes notification intents in dry-run mode or executes real delivery for allowlisted recipients.
+ * Processes notification intents in dry-run mode or executes real delivery.
  * 
  * @param {Array<Object>} intents - List of notification intents
  * @param {Object} [data={}] - Context data { booking, trip, bookingsList }
@@ -97,7 +115,7 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
     const results = [];
 
     for (const intent of intents) {
-        // WhatsApp intents remain strictly skipped
+        // WhatsApp intents remain strictly skipped in Phase C.2
         if (intent.channel === 'whatsapp') {
             results.push({
                 channel: 'whatsapp',
@@ -122,8 +140,19 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                 continue;
             }
 
-            // Render message text & buttons
-            const rendered = renderTelegramNotification(intent, data);
+            // Phase C.2 Recipient Role Gate (creator, coordinator, family_or_group allowed; passenger blocked)
+            if (!isRecipientTypeAllowed(intent.recipientType)) {
+                results.push({
+                    channel: 'telegram',
+                    recipientType: intent.recipientType,
+                    status: 'skipped',
+                    reason: intent.recipientType === 'passenger'
+                        ? 'PASSENGER_DIRECT_DELIVERY_NOT_ENABLED'
+                        : 'RECIPIENT_TYPE_NOT_ALLOWED',
+                    dryRun: isDryRun
+                });
+                continue;
+            }
 
             // Check Test Mode Allowlist
             const allowlisted = isRecipientAllowlisted(intent.recipientUserId, intent.telegramChatId);
@@ -137,6 +166,9 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                 });
                 continue;
             }
+
+            // Render message text & buttons
+            const rendered = renderTelegramNotification(intent, data);
 
             // In Dry-Run mode or when delivery flags are false: produce preview only
             if (isDryRun || !deliveryPermitted) {
@@ -160,7 +192,7 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                 continue;
             }
 
-            // REAL DELIVERY PATH (Only executed when delivery is enabled AND recipient is allowlisted)
+            // REAL DELIVERY PATH (Only executed when delivery is enabled, role allowed, and allowlist passed)
             try {
                 if (!intent.telegramChatId) {
                     results.push({
@@ -218,6 +250,7 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
 module.exports = {
     classifyTelegramError,
     isDeliveryEnabled,
+    isRecipientTypeAllowed,
     isRecipientAllowlisted,
     processNotificationIntents
 };

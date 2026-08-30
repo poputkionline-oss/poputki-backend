@@ -173,9 +173,9 @@ describe('MANUAL BOOKING PASSENGER ACTIVATION V1 — PHASE C TEST SUITE', () => 
             const booking = {
                 id: 111,
                 bus_ticket_id: 10,
-                passenger_name: 'Zarif Verified Passenger',
+                passenger_name: 'Zarif Verified Contact',
                 phone: '+992900112233',
-                contact_role: 'passenger',
+                contact_role: 'family_or_group',
                 created_by_user_id: 11
             };
 
@@ -242,10 +242,10 @@ describe('MANUAL BOOKING PASSENGER ACTIVATION V1 — PHASE C TEST SUITE', () => 
 
                 const intent = {
                     channel: 'telegram',
-                    recipientType: 'passenger',
+                    recipientType: 'creator',
                     recipientUserId: 55,
                     telegramChatId: 555555,
-                    templateKey: 'passenger_ticket_issued'
+                    templateKey: 'creator_tickets_ready_for_handoff'
                 };
 
                 const results = await processNotificationIntents([intent], { booking: {}, trip: mockTrip }, { dryRun: false });
@@ -255,6 +255,52 @@ describe('MANUAL BOOKING PASSENGER ACTIVATION V1 — PHASE C TEST SUITE', () => 
                 process.env.NOTIFICATION_TEST_MODE = prevMode;
                 process.env.TELEGRAM_NOTIFICATION_TEST_USER_IDS = prevAllowlist;
             }
+        });
+
+        it('16. Phase C.2 blocks direct passenger delivery with PASSENGER_DIRECT_DELIVERY_NOT_ENABLED', async () => {
+            const intent = {
+                channel: 'telegram',
+                recipientType: 'passenger',
+                recipientUserId: 55,
+                telegramChatId: 555555,
+                templateKey: 'passenger_ticket_issued'
+            };
+
+            const results = await processNotificationIntents([intent], { booking: {}, trip: mockTrip }, { dryRun: true });
+            assert.equal(results[0].status, 'skipped');
+            assert.equal(results[0].reason, 'PASSENGER_DIRECT_DELIVERY_NOT_ENABLED');
+        });
+
+        it('17. Phase C.2 allows creator, coordinator, and family_or_group through role gate', async () => {
+            const creatorIntent = { channel: 'telegram', recipientType: 'creator', recipientUserId: 11, telegramChatId: 111111, templateKey: 'creator_tickets_ready_for_handoff' };
+            const coordIntent = { channel: 'telegram', recipientType: 'coordinator', recipientUserId: 11, telegramChatId: 111111, templateKey: 'coordinator_tickets_ready' };
+            const famIntent = { channel: 'telegram', recipientType: 'family_or_group', recipientUserId: 11, telegramChatId: 111111, templateKey: 'family_group_tickets_ready' };
+
+            const resCreator = await processNotificationIntents([creatorIntent], { booking: {}, trip: mockTrip }, { dryRun: true });
+            const resCoord = await processNotificationIntents([coordIntent], { booking: {}, trip: mockTrip }, { dryRun: true });
+            const resFam = await processNotificationIntents([famIntent], { booking: {}, trip: mockTrip }, { dryRun: true });
+
+            assert.equal(resCreator[0].status, 'pending');
+            assert.equal(resCoord[0].status, 'pending');
+            assert.equal(resFam[0].status, 'pending');
+        });
+
+        it('18. 6 family passengers on same trip produce single aggregate family_group_manifest intent', () => {
+            const sixBookings = [1, 2, 3, 4, 5, 6].map(i => ({
+                id: 200 + i,
+                bus_ticket_id: 10,
+                passenger_name: `Family Member ${i}`,
+                phone: '+992900112233',
+                contact_role: 'family_or_group',
+                created_by_user_id: 11
+            }));
+
+            const plan = buildNotificationPlan(sixBookings[0], { users: mockUsers, trip: mockTrip, tripBookings: sixBookings });
+            const tgIntent = plan.intents.find(i => i.channel === 'telegram');
+            assert.ok(tgIntent);
+            assert.equal(tgIntent.recipientType, 'family_or_group');
+            assert.equal(tgIntent.notificationType, 'family_group_manifest');
+            assert.equal(tgIntent.templateKey, 'family_group_tickets_ready');
         });
     });
 });
