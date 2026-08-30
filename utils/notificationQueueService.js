@@ -1,13 +1,15 @@
 /**
  * notificationQueueService.js
  * 
- * Production Notification Queue & Server-Side Audit Service (Phase D)
+ * Production Notification Queue & Server-Side Audit Service (Phase D.1)
  * Project: POPUTKI.ONLINE
  * 
  * Features:
  * - Server-side only Supabase service-role client (RLS preserved, anon writes blocked)
  * - Atomic queue acquisition (pending -> sending) with concurrency safety
- * - Group notification many-to-many linking (booking_notification_bookings)
+ * - Pre-send booking cancellation eligibility verification
+ * - Partial group cancellation manifest re-evaluation
+ * - Group notification many-to-many linking (booking_notification_bookings with PK(notification_id, booking_id))
  * - Idempotent plan persistence (unique idempotency_key conflict handling)
  * - Stale sending recovery (automatic timeout after 5 minutes)
  * - Bounded retry classification with exponential backoff
@@ -154,6 +156,60 @@ async function acquirePendingNotification(notificationId, options = {}) {
 }
 
 /**
+ * Evaluates whether linked bookings are still valid and confirmed immediately prior to dispatch.
+ *
+ * @param {Object} notif - Notification record
+ * @param {Object} context - { booking, trip, bookingsList }
+ * @param {Object} [options={}] - { supabaseClient }
+ * @returns {Promise<{ isEligible: boolean, reason?: string, eligibleBookings: Array<Object> }>}
+ */
+async function evaluateBookingEligibility(notif, context = {}, options = {}) {
+    const dbClient = options.supabaseClient || supabase;
+    const rootBooking = context.booking;
+    const candidateList = context.bookingsList || (rootBooking ? [rootBooking] : []);
+
+    let liveBookings = candidateList;
+
+    if (notif && notif.id && candidateList.length === 0) {
+        const { data: links } = await dbClient
+            .from('booking_notification_bookings')
+            .select('booking_id')
+            .eq('notification_id', notif.id);
+
+        if (links && links.length > 0) {
+            const bookingIds = links.map(l => l.booking_id);
+            const { data: dbRows } = await dbClient
+                .from('bus_ticket_bookings')
+                .select('*')
+                .in('id', bookingIds);
+            liveBookings = dbRows || [];
+        } else if (notif.booking_id) {
+            const { data: singleRow } = await dbClient
+                .from('bus_ticket_bookings')
+                .select('*')
+                .eq('id', notif.booking_id)
+                .single();
+            liveBookings = singleRow ? [singleRow] : [];
+        }
+    }
+
+    const confirmedBookings = liveBookings.filter(b => b && b.status === 'confirmed');
+
+    if (confirmedBookings.length === 0) {
+        return {
+            isEligible: false,
+            reason: liveBookings.length > 0 ? 'BOOKING_NO_LONGER_ELIGIBLE' : 'NO_LINKED_BOOKINGS',
+            eligibleBookings: []
+        };
+    }
+
+    return {
+        isEligible: true,
+        eligibleBookings: confirmedBookings
+    };
+}
+
+/**
  * Marks a notification as successfully sent.
  * 
  * @param {string} notificationId
@@ -193,7 +249,7 @@ async function markNotificationFailed(notificationId, errorClassification = {}, 
     await dbClient
         .from('booking_notifications')
         .update({
-            status: isTemporary ? 'pending' : 'failed',
+            status: isTemporary ? 'pending' : (errorClassification.status || 'failed'),
             error_code: errorClassification.errorCode || 'DELIVERY_FAILED',
             last_attempt_at: nowIso,
             next_attempt_at: nextAttemptIso
@@ -219,10 +275,28 @@ async function enqueueAndDispatchNotifications(plan, context = {}, options = {})
 
             if (notif.status !== 'pending') continue;
 
+            // Pre-send booking cancellation eligibility check
+            const eligibility = await evaluateBookingEligibility(notif, context, options);
+            if (!eligibility.isEligible) {
+                await markNotificationFailed(notif.id, {
+                    isTemporary: false,
+                    status: 'skipped',
+                    errorCode: eligibility.reason
+                }, options);
+                continue; // Zero provider calls
+            }
+
             const acquired = await acquirePendingNotification(notif.id, options);
             if (!acquired) continue;
 
-            const deliveryResults = await processNotificationIntents([intent], context, {
+            // Use only confirmed eligible bookings for outgoing manifest
+            const dispatchContext = {
+                ...context,
+                booking: eligibility.eligibleBookings[0] || context.booking,
+                bookingsList: eligibility.eligibleBookings
+            };
+
+            const deliveryResults = await processNotificationIntents([intent], dispatchContext, {
                 dryRun: false,
                 ...options
             });
@@ -239,6 +313,7 @@ async function enqueueAndDispatchNotifications(plan, context = {}, options = {})
             } else if (result && result.status === 'skipped') {
                 await markNotificationFailed(notif.id, {
                     isTemporary: false,
+                    status: 'skipped',
                     errorCode: result.reason
                 }, options);
             }
@@ -252,6 +327,7 @@ module.exports = {
     STALE_SENDING_TIMEOUT_MS,
     persistNotificationPlan,
     acquirePendingNotification,
+    evaluateBookingEligibility,
     recoverStaleSendingNotifications: async (staleMinutes = 5, options = {}) => {
         const dbClient = options.supabaseClient || supabase;
         const threshold = new Date(Date.now() - staleMinutes * 60 * 1000).toISOString();

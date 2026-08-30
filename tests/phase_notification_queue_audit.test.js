@@ -318,8 +318,94 @@ describe('MANUAL BOOKING PASSENGER ACTIVATION V1 — PHASE D QUEUE & AUDIT SUITE
             };
 
             // Should complete cleanly without throwing
-            await enqueueAndDispatchNotifications(failingPlan, { booking: { id: 700 } }, { supabaseClient: mockDb });
+            await enqueueAndDispatchNotifications(failingPlan, { booking: { id: 700, status: 'confirmed' } }, { supabaseClient: mockDb });
             assert.ok(true);
+        });
+
+        it('12. cancelled single booking pending notification is skipped with BOOKING_NO_LONGER_ELIGIBLE and zero provider calls', async () => {
+            const plan = {
+                intents: [{
+                    channel: 'telegram',
+                    recipientType: 'creator',
+                    recipientUserId: 11,
+                    telegramChatId: 111111,
+                    notificationType: 'creator_handoff',
+                    idempotencyKey: 'booking:800:creator:hash:telegram:creator_handoff'
+                }]
+            };
+
+            // Booking is cancelled
+            const cancelledBooking = { id: 800, status: 'cancelled' };
+            await enqueueAndDispatchNotifications(plan, { booking: cancelledBooking }, { supabaseClient: mockDb });
+
+            // Record in mockDb should be marked skipped
+            let savedNotif = null;
+            for (const n of mockDb._notifications.values()) {
+                if (n.idempotency_key === plan.intents[0].idempotencyKey) savedNotif = n;
+            }
+            assert.ok(savedNotif);
+            assert.equal(savedNotif.status, 'skipped');
+            assert.equal(savedNotif.error_code, 'BOOKING_NO_LONGER_ELIGIBLE');
+        });
+
+        it('13. aggregate group with 1 cancelled booking dispatches remaining 5 confirmed bookings', async () => {
+            const bookings = [
+                { id: 901, status: 'confirmed', passenger_name: 'P1' },
+                { id: 902, status: 'confirmed', passenger_name: 'P2' },
+                { id: 903, status: 'confirmed', passenger_name: 'P3' },
+                { id: 904, status: 'confirmed', passenger_name: 'P4' },
+                { id: 905, status: 'confirmed', passenger_name: 'P5' },
+                { id: 906, status: 'cancelled', passenger_name: 'P6' } // 1 cancelled
+            ];
+
+            const plan = {
+                intents: [{
+                    channel: 'telegram',
+                    recipientType: 'family_or_group',
+                    recipientUserId: 22,
+                    telegramChatId: 222222,
+                    notificationType: 'family_group_manifest',
+                    idempotencyKey: 'trip:10:family:hash:partial:test'
+                }]
+            };
+
+            await enqueueAndDispatchNotifications(plan, { booking: bookings[0], bookingsList: bookings }, { supabaseClient: mockDb });
+
+            let savedNotif = null;
+            for (const n of mockDb._notifications.values()) {
+                if (n.idempotency_key === plan.intents[0].idempotencyKey) savedNotif = n;
+            }
+            assert.ok(savedNotif);
+            // Notification is processed for the 5 confirmed bookings
+            assert.notEqual(savedNotif.status, 'failed');
+        });
+
+        it('14. aggregate group with all bookings cancelled is skipped with zero provider calls', async () => {
+            const allCancelled = [
+                { id: 911, status: 'cancelled', passenger_name: 'P1' },
+                { id: 912, status: 'cancelled', passenger_name: 'P2' }
+            ];
+
+            const plan = {
+                intents: [{
+                    channel: 'telegram',
+                    recipientType: 'coordinator',
+                    recipientUserId: 33,
+                    telegramChatId: 333333,
+                    notificationType: 'coordinator_manifest',
+                    idempotencyKey: 'trip:10:coord:hash:allcancelled:test'
+                }]
+            };
+
+            await enqueueAndDispatchNotifications(plan, { booking: allCancelled[0], bookingsList: allCancelled }, { supabaseClient: mockDb });
+
+            let savedNotif = null;
+            for (const n of mockDb._notifications.values()) {
+                if (n.idempotency_key === plan.intents[0].idempotencyKey) savedNotif = n;
+            }
+            assert.ok(savedNotif);
+            assert.equal(savedNotif.status, 'skipped');
+            assert.equal(savedNotif.error_code, 'BOOKING_NO_LONGER_ELIGIBLE');
         });
     });
 });
