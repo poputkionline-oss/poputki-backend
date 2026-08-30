@@ -14,7 +14,7 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
-const { verifyToken } = require('../middleware/auth');
+const { carrierAuth } = require('../utils/carrierAuth');
 const {
     generateClaimSession,
     resolveClaimSession,
@@ -221,9 +221,9 @@ router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) =
  * GET /api/claims/carrier/requests
  * Carrier authenticated endpoint: List pending claim requests for carrier's trips.
  */
-router.get('/carrier/requests', verifyToken, async (req, res) => {
+router.get('/carrier/requests', carrierAuth(), async (req, res) => {
     try {
-        const carrierId = req.carrier?.user_id || req.user?.id;
+        const carrierId = req.carrierId || req.user?.id;
         if (!carrierId) {
             return res.status(401).json({ error: 'Авторизация перевозчика обязательна' });
         }
@@ -259,9 +259,9 @@ router.get('/carrier/requests', verifyToken, async (req, res) => {
  * POST /api/claims/carrier/requests/:id/review
  * Carrier authenticated endpoint: Approve or reject a claim request.
  */
-router.post('/carrier/requests/:id/review', verifyToken, async (req, res) => {
+router.post('/carrier/requests/:id/review', carrierAuth(), async (req, res) => {
     try {
-        const carrierId = req.carrier?.user_id || req.user?.id;
+        const carrierId = req.carrierId || req.user?.id;
         const { decision, reason } = req.body;
 
         if (!['approved', 'rejected'].includes(decision)) {
