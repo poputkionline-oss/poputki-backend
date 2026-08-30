@@ -28,6 +28,7 @@ const {
     buildPassengerTicketProjection,
     buildTripPrintManifest
 } = require('../utils/ticketHelper');
+const { isValidPhone, cleanPhoneForStorage } = require('../utils/phoneHelper');
 
 
 
@@ -700,11 +701,21 @@ router.post('/bookings/manual', async (req, res) => {
         return res.status(403).json({ error: 'Недостаточно прав для ручного бронирования' });
     }
 
-    const { bus_ticket_id, seat_numbers, passengers_data, phone, passenger_name, pickup_city, drop_off_city } = req.body;
+    const { bus_ticket_id, seat_numbers, passengers_data, phone, passenger_name, pickup_city, drop_off_city, contact_role } = req.body;
 
     if (!bus_ticket_id) {
         return res.status(400).json({ error: 'Необходимо указать bus_ticket_id' });
     }
+
+    // Phone format validation (reject text typos, allow empty / valid international numbers)
+    if (!isValidPhone(phone, true)) {
+        return res.status(400).json({
+            error: 'INVALID_PHONE_FORMAT',
+            message: 'Некорректный номер телефона. Введите номер в международном формате (+992..., +7...) или оставьте поле пустым'
+        });
+    }
+    const cleanPhone = cleanPhoneForStorage(phone);
+    const validContactRole = ['passenger', 'family_or_group', 'coordinator', 'unknown'].includes(contact_role) ? contact_role : 'unknown';
 
     // Strict ownership verification
     const hasAccess = await verifyTicketAccess(req.carrier, bus_ticket_id);
@@ -745,11 +756,13 @@ router.post('/bookings/manual', async (req, res) => {
             .from('bus_ticket_bookings')
             .insert([{
                 bus_ticket_id,
-                passenger_id: req.carrier.user_id, // Authenticated carrier manager
+                passenger_id: req.carrier.user_id, // Authenticated carrier manager (legacy surrogate)
                 seat_numbers,
                 passenger_count: (seat_numbers || []).length,
                 passengers_data,
-                phone,
+                phone: cleanPhone,
+                contact_role: validContactRole,
+                claim_status: 'unclaimed',
                 status: 'confirmed',
                 total_price: manualTotalPrice,
                 commission_rate: commissionRate,
@@ -793,6 +806,25 @@ router.post('/bookings/manual', async (req, res) => {
                 drop_off_city
             }
         });
+
+        // Phase B Notification Planning Hook (Feature-flagged, no external dispatch)
+        if (process.env.NOTIFICATION_ROUTING_ENABLED === 'true') {
+            try {
+                const { buildNotificationPlan } = require('../utils/notificationRoutingEngine');
+                const fullBooking = {
+                    id: booking.id,
+                    bus_ticket_id,
+                    passenger_id: req.carrier.user_id,
+                    passenger_name,
+                    phone: cleanPhone,
+                    contact_role: validContactRole,
+                    created_by_user_id: req.carrier.user_id
+                };
+                buildNotificationPlan(fullBooking, { creator: req.carrier, trip: ticket });
+            } catch (planErr) {
+                console.error('[NotificationPlan] Error generating plan:', planErr.message);
+            }
+        }
 
         res.json({ success: true, id: booking.id });
     } catch (err) {
