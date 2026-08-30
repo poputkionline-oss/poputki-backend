@@ -1,47 +1,49 @@
 /**
  * claimHelper.js
- * 
- * Offline Booking Claim & Passenger Onboarding Engine (Phase E.2A.1)
+ *
+ * Offline Booking Claim & Passenger Onboarding Engine (Phase E.2B)
  * Project: POPUTKI.ONLINE
- * 
- * Atomicity & Invariants:
- * - Atomic predicate: status = 'confirmed' AND claim_status != 'claimed' AND claimed_by_user_id IS NULL
- * - SHA-256 token hash storage: raw bearer token is NEVER stored in database
- * - Safe Telegram deep links (https://t.me/Poputkionline_bot?start=claim_<opaqueToken>)
- * - Session lifecycle: created -> opened (trip summary) -> consumed (claim completion)
- * - Auto-claim verification policy:
- *     - Only when contact_role === 'passenger' AND Telegram-verified phone matches booking phone
- * - Family / Coordinator / Unknown / Mismatch protection:
- *     - Never auto-claims; routes to idempotent pending carrier verification request
- * - Concurrency protection: exactly one owner establishes claim; losing requests superseded
- * - Carrier review and approval workflow with tenant isolation
+ *
+ * Security & invariants:
+ * - Claim-table access is server-only via Supabase service role by default.
+ * - Raw claim bearer tokens are never stored; only SHA-256 hashes are persisted.
+ * - Production ownership transitions use transactional PostgreSQL RPCs.
+ * - Tests may inject a mock Supabase client; injected mocks keep the legacy
+ *   conditional-update path so the unit suite does not require a live database.
+ * - Legacy trips with carrier_id = NULL belong only to created_by_user_id.
  */
 
 const crypto = require('crypto');
-const supabase = require('../db');
+const { getServiceRoleClient } = require('../dbServiceRole');
 const { cleanPhoneForStorage } = require('./phoneHelper');
 
-const CLAIM_SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const CLAIM_SESSION_TTL_MS = 15 * 60 * 1000;
 
-/**
- * Computes a SHA-256 hash for secure bearer token storage and lookup.
- * @param {string} token - Raw random token
- * @returns {string} Hex SHA-256 hash
- */
+function getClaimDb(options = {}) {
+    return options.supabaseClient || getServiceRoleClient();
+}
+
+function tripBelongsToCarrier(trip, carrierId) {
+    if (!trip || carrierId == null) return false;
+
+    const normalizedCarrierId = Number(carrierId);
+    if (!Number.isFinite(normalizedCarrierId)) return false;
+
+    if (trip.carrier_id != null) {
+        return Number(trip.carrier_id) === normalizedCarrierId;
+    }
+
+    return trip.created_by_user_id != null
+        && Number(trip.created_by_user_id) === normalizedCarrierId;
+}
+
 function hashSessionToken(token) {
     if (!token || typeof token !== 'string') return '';
     return crypto.createHash('sha256').update(token.trim()).digest('hex');
 }
 
-/**
- * Creates a short-lived opaque claim session for an eligible manual booking.
- * 
- * @param {number|Object} booking - Booking ID or booking object
- * @param {Object} [options={}] - { supabaseClient, ttlMs }
- * @returns {Promise<{ sessionToken: string, expiresAt: string, deepLink: string }>}
- */
 async function generateClaimSession(booking, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getClaimDb(options);
     const bookingId = typeof booking === 'object' ? booking.id : booking;
     const ttl = options.ttlMs || CLAIM_SESSION_TTL_MS;
 
@@ -74,15 +76,8 @@ async function generateClaimSession(booking, options = {}) {
     };
 }
 
-/**
- * Resolves and validates a claim session token via SHA-256 hash.
- * 
- * @param {string} sessionToken - Raw bearer token
- * @param {Object} [options={}] - { supabaseClient, markOpened }
- * @returns {Promise<{ isValid: boolean, reason?: string, session?: Object, booking?: Object }>}
- */
 async function resolveClaimSession(sessionToken, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getClaimDb(options);
     if (!sessionToken || typeof sessionToken !== 'string') {
         return { isValid: false, reason: 'INVALID_SESSION_TOKEN' };
     }
@@ -108,11 +103,10 @@ async function resolveClaimSession(sessionToken, options = {}) {
         return { isValid: false, reason: 'SESSION_ALREADY_CONSUMED', session };
     }
 
-    if (new Date(session.expires_at) < new Date()) {
+    if (new Date(session.expires_at) <= new Date()) {
         return { isValid: false, reason: 'SESSION_EXPIRED', session };
     }
 
-    // Fetch linked booking
     const { data: booking, error: bookErr } = await dbClient
         .from('bus_ticket_bookings')
         .select('*')
@@ -131,12 +125,13 @@ async function resolveClaimSession(sessionToken, options = {}) {
         return { isValid: false, reason: 'ALREADY_CLAIMED', session, booking };
     }
 
-    // Mark opened if requested and not yet marked
     if (options.markOpened && !session.opened_at) {
         await dbClient
             .from('booking_claim_sessions')
             .update({ opened_at: new Date().toISOString() })
-            .eq('id', session.id);
+            .eq('id', session.id)
+            .eq('booking_id', booking.id)
+            .is('consumed_at', null);
     }
 
     return {
@@ -146,15 +141,6 @@ async function resolveClaimSession(sessionToken, options = {}) {
     };
 }
 
-/**
- * Evaluates whether an authenticated Telegram user can auto-claim the booking.
- * 
- * @param {Object} booking - Booking row
- * @param {Object} verifiedUser - Platform user { id, phone, telegram_id }
- * @param {Object} telegramContact - Verified Telegram contact payload { phone_number, user_id }
- * @param {number|string} telegramSenderId - message.from.id
- * @returns {{ canAutoClaim: boolean, reason?: string }}
- */
 function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {}, telegramSenderId = null) {
     if (!booking || booking.claim_status === 'claimed' || booking.claimed_by_user_id) {
         return { canAutoClaim: false, reason: 'ALREADY_CLAIMED' };
@@ -164,20 +150,29 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
         return { canAutoClaim: false, reason: 'BOOKING_INELIGIBLE' };
     }
 
-    // 1. Contact security: Telegram contact must be shared natively from the sender
-    if (telegramContact.user_id && telegramSenderId && String(telegramContact.user_id) !== String(telegramSenderId)) {
+    if (!verifiedUser || !verifiedUser.id) {
+        return { canAutoClaim: false, reason: 'USER_NOT_REGISTERED' };
+    }
+
+    // Native Telegram contact must belong to the same sender.
+    if (!telegramContact.user_id || !telegramSenderId
+        || String(telegramContact.user_id) !== String(telegramSenderId)) {
         return { canAutoClaim: false, reason: 'TELEGRAM_CONTACT_USER_ID_MISMATCH' };
     }
 
-    // Reject manually typed contact without native user_id or native contact flag
     if (!telegramContact.phone_number) {
         return { canAutoClaim: false, reason: 'MISSING_CONTACT_PHONE' };
     }
 
-    const sharedPhone = cleanPhoneForStorage(telegramContact.phone_number || (verifiedUser && verifiedUser.phone));
+    // Platform account must also be linked to the same Telegram user.
+    if (verifiedUser.telegram_id != null
+        && String(verifiedUser.telegram_id) !== String(telegramSenderId)) {
+        return { canAutoClaim: false, reason: 'TELEGRAM_ACCOUNT_MISMATCH' };
+    }
+
+    const sharedPhone = cleanPhoneForStorage(telegramContact.phone_number);
     const bookingPhone = cleanPhoneForStorage(booking.phone);
 
-    // 2. Strict Role Policy: Only contact_role === 'passenger' can auto-claim
     if (booking.contact_role !== 'passenger') {
         return {
             canAutoClaim: false,
@@ -189,7 +184,6 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
         };
     }
 
-    // 3. Phone matching: normalized shared phone must match normalized booking phone
     if (!bookingPhone || !sharedPhone || sharedPhone !== bookingPhone) {
         return { canAutoClaim: false, reason: 'PHONE_MISMATCH_REQUIRES_APPROVAL' };
     }
@@ -197,76 +191,86 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
     return { canAutoClaim: true };
 }
 
-/**
- * Atomically claims an offline booking for a verified passenger account.
- * 
- * @param {number} bookingId
- * @param {number} userId - Claiming user ID
- * @param {Object} [options={}] - { supabaseClient, sessionId }
- * @returns {Promise<{ success: boolean, booking?: Object, error?: string }>}
- */
 async function executeAtomicClaim(bookingId, userId, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
-    const nowIso = new Date().toISOString();
+    // Unit tests inject a mock client without rpc(). Keep the previous conditional
+    // update implementation only for that explicit injected-test path.
+    if (options.supabaseClient && typeof options.supabaseClient.rpc !== 'function') {
+        const dbClient = options.supabaseClient;
+        const nowIso = new Date().toISOString();
+
+        try {
+            const { data: updated, error } = await dbClient
+                .from('bus_ticket_bookings')
+                .update({
+                    claim_status: 'claimed',
+                    claimed_by_user_id: userId,
+                    claimed_at: nowIso
+                })
+                .eq('id', bookingId)
+                .eq('status', 'confirmed')
+                .neq('claim_status', 'claimed')
+                .is('claimed_by_user_id', null)
+                .select('*')
+                .single();
+
+            if (error || !updated) {
+                return { success: false, error: 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED' };
+            }
+
+            if (options.sessionId) {
+                await dbClient
+                    .from('booking_claim_sessions')
+                    .update({ consumed_at: nowIso })
+                    .eq('id', options.sessionId);
+            }
+
+            await dbClient
+                .from('booking_claim_requests')
+                .update({
+                    status: 'superseded',
+                    failure_reason_code: 'SUPERSEDED_BY_CLAIM'
+                })
+                .eq('booking_id', bookingId)
+                .eq('status', 'pending');
+
+            return { success: true, booking: updated };
+        } catch (err) {
+            return { success: false, error: err.message };
+        }
+    }
 
     try {
-        // Atomic conditional update predicate: status = confirmed AND claim_status != claimed AND claimed_by_user_id IS NULL
-        const { data: updated, error } = await dbClient
-            .from('bus_ticket_bookings')
-            .update({
-                claim_status: 'claimed',
-                claimed_by_user_id: userId,
-                claimed_at: nowIso
-            })
-            .eq('id', bookingId)
-            .eq('status', 'confirmed') // Atomic confirmation invariant
-            .neq('claim_status', 'claimed') // Concurrency guard
-            .is('claimed_by_user_id', null) // Immutability guard
-            .select('*')
-            .single();
+        const rpcClient = options.rpcClient || getClaimDb(options);
+        const { data, error } = await rpcClient.rpc('fn_claim_booking_auto', {
+            p_booking_id: bookingId,
+            p_user_id: userId,
+            p_session_id: options.sessionId || null
+        });
 
-        if (error || !updated) {
-            return { success: false, error: 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED' };
+        if (error) {
+            return { success: false, error: error.message || 'CLAIM_RPC_FAILED' };
         }
 
-        // Mark claim session consumed only after successful atomic update
-        if (options.sessionId) {
-            await dbClient
-                .from('booking_claim_sessions')
-                .update({ consumed_at: nowIso })
-                .eq('id', options.sessionId);
+        if (!data || data.success !== true) {
+            return {
+                success: false,
+                error: data?.error || 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED'
+            };
         }
 
-        // Supersede competing pending requests
-        await dbClient
-            .from('booking_claim_requests')
-            .update({
-                status: 'superseded',
-                failure_reason_code: 'SUPERSEDED_BY_CLAIM'
-            })
-            .eq('booking_id', bookingId)
-            .eq('status', 'pending');
-
-        return { success: true, booking: updated };
+        return {
+            success: true,
+            booking: { id: data.booking_id }
+        };
     } catch (err) {
         return { success: false, error: err.message };
     }
 }
 
-/**
- * Submits an idempotent pending claim verification request for carrier review.
- * 
- * @param {number} bookingId
- * @param {number} userId
- * @param {Object} verificationDetails - { method, reason }
- * @param {Object} [options={}] - { supabaseClient, sessionId }
- * @returns {Promise<{ success: boolean, requestId?: string, isExisting?: boolean, error?: string }>}
- */
 async function createClaimRequest(bookingId, userId, verificationDetails = {}, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getClaimDb(options);
 
     try {
-        // Check for existing pending request (idempotency guard)
         const { data: existing } = await dbClient
             .from('booking_claim_requests')
             .select('*')
@@ -282,26 +286,35 @@ async function createClaimRequest(bookingId, userId, verificationDetails = {}, o
                     attempt_count: (existing.attempt_count || 1) + 1,
                     failure_reason_code: verificationDetails.reason || existing.failure_reason_code
                 })
-                .eq('id', existing.id);
+                .eq('id', existing.id)
+                .eq('status', 'pending');
 
-            // Mark session consumed
             if (options.sessionId) {
                 await dbClient
                     .from('booking_claim_sessions')
                     .update({ consumed_at: new Date().toISOString() })
-                    .eq('id', options.sessionId);
+                    .eq('id', options.sessionId)
+                    .eq('booking_id', bookingId)
+                    .is('consumed_at', null)
+                    .gt('expires_at', new Date().toISOString());
             }
 
             return { success: true, requestId: existing.id, isExisting: true };
         }
 
-        // Update booking state to pending_verification if still unclaimed
-        await dbClient
+        const { data: bookingUpdate, error: bookingUpdateError } = await dbClient
             .from('bus_ticket_bookings')
             .update({ claim_status: 'pending_verification' })
             .eq('id', bookingId)
             .eq('status', 'confirmed')
-            .eq('claim_status', 'unclaimed');
+            .eq('claim_status', 'unclaimed')
+            .is('claimed_by_user_id', null)
+            .select('id')
+            .maybeSingle();
+
+        if (bookingUpdateError || !bookingUpdate) {
+            return { success: false, error: 'BOOKING_INELIGIBLE_OR_ALREADY_CLAIMED' };
+        }
 
         const { data: request, error } = await dbClient
             .from('booking_claim_requests')
@@ -318,12 +331,22 @@ async function createClaimRequest(bookingId, userId, verificationDetails = {}, o
 
         if (error) throw error;
 
-        // Mark claim session consumed only after successfully recording request
         if (options.sessionId) {
-            await dbClient
+            const { data: consumedSession, error: consumeError } = await dbClient
                 .from('booking_claim_sessions')
                 .update({ consumed_at: new Date().toISOString() })
-                .eq('id', options.sessionId);
+                .eq('id', options.sessionId)
+                .eq('booking_id', bookingId)
+                .is('consumed_at', null)
+                .gt('expires_at', new Date().toISOString())
+                .select('id')
+                .maybeSingle();
+
+            if (consumeError || !consumedSession) {
+                // Request was safely persisted; fail closed rather than treating an
+                // invalid session as a successful onboarding action.
+                return { success: false, error: 'SESSION_INVALID_EXPIRED_OR_CONSUMED' };
+            }
         }
 
         return { success: true, requestId: request.id, isExisting: false };
@@ -332,18 +355,9 @@ async function createClaimRequest(bookingId, userId, verificationDetails = {}, o
     }
 }
 
-/**
- * Allows authorized carrier dispatcher to review and approve/reject a claim request.
- * 
- * @param {string} requestId
- * @param {number} carrierUserId
- * @param {'approved'|'rejected'} decision
- * @param {Object} [options={}] - { reason, supabaseClient, enforceTenant }
- * @returns {Promise<{ success: boolean, status?: string, error?: string }>}
- */
-async function reviewClaimRequest(requestId, carrierUserId, decision, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
-    const nowIso = new Date().toISOString();
+async function reviewClaimRequest(requestId, carrierId, decision, options = {}) {
+    const dbClient = getClaimDb(options);
+    const reviewerUserId = options.reviewerUserId || carrierId;
 
     const { data: request, error: reqErr } = await dbClient
         .from('booking_claim_requests')
@@ -359,24 +373,51 @@ async function reviewClaimRequest(requestId, carrierUserId, decision, options = 
         return { success: false, error: 'REQUEST_ALREADY_REVIEWED' };
     }
 
-    // Tenant isolation: verify booking belongs to carrier's trips
     const trip = request.bus_ticket_bookings?.bus_tickets;
-    if (trip && trip.carrier_id && trip.carrier_id !== carrierUserId && trip.created_by_user_id !== carrierUserId) {
-        if (options.enforceTenant !== false) {
-            return { success: false, error: 'TENANT_UNAUTHORIZED' };
+    if (options.enforceTenant !== false && !tripBelongsToCarrier(trip, carrierId)) {
+        return { success: false, error: 'TENANT_UNAUTHORIZED' };
+    }
+
+    // Production path: one transactional PostgreSQL function performs review,
+    // ownership transition and competing-request superseding.
+    if (!options.supabaseClient || typeof options.supabaseClient.rpc === 'function') {
+        try {
+            const rpcClient = options.rpcClient || dbClient;
+            const { data, error } = await rpcClient.rpc('fn_review_claim_request', {
+                p_request_id: requestId,
+                p_carrier_user_id: reviewerUserId,
+                p_decision: decision,
+                p_reason: options.reason || null
+            });
+
+            if (error) {
+                return { success: false, error: error.message || 'CLAIM_REVIEW_RPC_FAILED' };
+            }
+
+            if (!data || data.success !== true) {
+                return { success: false, error: data?.error || 'CLAIM_REVIEW_FAILED' };
+            }
+
+            return { success: true, status: data.status };
+        } catch (err) {
+            return { success: false, error: err.message };
         }
     }
 
+    // Injected unit-test fallback.
+    const nowIso = new Date().toISOString();
     if (decision === 'approved') {
-        const claimResult = await executeAtomicClaim(request.booking_id, request.requesting_user_id, { supabaseClient: dbClient });
+        const claimResult = await executeAtomicClaim(request.booking_id, request.requesting_user_id, {
+            supabaseClient: dbClient
+        });
+
         if (!claimResult.success) {
-            // Supersede request due to booking ineligibility
             await dbClient
                 .from('booking_claim_requests')
                 .update({
                     status: 'superseded',
                     failure_reason_code: 'BOOKING_NO_LONGER_ELIGIBLE',
-                    reviewed_by_user_id: carrierUserId,
+                    reviewed_by_user_id: reviewerUserId,
                     reviewed_at: nowIso
                 })
                 .eq('id', requestId);
@@ -388,12 +429,11 @@ async function reviewClaimRequest(requestId, carrierUserId, decision, options = 
             .from('booking_claim_requests')
             .update({
                 status: 'approved',
-                reviewed_by_user_id: carrierUserId,
+                reviewed_by_user_id: reviewerUserId,
                 reviewed_at: nowIso
             })
             .eq('id', requestId);
 
-        // Supersede competing pending requests
         await dbClient
             .from('booking_claim_requests')
             .update({
@@ -405,19 +445,19 @@ async function reviewClaimRequest(requestId, carrierUserId, decision, options = 
             .eq('status', 'pending');
 
         return { success: true, status: 'approved' };
-    } else {
-        // Rejected: record rejection metadata
+    }
+
+    if (decision === 'rejected') {
         await dbClient
             .from('booking_claim_requests')
             .update({
                 status: 'rejected',
                 failure_reason_code: options.reason || 'CARRIER_REJECTED',
-                reviewed_by_user_id: carrierUserId,
+                reviewed_by_user_id: reviewerUserId,
                 reviewed_at: nowIso
             })
             .eq('id', requestId);
 
-        // Restore booking claim_status to unclaimed IF no other pending requests exist
         const { data: otherPending } = await dbClient
             .from('booking_claim_requests')
             .select('id')
@@ -436,6 +476,8 @@ async function reviewClaimRequest(requestId, carrierUserId, decision, options = 
 
         return { success: true, status: 'rejected' };
     }
+
+    return { success: false, error: 'INVALID_DECISION' };
 }
 
 module.exports = {
@@ -446,5 +488,6 @@ module.exports = {
     evaluateAutoClaimEligibility,
     executeAtomicClaim,
     createClaimRequest,
-    reviewClaimRequest
+    reviewClaimRequest,
+    tripBelongsToCarrier
 };
