@@ -807,10 +807,11 @@ router.post('/bookings/manual', async (req, res) => {
             }
         });
 
-        // Phase B Notification Planning Hook (Feature-flagged, no external dispatch)
+        // Phase D Notification Planning & Server-Side Queue Hook (Non-blocking)
         if (process.env.NOTIFICATION_ROUTING_ENABLED === 'true') {
             try {
                 const { buildNotificationPlan } = require('../utils/notificationRoutingEngine');
+                const { enqueueAndDispatchNotifications } = require('../utils/notificationQueueService');
                 const fullBooking = {
                     id: booking.id,
                     bus_ticket_id,
@@ -820,7 +821,10 @@ router.post('/bookings/manual', async (req, res) => {
                     contact_role: validContactRole,
                     created_by_user_id: req.carrier.user_id
                 };
-                buildNotificationPlan(fullBooking, { creator: req.carrier, trip: ticket });
+                const plan = buildNotificationPlan(fullBooking, { creator: req.carrier, trip: ticket });
+                enqueueAndDispatchNotifications(plan, { booking: fullBooking, trip: ticket, creator: req.carrier }).catch(err => {
+                    console.error('[NotificationQueue] Async dispatch error:', err.message);
+                });
             } catch (planErr) {
                 console.error('[NotificationPlan] Error generating plan:', planErr.message);
             }
