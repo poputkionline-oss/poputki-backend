@@ -247,13 +247,22 @@ router.get('/:id/bus-bookings', async (req, res) => {
                     operator:users!operator_id (phone)
                 )
             `)
-            .eq('passenger_id', req.params.id)
+            .or(`passenger_id.eq.${req.params.id},claimed_by_user_id.eq.${req.params.id}`)
             .eq('status', 'confirmed')
             .order('created_at', { ascending: false });
 
         if (error) throw error;
 
-        const result = bookings.map(b => {
+        // Security filter: prevent carrier surrogate passenger_id on manual bookings from leaking into dispatcher's passenger tab
+        const userPassengerBookings = (bookings || []).filter(b => {
+            const isManual = b.channel === 'manual' || b.source_type === 'manual';
+            if (isManual) {
+                return b.claimed_by_user_id && String(b.claimed_by_user_id) === String(req.params.id);
+            }
+            return String(b.passenger_id) === String(req.params.id);
+        });
+
+        const result = userPassengerBookings.map(b => {
             const ticketData = b.bus_tickets;
             delete b.bus_tickets;
             return {

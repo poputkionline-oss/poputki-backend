@@ -241,6 +241,10 @@ function buildPassengerTicketProjection(booking, ticket, busMaster = null, optio
         isPendingPayment: booking.status === 'pending_payment',
         isCancelled: booking.status === 'cancelled',
 
+        claimStatus: booking.claim_status || 'unclaimed',
+        isClaimed: booking.claim_status === 'claimed',
+        isManual: booking.channel === 'manual' || booking.source_type === 'manual',
+
         boardingStatus: boardingStatus,
         boardingLabel: boardingLabel,
         boardedAt: booking.boarded_at || null,

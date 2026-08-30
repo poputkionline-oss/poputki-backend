@@ -94,6 +94,7 @@ const generalRoutes = require('./routes/general');
 const ridesRoutes = require('./routes/rides');
 const smartpayRoutes = require('./routes/smartpay');
 const ocrRoutes = require('./routes/ocr');
+const claimRoutes = require('./routes/claims');
 
 // Use Routes
 app.use('/api/auth', authRoutes);
@@ -109,6 +110,7 @@ app.use('/api/users', usersRoutes);
 app.use('/api/rides', ridesRoutes);
 app.use('/api/payments', smartpayRoutes);
 app.use('/api/ocr', ocrRoutes);
+app.use('/api/claims', claimRoutes);
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
