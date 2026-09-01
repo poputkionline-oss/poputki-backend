@@ -17,10 +17,29 @@
  */
 
 const supabase = require('../db');
+const { getServiceRoleClient } = require('../dbServiceRole');
 const { maskPhone } = require('./phoneHelper');
 const { processNotificationIntents } = require('./telegramDeliveryService');
 
 const STALE_SENDING_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Resolves appropriate database client for server-side notification queue management.
+ * Uses service-role client by default to ensure atomic bypass of anon RLS policies.
+ * 
+ * @param {Object} [options={}]
+ * @returns {Object} Supabase DB Client
+ */
+function getQueueDbClient(options = {}) {
+    if (options.supabaseClient) return options.supabaseClient;
+    try {
+        const serviceClient = getServiceRoleClient();
+        if (serviceClient) return serviceClient;
+    } catch {
+        // Fall back to standard supabase client if service role key is unconfigured (e.g. dev mock)
+    }
+    return supabase;
+}
 
 /**
  * Persists planned notification intents and their relational booking links.
@@ -31,7 +50,7 @@ const STALE_SENDING_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
  * @returns {Promise<Array<Object>>} List of persisted or existing notification records
  */
 async function persistNotificationPlan(plan, context = {}, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getQueueDbClient(options);
     const intents = plan.intents || [];
     const persistedResults = [];
 
@@ -112,7 +131,7 @@ async function persistNotificationPlan(plan, context = {}, options = {}) {
  * @returns {Promise<Object|null>} Acquired notification record or null
  */
 async function acquirePendingNotification(notificationId, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getQueueDbClient(options);
     const nowIso = new Date().toISOString();
     const staleThresholdIso = new Date(Date.now() - STALE_SENDING_TIMEOUT_MS).toISOString();
 
@@ -164,7 +183,7 @@ async function acquirePendingNotification(notificationId, options = {}) {
  * @returns {Promise<{ isEligible: boolean, reason?: string, eligibleBookings: Array<Object> }>}
  */
 async function evaluateBookingEligibility(notif, context = {}, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getQueueDbClient(options);
     const rootBooking = context.booking;
     const candidateList = context.bookingsList || (rootBooking ? [rootBooking] : []);
 
@@ -217,7 +236,7 @@ async function evaluateBookingEligibility(notif, context = {}, options = {}) {
  * @param {Object} [options={}]
  */
 async function markNotificationSent(notificationId, providerMessageId, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getQueueDbClient(options);
     const nowIso = new Date().toISOString();
 
     await dbClient
@@ -240,7 +259,7 @@ async function markNotificationSent(notificationId, providerMessageId, options =
  * @param {Object} [options={}]
  */
 async function markNotificationFailed(notificationId, errorClassification = {}, options = {}) {
-    const dbClient = options.supabaseClient || supabase;
+    const dbClient = getQueueDbClient(options);
     const nowIso = new Date().toISOString();
     const isTemporary = errorClassification.isTemporary !== false;
     const retrySeconds = errorClassification.retryAfterSeconds || 60;
