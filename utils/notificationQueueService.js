@@ -35,10 +35,10 @@ function getQueueDbClient(options = {}) {
     try {
         const serviceClient = getServiceRoleClient();
         if (serviceClient) return serviceClient;
-    } catch {
-        // Fall back to standard supabase client if service role key is unconfigured (e.g. dev mock)
+    } catch (err) {
+        throw new Error('NOTIFICATION_SERVICE_ROLE_UNAVAILABLE');
     }
-    return supabase;
+    throw new Error('NOTIFICATION_SERVICE_ROLE_UNAVAILABLE');
 }
 
 /**
@@ -115,8 +115,12 @@ async function persistNotificationPlan(plan, context = {}, options = {}) {
                 });
             }
         } catch (err) {
-            // Non-blocking logging
-            console.error('[NotificationQueue] Persist failed for key:', intent.idempotencyKey, err.message);
+            // Non-blocking logging (NO PII)
+            console.error('[NotificationQueue] Persist failed:', {
+                booking_id: notifRow.booking_id,
+                stage: 'persist',
+                error_code: err.message || 'PERSIST_FAILED'
+            });
         }
     }
 
@@ -183,13 +187,13 @@ async function acquirePendingNotification(notificationId, options = {}) {
  * @returns {Promise<{ isEligible: boolean, reason?: string, eligibleBookings: Array<Object> }>}
  */
 async function evaluateBookingEligibility(notif, context = {}, options = {}) {
-    const dbClient = getQueueDbClient(options);
     const rootBooking = context.booking;
     const candidateList = context.bookingsList || (rootBooking ? [rootBooking] : []);
 
     let liveBookings = candidateList;
 
     if (notif && notif.id && candidateList.length === 0) {
+        const dbClient = getQueueDbClient(options);
         const { data: links } = await dbClient
             .from('booking_notification_bookings')
             .select('booking_id')
