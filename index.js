@@ -32,15 +32,18 @@ app.use((req, res, next) => {
 // Security Header Check Middleware
 app.use((req, res, next) => {
     // Skip security check for: CORS, Health, API Docs, and Phone Redirects
+    // /api/claims/bot/* endpoints are exempt: Telegram cannot send x-mana-man;
+    // they are individually secured by requireClaimBotSecret (X-Claim-Bot-Secret).
     if (
-        req.method === 'OPTIONS' || 
-        req.url === '/health' || 
+        req.method === 'OPTIONS' ||
+        req.url === '/health' ||
         req.url.startsWith('/api-docs') ||
-        req.url.startsWith('/api/call/')
+        req.url.startsWith('/api/call/') ||
+        req.url.startsWith('/api/claims/bot/')
     ) {
         return next();
     }
-    
+
     const clientHeader = req.headers['x-mana-man'];
     if (clientHeader !== 'nasa.2006') {
         console.warn(`[SECURITY] 403 Forbidden - Missing or invalid header from ${req.ip} for ${req.url}`);
