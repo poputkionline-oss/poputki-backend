@@ -849,7 +849,8 @@ router.post('/bookings/manual', async (req, res) => {
                     passenger_name,
                     phone: cleanPhone,
                     contact_role: effectiveContactRole,
-                    created_by_user_id: req.carrier.user_id
+                    created_by_user_id: req.carrier.user_id,
+                    status: 'confirmed'
                 };
                 const plan = buildNotificationPlan(fullBooking, {
                     creator: req.carrier,
