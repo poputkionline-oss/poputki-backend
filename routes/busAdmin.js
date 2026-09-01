@@ -717,6 +717,21 @@ router.post('/bookings/manual', async (req, res) => {
     const cleanPhone = cleanPhoneForStorage(phone);
     const validContactRole = ['passenger', 'family_or_group', 'coordinator', 'unknown'].includes(contact_role) ? contact_role : 'unknown';
 
+    const { resolveRegisteredPassenger, executeAtomicClaim } = require('../utils/claimHelper');
+
+    // Phase E.7 Server-Side Registered Passenger Auto-Resolution:
+    // Explicit carrier roles 'family_or_group' and 'coordinator' take precedence.
+    // For default/unspecified or 'passenger' or 'unknown' roles, check if the phone belongs to a single registered Telegram passenger.
+    let registeredPassenger = null;
+    let effectiveContactRole = validContactRole;
+
+    if (validContactRole !== 'family_or_group' && validContactRole !== 'coordinator') {
+        registeredPassenger = await resolveRegisteredPassenger(cleanPhone);
+        if (registeredPassenger) {
+            effectiveContactRole = 'passenger';
+        }
+    }
+
     // Strict ownership verification
     const hasAccess = await verifyTicketAccess(req.carrier, bus_ticket_id);
     if (!hasAccess) {
@@ -761,7 +776,7 @@ router.post('/bookings/manual', async (req, res) => {
                 passenger_count: (seat_numbers || []).length,
                 passengers_data,
                 phone: cleanPhone,
-                contact_role: validContactRole,
+                contact_role: effectiveContactRole,
                 claim_status: 'unclaimed',
                 status: 'confirmed',
                 total_price: manualTotalPrice,
@@ -780,6 +795,19 @@ router.post('/bookings/manual', async (req, res) => {
             .single();
 
         if (bErr) throw bErr;
+
+        // Phase E.7 Atomic Auto-Claim for Resolved Registered Passenger
+        let isAutoClaimed = false;
+        if (registeredPassenger) {
+            try {
+                const claimRes = await executeAtomicClaim(booking.id, registeredPassenger.id);
+                if (claimRes.success) {
+                    isAutoClaimed = true;
+                }
+            } catch (claimErr) {
+                console.error('[ManualBooking] Registered passenger auto-claim error:', claimErr.message);
+            }
+        }
 
         // Update ticket reserved seats
         const newReserved = [...reserved, ...(seat_numbers || [])];
@@ -807,7 +835,7 @@ router.post('/bookings/manual', async (req, res) => {
             }
         });
 
-        // Phase D Notification Planning & Server-Side Queue Hook (Non-blocking)
+        // Phase D / E.7 Notification Planning & Server-Side Queue Hook (Non-blocking)
         if (process.env.NOTIFICATION_ROUTING_ENABLED === 'true') {
             try {
                 const { buildNotificationPlan } = require('../utils/notificationRoutingEngine');
@@ -816,12 +844,18 @@ router.post('/bookings/manual', async (req, res) => {
                     id: booking.id,
                     bus_ticket_id,
                     passenger_id: req.carrier.user_id,
+                    claimed_by_user_id: isAutoClaimed ? registeredPassenger.id : null,
+                    claim_status: isAutoClaimed ? 'claimed' : 'unclaimed',
                     passenger_name,
                     phone: cleanPhone,
-                    contact_role: validContactRole,
+                    contact_role: effectiveContactRole,
                     created_by_user_id: req.carrier.user_id
                 };
-                const plan = buildNotificationPlan(fullBooking, { creator: req.carrier, trip: ticket });
+                const plan = buildNotificationPlan(fullBooking, {
+                    creator: req.carrier,
+                    trip: ticket,
+                    users: registeredPassenger ? [registeredPassenger] : []
+                });
                 enqueueAndDispatchNotifications(plan, { booking: fullBooking, trip: ticket, creator: req.carrier }).catch(err => {
                     console.error('[NotificationQueue] Async dispatch error:', err.message);
                 });

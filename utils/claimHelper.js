@@ -586,6 +586,44 @@ async function reviewClaimRequest(requestId, carrierId, decision, options = {}) 
     return { success: false, error: 'INVALID_DECISION' };
 }
 
+/**
+ * Server-side helper that safely resolves an existing registered Telegram passenger
+ * by matching the normalized booking phone against users table.
+ *
+ * Requirements:
+ * 1. Exactly 1 user record matched.
+ * 2. User has a valid telegram_id linked.
+ * 3. Ambiguous matches (>1) or 0 matches return null.
+ *
+ * @param {string} phone - Normalized or raw booking phone
+ * @param {Object} [options={}] - Options { supabaseClient }
+ * @returns {Promise<Object|null>} Resolved user object or null
+ */
+async function resolveRegisteredPassenger(phone, options = {}) {
+    const cleanPhone = cleanPhoneForStorage(phone);
+    if (!cleanPhone || cleanPhone.length < 8) {
+        return null;
+    }
+
+    const dbClient = getClaimDb(options);
+    const { data: users, error } = await dbClient
+        .from('users')
+        .select('*')
+        .eq('phone', cleanPhone)
+        .not('telegram_id', 'is', null);
+
+    if (error || !users || users.length === 0) {
+        return null;
+    }
+
+    if (users.length > 1) {
+        console.warn('[ClaimHelper] AMBIGUOUS_REGISTERED_PASSENGER: multiple users found for phone');
+        return null;
+    }
+
+    return users[0];
+}
+
 module.exports = {
     CLAIM_SESSION_TTL_MS,
     hashSessionToken,
@@ -593,6 +631,7 @@ module.exports = {
     resolveClaimSession,
     evaluateAutoClaimEligibility,
     executeAtomicClaim,
+    resolveRegisteredPassenger,
     createClaimRequest,
     reviewClaimRequest,
     tripBelongsToCarrier

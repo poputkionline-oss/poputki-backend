@@ -72,12 +72,21 @@ function isDeliveryEnabled() {
  * @param {string} recipientType
  * @returns {boolean}
  */
-function isRecipientTypeAllowed(recipientType) {
+function isRecipientTypeAllowed(recipientType, intent = {}) {
+    const rType = String(recipientType || '').toLowerCase();
+    
+    // Phase E.7 Rule: Direct Telegram passenger ticket delivery is allowed ONLY for registered, verified, safely resolved Telegram passengers
+    if (rType === 'passenger') {
+        if (intent.reason === 'VERIFIED_TELEGRAM_PASSENGER' || intent.isRegisteredPassenger || intent.isClaimed) {
+            return true;
+        }
+    }
+
     const configured = process.env.TELEGRAM_NOTIFICATION_ALLOWED_RECIPIENT_TYPES;
     const allowedList = configured
         ? configured.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
         : DEFAULT_ALLOWED_RECIPIENT_TYPES;
-    return allowedList.includes(String(recipientType || '').toLowerCase());
+    return allowedList.includes(rType);
 }
 
 /**
@@ -140,8 +149,8 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                 continue;
             }
 
-            // Phase C.2 Recipient Role Gate (creator, coordinator, family_or_group allowed; passenger blocked)
-            if (!isRecipientTypeAllowed(intent.recipientType)) {
+            // Phase C.2 / E.7 Recipient Role Gate
+            if (!isRecipientTypeAllowed(intent.recipientType, intent)) {
                 results.push({
                     channel: 'telegram',
                     recipientType: intent.recipientType,
