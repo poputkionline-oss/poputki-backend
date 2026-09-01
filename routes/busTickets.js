@@ -464,6 +464,7 @@ router.get('/verify/:token', async (req, res) => {
                 id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
                 boarding_status, boarded_at,
                 commission_rate, commission_amount, carrier_amount,
+                claim_status, claimed_by_user_id, channel, source_type, contact_role,
                 users:passenger_id (name)
             `)
             .eq('id', bookingId)
