@@ -165,7 +165,39 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
         return { canAutoClaim: false, reason: 'USER_NOT_REGISTERED' };
     }
 
-    if (!telegramContact.user_id || !telegramSenderId
+    // STRICT FORGED CONTACT GUARD:
+    // If a contact card object is provided with a user_id that differs from telegramSenderId, reject immediately.
+    if (telegramContact && telegramContact.user_id && telegramSenderId
+        && String(telegramContact.user_id) !== String(telegramSenderId)) {
+        return { canAutoClaim: false, reason: 'TELEGRAM_CONTACT_USER_ID_MISMATCH' };
+    }
+
+    const bookingPhone = cleanPhoneForStorage(booking.phone);
+
+    // SAFE KNOWN-USER AUTO-CLAIM PATH:
+    // If the Telegram sender is an existing platform user (verifiedUser.telegram_id === telegramSenderId)
+    // AND the user has a verified phone that matches the booking phone 100%,
+    // allow auto-claim for passenger & unknown contact roles WITHOUT requiring Telegram contact button re-share!
+    if (telegramSenderId && verifiedUser.telegram_id != null && String(verifiedUser.telegram_id) === String(telegramSenderId)) {
+        const userPhone = cleanPhoneForStorage(verifiedUser.phone);
+
+        if (booking.contact_role === 'family_or_group') {
+            return { canAutoClaim: false, reason: 'FAMILY_GROUP_CONTACT_REQUIRES_APPROVAL' };
+        }
+
+        if (booking.contact_role === 'coordinator') {
+            return { canAutoClaim: false, reason: 'COORDINATOR_CONTACT_REQUIRES_APPROVAL' };
+        }
+
+        if (userPhone && bookingPhone && userPhone === bookingPhone) {
+            if (booking.contact_role === 'passenger' || booking.contact_role === 'unknown') {
+                return { canAutoClaim: true, method: 'known_user_phone_match' };
+            }
+        }
+    }
+
+    // FALLBACK: Native Telegram Contact Verification Path
+    if (!telegramContact || !telegramContact.user_id || !telegramSenderId
         || String(telegramContact.user_id) !== String(telegramSenderId)) {
         return { canAutoClaim: false, reason: 'TELEGRAM_CONTACT_USER_ID_MISMATCH' };
     }
@@ -180,7 +212,6 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
     }
 
     const sharedPhone = cleanPhoneForStorage(telegramContact.phone_number);
-    const bookingPhone = cleanPhoneForStorage(booking.phone);
 
     if (booking.contact_role !== 'passenger') {
         return {

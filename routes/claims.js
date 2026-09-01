@@ -310,7 +310,7 @@ router.post('/preview-trip', claimRateLimiter(20, 60000), async (req, res) => {
  */
 router.post('/bot/open', claimRateLimiter(20, 60000), requireClaimBotSecret, async (req, res) => {
     try {
-        const { sessionToken } = req.body;
+        const { sessionToken, telegramUser } = req.body;
         if (!sessionToken) {
             return res.status(400).json({ error: 'Токен сессии обязателен', code: 'SESSION_TOKEN_REQUIRED' });
         }
@@ -322,6 +322,41 @@ router.post('/bot/open', claimRateLimiter(20, 60000), requireClaimBotSecret, asy
 
         const booking = sessionResult.booking;
         const claimDb = getServiceRoleClient();
+
+        let isAlreadyOwned = false;
+        let isAutoClaimed = false;
+
+        // SAFE KNOWN-USER AUTO-CLAIM SHORTCUT:
+        // If the bot passes telegramUser, check if the sender is an existing verified user whose phone matches booking.phone
+        if (telegramUser?.id) {
+            const telegramSenderId = telegramUser.id;
+            const { data: existingUser } = await claimDb
+                .from('users')
+                .select('*')
+                .eq('telegram_id', telegramSenderId)
+                .maybeSingle();
+
+            if (existingUser) {
+                if (booking.claim_status === 'claimed' || booking.claimed_by_user_id) {
+                    if (String(booking.claimed_by_user_id) === String(existingUser.id)) {
+                        isAlreadyOwned = true;
+                    }
+                } else {
+                    const evalRes = evaluateAutoClaimEligibility(booking, existingUser, {}, telegramSenderId);
+                    if (evalRes.canAutoClaim) {
+                        const claimRes = await executeAtomicClaim(booking.id, existingUser.id, {
+                            sessionId: sessionResult.session.id
+                        });
+                        if (claimRes.success) {
+                            isAutoClaimed = true;
+                            booking.claim_status = 'claimed';
+                            booking.claimed_by_user_id = existingUser.id;
+                        }
+                    }
+                }
+            }
+        }
+
         const { data: trip } = await claimDb
             .from('bus_tickets')
             .select('from_city, to_city, departure_date, departure_time, transport_company')
@@ -332,6 +367,10 @@ router.post('/bot/open', claimRateLimiter(20, 60000), requireClaimBotSecret, asy
             success: true,
             sessionId: sessionResult.session.id,
             expiresAt: sessionResult.session.expires_at,
+            status: booking.claim_status || 'unclaimed',
+            isAutoClaimed,
+            isAlreadyOwned,
+            requiresContact: !isAlreadyOwned && !isAutoClaimed && booking.claim_status !== 'claimed',
             trip: {
                 fromCity: trip?.from_city || booking.pickup_city,
                 toCity: trip?.to_city || booking.drop_off_city,
@@ -350,20 +389,16 @@ router.post('/bot/open', claimRateLimiter(20, 60000), requireClaimBotSecret, asy
 
 /**
  * POST /api/claims/bot/verify-and-claim
- * Bot-only endpoint. Accepts only a native Telegram contact where contact.user_id
- * equals message.from.id. Resolves/creates the platform passenger server-side.
+ * Bot-only endpoint. Accepts native Telegram contact or known verified user identity.
+ * Resolves/creates the platform passenger server-side and executes atomic claim.
  */
 router.post('/bot/verify-and-claim', claimRateLimiter(10, 60000), requireClaimBotSecret, async (req, res) => {
     try {
         const { sessionId, telegramUser, telegramContact } = req.body;
         const telegramSenderId = telegramUser?.id;
 
-        if (!sessionId || !telegramSenderId || !telegramContact) {
+        if (!sessionId || !telegramSenderId) {
             return res.status(400).json({ error: 'Недостаточно данных Telegram', code: 'TELEGRAM_DATA_REQUIRED' });
-        }
-
-        if (!telegramContact.user_id || String(telegramContact.user_id) !== String(telegramSenderId)) {
-            return res.status(400).json({ error: 'Номер должен быть отправлен кнопкой Telegram', code: 'TELEGRAM_CONTACT_USER_ID_MISMATCH' });
         }
 
         const claimDb = getServiceRoleClient();
@@ -372,18 +407,37 @@ router.post('/bot/verify-and-claim', claimRateLimiter(10, 60000), requireClaimBo
             return res.status(400).json({ error: sessionResult.error, code: sessionResult.error });
         }
 
-        const identityResult = await resolveOrCreateTelegramPassenger(claimDb, telegramUser, telegramContact);
-        if (!identityResult.success) {
-            const status = identityResult.error === 'PHONE_ALREADY_LINKED_TO_ANOTHER_TELEGRAM' ? 409 : 400;
-            return res.status(status).json({ error: identityResult.error, code: identityResult.error });
+        const booking = sessionResult.booking;
+
+        let platformUser = null;
+        if (telegramUser?.id) {
+            const { data: existingUser } = await claimDb
+                .from('users')
+                .select('*')
+                .eq('telegram_id', telegramUser.id)
+                .maybeSingle();
+
+            if (existingUser) {
+                platformUser = existingUser;
+            }
         }
 
-        const booking = sessionResult.booking;
-        const platformUser = identityResult.user;
+        if (!platformUser) {
+            if (!telegramContact || !telegramContact.user_id || String(telegramContact.user_id) !== String(telegramSenderId)) {
+                return res.status(400).json({ error: 'Номер должен быть отправлен кнопкой Telegram', code: 'TELEGRAM_CONTACT_USER_ID_MISMATCH' });
+            }
+            const identityResult = await resolveOrCreateTelegramPassenger(claimDb, telegramUser, telegramContact);
+            if (!identityResult.success) {
+                const status = identityResult.error === 'PHONE_ALREADY_LINKED_TO_ANOTHER_TELEGRAM' ? 409 : 400;
+                return res.status(status).json({ error: identityResult.error, code: identityResult.error });
+            }
+            platformUser = identityResult.user;
+        }
+
         const evaluation = evaluateAutoClaimEligibility(
             booking,
             platformUser,
-            telegramContact,
+            telegramContact || {},
             telegramSenderId
         );
 
