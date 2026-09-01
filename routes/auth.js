@@ -7,17 +7,36 @@ const { verifyAndMigrateDurable, hashPassword } = require('../utils/passwordSecu
 const { resolveCarrierRole } = require('../utils/carrierAuth');
 
 
-// Professional Telegram initData verification
-// Use environment variable for bot token
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// Professional Telegram initData verification & server-side user extraction
+function verifyAndParseTelegramInitData(initData) {
+    if (!initData || typeof initData !== 'string') {
+        return { valid: false, code: 'TELEGRAM_INIT_DATA_INVALID', error: 'Missing initData' };
+    }
 
-function verifyTelegramData(initData) {
-    if (!initData) return false;
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    if (!botToken) {
+        console.error('[Auth/Telegram] TELEGRAM_BOT_TOKEN is not configured');
+        return { valid: false, code: 'TELEGRAM_BOT_TOKEN_MISSING', error: 'TELEGRAM_BOT_TOKEN is not configured' };
+    }
 
     try {
         const urlParams = new URLSearchParams(initData);
         const hash = urlParams.get('hash');
+        if (!hash) {
+            return { valid: false, code: 'TELEGRAM_INIT_DATA_INVALID', error: 'Missing hash in initData' };
+        }
         urlParams.delete('hash');
+
+        const authDateStr = urlParams.get('auth_date');
+        if (!authDateStr) {
+            return { valid: false, code: 'TELEGRAM_INIT_DATA_INVALID', error: 'Missing auth_date in initData' };
+        }
+
+        const authDate = parseInt(authDateStr, 10);
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (isNaN(authDate) || (nowSec - authDate) > 86400) {
+            return { valid: false, code: 'TELEGRAM_INIT_DATA_EXPIRED', error: 'Expired initData' };
+        }
 
         const sortedKeys = Array.from(urlParams.keys()).sort();
         const dataCheckString = sortedKeys
@@ -26,7 +45,7 @@ function verifyTelegramData(initData) {
 
         const secretKey = crypto
             .createHmac('sha256', 'WebAppData')
-            .update(BOT_TOKEN)
+            .update(botToken)
             .digest();
 
         const generatedHash = crypto
@@ -34,11 +53,33 @@ function verifyTelegramData(initData) {
             .update(dataCheckString)
             .digest('hex');
 
-        return generatedHash === hash;
+        const a = Buffer.from(generatedHash);
+        const b = Buffer.from(hash);
+        const isValid = a.length === b.length && crypto.timingSafeEqual(a, b);
+
+        if (!isValid) {
+            return { valid: false, code: 'TELEGRAM_INIT_DATA_INVALID', error: 'Signature mismatch' };
+        }
+
+        const userJson = urlParams.get('user');
+        if (!userJson) {
+            return { valid: false, code: 'TELEGRAM_INIT_DATA_INVALID', error: 'Missing user in initData' };
+        }
+
+        const tgUser = JSON.parse(userJson);
+        if (!tgUser || !tgUser.id) {
+            return { valid: false, code: 'TELEGRAM_INIT_DATA_INVALID', error: 'Invalid user in initData' };
+        }
+
+        return { valid: true, tgUser };
     } catch (e) {
-        console.error('Telegram sync verification error:', e);
-        return false;
+        console.error('[Auth/Telegram] Verification error:', e.message);
+        return { valid: false, code: 'TELEGRAM_INIT_DATA_INVALID', error: e.message };
     }
+}
+
+function verifyTelegramData(initData) {
+    return verifyAndParseTelegramInitData(initData).valid;
 }
 
 /**
@@ -611,13 +652,146 @@ router.post('/telegram-login', async (req, res) => {
             }
         }
 
-        // Set isNew flag if they haven't provided enough info yet (name, age, phone)
-        user.isNew = !user.phone || !user.age || !user.name || user.age <= 0;
+        // Set isNew flag if name is missing (age is optional)
+        user.isNew = !user.name;
 
         console.log('[Auth/Telegram] Login successful for user:', user.id);
         res.json({ user, token: 'mock-token-' + user.id });
     } catch (err) {
         console.error("[Auth/Telegram] Login error:", err);
+        res.status(500).json({ error: 'Ошибка Telegram входа: ' + err.message });
+    }
+});
+
+/**
+ * @swagger
+ * /api/auth/telegram-miniapp:
+ *   post:
+ *     summary: Seamless login for Telegram Mini App using initData
+ *     tags: [Auth]
+ */
+router.post('/telegram-miniapp', async (req, res) => {
+    const { initData, userId } = req.body;
+
+    const verification = verifyAndParseTelegramInitData(initData);
+    if (!verification.valid) {
+        return res.status(403).json({
+            error: verification.error,
+            code: verification.code
+        });
+    }
+
+    const tgUser = verification.tgUser;
+    const telegramId = tgUser.id;
+    const firstName = tgUser.first_name || '';
+    const lastName = tgUser.last_name || '';
+    const username = tgUser.username || null;
+    const photoUrl = tgUser.photo_url || null;
+    const fullName = [firstName, lastName].filter(Boolean).join(' ') || 'Пассажир';
+
+    try {
+        let user;
+
+        // Step 1: Look up existing user by telegram_id
+        const { data: existingTgUser, error: findErr } = await supabase
+            .from('users')
+            .select('*')
+            .eq('telegram_id', telegramId)
+            .maybeSingle();
+
+        if (findErr) throw findErr;
+
+        if (existingTgUser) {
+            // Update profile fields if empty or updated
+            const updatePayload = {};
+            if (username && existingTgUser.username !== username) updatePayload.username = username;
+            if (photoUrl && existingTgUser.photo_url !== photoUrl) updatePayload.photo_url = photoUrl;
+            if (!existingTgUser.name) updatePayload.name = fullName;
+
+            if (Object.keys(updatePayload).length > 0) {
+                const { data: updated } = await supabase
+                    .from('users')
+                    .update(updatePayload)
+                    .eq('id', existingTgUser.id)
+                    .select('*')
+                    .single();
+                user = updated || existingTgUser;
+            } else {
+                user = existingTgUser;
+            }
+        } else if (userId) {
+            // Explicit link request to logged-in user
+            const { data: existingUser } = await supabase
+                .from('users')
+                .select('*')
+                .eq('id', userId)
+                .maybeSingle();
+
+            if (existingUser) {
+                const { data: updated } = await supabase
+                    .from('users')
+                    .update({
+                        telegram_id: telegramId,
+                        username: username || existingUser.username,
+                        photo_url: photoUrl || existingUser.photo_url,
+                        name: existingUser.name || fullName
+                    })
+                    .eq('id', existingUser.id)
+                    .select('*')
+                    .single();
+                user = updated || existingUser;
+            }
+        }
+
+        // Step 2: Create new user if still not resolved
+        if (!user) {
+            const { data: newUser, error: createErr } = await supabase
+                .from('users')
+                .insert([{
+                    telegram_id: telegramId,
+                    username,
+                    name: fullName,
+                    photo_url: photoUrl,
+                    role: 'passenger'
+                }])
+                .select('*')
+                .single();
+
+            if (createErr) throw createErr;
+            user = newUser;
+        }
+
+        const jwtSecret = process.env.JWT_SECRET;
+        let token = 'mock-token-' + user.id;
+        if (jwtSecret) {
+            token = jwt.sign(
+                {
+                    sub: String(user.id),
+                    role: user.role || 'passenger',
+                    phone: user.phone || null
+                },
+                jwtSecret,
+                {
+                    algorithm: 'HS256',
+                    expiresIn: '30d',
+                    issuer: 'poputki.online',
+                    audience: 'poputki-passenger'
+                }
+            );
+        }
+
+        const sanitizedUser = { ...user };
+        delete sanitizedUser.password;
+        sanitizedUser.isNew = !sanitizedUser.name;
+
+        console.log('[Auth/Telegram-MiniApp] Login successful for user:', user.id);
+        res.json({
+            success: true,
+            user: sanitizedUser,
+            token
+        });
+    } catch (err) {
+        console.error('[Auth/Telegram-MiniApp] Login error:', err);
         res.status(500).json({ error: 'Ошибка Telegram входа: ' + err.message });
     }
 });

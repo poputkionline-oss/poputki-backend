@@ -253,11 +253,17 @@ router.get('/:id/bus-bookings', async (req, res) => {
 
         if (error) throw error;
 
-        // Security filter: prevent carrier surrogate passenger_id on manual bookings from leaking into dispatcher's passenger tab
+        // Security & Ownership filter:
+        // 1. If claimed_by_user_id is set, it is authoritative (matches current user ID).
+        // 2. If claimed_by_user_id is NOT set and booking is manual/carrier_contact, filter out (unclaimed manual booking must not leak).
+        // 3. Otherwise (online non-manual booking), fallback to passenger_id matching user ID.
         const userPassengerBookings = (bookings || []).filter(b => {
-            const isManual = b.channel === 'manual' || b.source_type === 'manual';
+            if (b.claimed_by_user_id) {
+                return String(b.claimed_by_user_id) === String(req.params.id);
+            }
+            const isManual = b.channel === 'manual' || b.source_type === 'manual' || b.contact_role === 'carrier_contact';
             if (isManual) {
-                return b.claimed_by_user_id && String(b.claimed_by_user_id) === String(req.params.id);
+                return false;
             }
             return String(b.passenger_id) === String(req.params.id);
         });
