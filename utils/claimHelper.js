@@ -189,8 +189,12 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
             return { canAutoClaim: false, reason: 'COORDINATOR_CONTACT_REQUIRES_APPROVAL' };
         }
 
+        if (booking.contact_role === 'unknown') {
+            return { canAutoClaim: false, reason: 'UNKNOWN_ROLE_REQUIRES_APPROVAL' };
+        }
+
         if (userPhone && bookingPhone && userPhone === bookingPhone) {
-            if (booking.contact_role === 'passenger' || booking.contact_role === 'unknown') {
+            if (booking.contact_role === 'passenger') {
                 return { canAutoClaim: true, method: 'known_user_phone_match' };
             }
         }

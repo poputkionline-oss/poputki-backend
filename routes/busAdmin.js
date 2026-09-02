@@ -735,17 +735,13 @@ router.post('/bookings/manual', async (req, res) => {
 
     const { resolveRegisteredPassenger, executeAtomicClaim } = require('../utils/claimHelper');
 
-    // Phase E.7 Server-Side Registered Passenger Auto-Resolution:
-    // Explicit carrier roles 'family_or_group' and 'coordinator' take precedence.
-    // For default/unspecified or 'passenger' or 'unknown' roles, check if the phone belongs to a single registered Telegram passenger.
+    // Phase E.38.1 Hardening: Only explicit 'passenger' role enters automatic registered passenger resolution.
+    // For 'unknown', 'family_or_group', and 'coordinator', never auto-promote role and never auto-claim.
     let registeredPassenger = null;
     let effectiveContactRole = validContactRole;
 
-    if (validContactRole !== 'family_or_group' && validContactRole !== 'coordinator') {
+    if (validContactRole === 'passenger') {
         registeredPassenger = await resolveRegisteredPassenger(cleanPhone);
-        if (registeredPassenger) {
-            effectiveContactRole = 'passenger';
-        }
     }
 
     // Strict ownership verification

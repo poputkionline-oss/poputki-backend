@@ -88,7 +88,7 @@ describe('Phase E.6 — Known Telegram User Safe Auto-Claim Tests', () => {
         assert.strictEqual(res.method, 'known_user_phone_match');
     });
 
-    it('[E6-B] Known Telegram user + verified matching phone + unknown role -> AUTO-CLAIM', () => {
+    it('[E6-B] Known Telegram user + verified matching phone + unknown role -> NO AUTO-CLAIM (E.38.1 hardening)', () => {
         const res = evaluateAutoClaimEligibility(
             matchingBookingUnknown,
             verifiedUser,
@@ -96,8 +96,8 @@ describe('Phase E.6 — Known Telegram User Safe Auto-Claim Tests', () => {
             '99887766'
         );
 
-        assert.strictEqual(res.canAutoClaim, true);
-        assert.strictEqual(res.method, 'known_user_phone_match');
+        assert.strictEqual(res.canAutoClaim, false);
+        assert.strictEqual(res.reason, 'UNKNOWN_ROLE_REQUIRES_APPROVAL');
     });
 
     it('[E6-C] Known Telegram user + mismatched phone -> NO AUTO-CLAIM', () => {
