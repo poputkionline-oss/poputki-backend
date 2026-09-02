@@ -290,6 +290,7 @@ router.get('/bookings', async (req, res) => {
                 boarding_status, boarded_at, boarded_by_user_id,
                 channel, source_type, source_id, created_by_user_id,
                 commission_rate, commission_amount, carrier_amount,
+                claim_status, claimed_by_user_id, contact_role,
                 users:passenger_id (name, phone)
             `)
             .in('bus_ticket_id', ticketIds);
@@ -343,6 +344,9 @@ router.get('/bookings', async (req, res) => {
                 channel: channel,
                 source_type: sourceType,
                 source_id: b.source_id || null,
+                claim_status: b.claim_status || 'unclaimed',
+                claimed_by_user_id: b.claimed_by_user_id || null,
+                contact_role: b.contact_role || 'passenger',
                 // Security Projection: Drivers do NOT see financial data
                 commission_rate: isDriver ? null : commRate,
                 commission_amount: isDriver ? null : commAmount,
