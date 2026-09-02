@@ -26,9 +26,12 @@ const {
 } = require('../utils/busHelper');
 const {
     buildPassengerTicketProjection,
-    buildTripPrintManifest
+    buildTripPrintManifest,
+    verifyTicketToken,
+    extractBookingIdFromToken
 } = require('../utils/ticketHelper');
 const { isValidPhone, cleanPhoneForStorage } = require('../utils/phoneHelper');
+const { completeTrip } = require('../utils/tripCompletionHelper');
 
 
 
@@ -1334,6 +1337,276 @@ router.patch('/bookings/:id/boarding', async (req, res) => {
     } catch (err) {
         console.error('[BusAdmin Boarding] Fatal error:', err);
         res.status(500).json({ error: err.message || 'Ошибка обновления статуса посадки' });
+    }
+});
+
+/**
+ * Builds a minimal, PII-safe display projection of a boarded passenger for
+ * the QR scanner response (seat + name only — no phone, no documents, no
+ * Telegram IDs).
+ */
+function buildScanDisplayName(booking) {
+    if (booking.passenger_name && String(booking.passenger_name).trim()) {
+        return String(booking.passenger_name).trim();
+    }
+    try {
+        const pData = typeof booking.passengers_data === 'string'
+            ? JSON.parse(booking.passengers_data || '[]')
+            : (booking.passengers_data || []);
+        if (Array.isArray(pData) && pData[0]) {
+            const p0 = pData[0];
+            const name = [p0.lastName, p0.firstName, p0.middleName].filter(Boolean).join(' ').trim();
+            if (name) return name;
+        }
+    } catch (e) { /* fall through to default */ }
+    return 'Пассажир';
+}
+
+function buildScanSeats(booking) {
+    try {
+        const seats = typeof booking.seat_numbers === 'string'
+            ? JSON.parse(booking.seat_numbers || '[]')
+            : (booking.seat_numbers || []);
+        return Array.isArray(seats) ? seats : (seats ? [seats] : []);
+    } catch (e) {
+        return [];
+    }
+}
+
+/**
+ * @swagger
+ * /api/bus-admin/bookings/scan-boarding:
+ *   post:
+ *     summary: Board a passenger by scanning their existing Ticket V1.1 QR code
+ *     tags: [Bus Admin]
+ */
+router.post('/bookings/scan-boarding', async (req, res) => {
+    // Security Gate: Accountants cannot mutate boarding
+    if (req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для отметки посадки', code: 'FORBIDDEN' });
+    }
+
+    const { ticketToken, tripId } = req.body || {};
+
+    if (!ticketToken || typeof ticketToken !== 'string') {
+        return res.status(400).json({ error: 'Отсутствует QR-токен билета', code: 'INVALID_TICKET' });
+    }
+    const numericTripId = parseInt(tripId, 10);
+    if (!numericTripId) {
+        return res.status(400).json({ error: 'Не выбран рейс для посадки', code: 'INVALID_TRIP' });
+    }
+
+    try {
+        // 1. Extract booking id from the token's structural shape (no trust yet)
+        const bookingId = extractBookingIdFromToken(ticketToken);
+        if (!bookingId) {
+            return res.status(404).json({ error: 'Недействительный билет', code: 'INVALID_TICKET' });
+        }
+
+        // 2. Fetch booking (safe columns only)
+        const { data: booking, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, bus_ticket_id, status, boarding_status, boarded_at, passenger_name, passengers_data, seat_numbers')
+            .eq('id', bookingId)
+            .maybeSingle();
+
+        if (bErr || !booking) {
+            return res.status(404).json({ error: 'Недействительный билет', code: 'INVALID_TICKET' });
+        }
+
+        // 3. Server-side HMAC verification — the SOLE source of cryptographic truth.
+        //    Frontend never re-implements or trusts a client-supplied booking id.
+        if (!verifyTicketToken(ticketToken, booking.id)) {
+            return res.status(404).json({ error: 'Недействительный билет', code: 'INVALID_TICKET' });
+        }
+
+        // 4. Resolve the trip the booking actually belongs to, and enforce
+        //    tenant isolation (cross-carrier tickets are BLOCKED without
+        //    revealing that the booking exists at all).
+        const { data: trip, error: tErr } = await supabase
+            .from('bus_tickets')
+            .select('id, operator_id, status, from_city, to_city')
+            .eq('id', booking.bus_ticket_id)
+            .maybeSingle();
+
+        if (tErr || !trip) {
+            return res.status(404).json({ error: 'Недействительный билет', code: 'INVALID_TICKET' });
+        }
+
+        if (trip.operator_id !== req.carrier.carrier_id) {
+            return res.status(404).json({ error: 'Недействительный билет', code: 'INVALID_TICKET' });
+        }
+
+        // Driver role: must be specifically assigned to this trip (same rule
+        // as every other operational boarding action).
+        if (req.carrier.role === 'driver') {
+            const assigned = Array.isArray(req.carrier.assignedTicketIds) ? req.carrier.assignedTicketIds : [];
+            const isAssigned = assigned.some(id => String(id) === String(trip.id));
+            if (!isAssigned) {
+                return res.status(404).json({ error: 'Недействительный билет', code: 'INVALID_TICKET' });
+            }
+        }
+
+        // 5. Same carrier, but scanning the WRONG trip: the booking is real
+        //    and belongs to this carrier, just not to the trip currently
+        //    selected in the scanner. Explicitly surfaced (not silently
+        //    treated as invalid) so the carrier can find the right trip.
+        if (trip.id !== numericTripId) {
+            return res.status(409).json({ error: 'Билет относится к другому рейсу', code: 'WRONG_TRIP' });
+        }
+
+        // 6. Trip must still be open for boarding.
+        if (trip.status === 'completed') {
+            return res.status(400).json({ error: 'Рейс уже завершён, посадка недоступна', code: 'TRIP_COMPLETED' });
+        }
+        if (trip.status !== 'active') {
+            return res.status(400).json({ error: 'Рейс недоступен для посадки', code: 'TRIP_NOT_ACTIVE' });
+        }
+
+        // 7. Booking / payment safety.
+        if (booking.status === 'pending_payment') {
+            return res.status(400).json({ error: 'Бронирование ожидает оплаты, посадка недоступна', code: 'PENDING_PAYMENT' });
+        }
+        if (booking.status !== 'confirmed') {
+            return res.status(400).json({ error: 'Бронирование недействительно для посадки', code: 'BOOKING_INVALID' });
+        }
+
+        const seats = buildScanSeats(booking);
+        const displayName = buildScanDisplayName(booking);
+
+        // 8. Idempotent duplicate-scan handling: already boarded -> no mutation.
+        if (booking.boarding_status === 'boarded') {
+            return res.json({
+                success: true,
+                already_boarded: true,
+                trip_id: trip.id,
+                booking_id: booking.id,
+                boarding_status: 'boarded',
+                boarded_at: booking.boarded_at,
+                passenger: { seats, displayName }
+            });
+        }
+
+        // 9. Conditional atomic update: only flips a still-confirmed,
+        //    not-yet-boarded booking. A concurrent duplicate scan (same QR
+        //    visible across several camera frames, or two devices at once)
+        //    that loses the race affects 0 rows and is treated as idempotent
+        //    below instead of double-mutating or erroring.
+        const now = new Date().toISOString();
+        const { data: updatedRows, error: uErr } = await supabase
+            .from('bus_ticket_bookings')
+            .update({
+                boarding_status: 'boarded',
+                boarded_at: now,
+                boarded_by_user_id: req.carrier.user_id
+            })
+            .eq('id', booking.id)
+            .eq('status', 'confirmed')
+            .neq('boarding_status', 'boarded')
+            .select('id, boarding_status, boarded_at')
+            .single();
+
+        if (uErr || !updatedRows) {
+            // Lost the race to a concurrent scan/mutation: converge to idempotent response.
+            const { data: refetched } = await supabase
+                .from('bus_ticket_bookings')
+                .select('boarding_status, boarded_at')
+                .eq('id', booking.id)
+                .maybeSingle();
+
+            return res.json({
+                success: true,
+                already_boarded: true,
+                trip_id: trip.id,
+                booking_id: booking.id,
+                boarding_status: refetched?.boarding_status || 'boarded',
+                boarded_at: refetched?.boarded_at || now,
+                passenger: { seats, displayName }
+            });
+        }
+
+        // 10. Audit trail (same dual-write pattern as manual boarding update).
+        try {
+            await supabase
+                .from('booking_audit_logs')
+                .insert([{
+                    booking_id: booking.id,
+                    action: 'boarding_status_update',
+                    old_status: booking.boarding_status || 'pending_boarding',
+                    new_status: 'boarded',
+                    performed_by_user_id: req.carrier.user_id,
+                    details: {
+                        previous_boarding_status: booking.boarding_status || 'pending_boarding',
+                        new_boarding_status: 'boarded',
+                        boarded_at: now,
+                        carrier_id: req.carrier.carrier_id,
+                        carrier_role: req.carrier.role,
+                        method: 'qr_scan'
+                    }
+                }]);
+        } catch (auditErr) {
+            console.error('[BusAdmin ScanBoarding] Legacy audit log insertion error (non-fatal):', auditErr);
+        }
+
+        await logCarrierActivity({
+            supabase,
+            carrierContext: req.carrier,
+            action: AUDIT_ACTIONS.BOARDING_STATUS_CHANGED,
+            entityType: AUDIT_ENTITY_TYPES.BOOKING,
+            entityId: booking.id,
+            entityLabel: `Бронь #${booking.id} (Места: ${seats.join(', ')})`,
+            oldData: { boarding_status: booking.boarding_status || 'pending_boarding' },
+            newData: { boarding_status: 'boarded' },
+            metadata: { reason: 'qr_scan' }
+        });
+
+        return res.json({
+            success: true,
+            already_boarded: false,
+            trip_id: trip.id,
+            booking_id: booking.id,
+            boarding_status: updatedRows.boarding_status,
+            boarded_at: updatedRows.boarded_at,
+            passenger: { seats, displayName }
+        });
+    } catch (err) {
+        console.error('[BusAdmin ScanBoarding] Fatal error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка обработки QR-сканирования' });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/tickets/{id}/complete:
+ *   post:
+ *     summary: Complete a trip via the canonical completion service (pending -> no_show, then status -> completed)
+ *     tags: [Bus Admin]
+ */
+router.post('/tickets/:id/complete', async (req, res) => {
+    // Security Gate: same role gate as other ticket-level mutations (edit/delete)
+    if (req.carrier.role === 'driver' || req.carrier.role === 'accountant') {
+        return res.status(403).json({ error: 'Недостаточно прав для завершения рейса' });
+    }
+
+    const { id } = req.params;
+
+    const hasAccess = await verifyTicketAccess(req.carrier, id);
+    if (!hasAccess) {
+        return res.status(403).json({ error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+    }
+
+    try {
+        const result = await completeTrip(supabase, { tripId: id, actorContext: req.carrier });
+
+        if (!result.success) {
+            const status = result.error === 'TRIP_NOT_FOUND' ? 404 : 400;
+            return res.status(status).json({ error: result.error, details: result.details });
+        }
+
+        res.json(result);
+    } catch (err) {
+        console.error('[BusAdmin CompleteTrip] Fatal error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка завершения рейса' });
     }
 });
 

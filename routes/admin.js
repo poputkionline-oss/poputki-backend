@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../db');
 const { hashPassword } = require('../utils/passwordSecurity');
 const { expirePendingPaymentBookings } = require('../utils/paymentExpirationHelper');
+const { sweepAutoCompleteTrips } = require('../utils/tripCompletionHelper');
 
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE;
 const ADMIN_SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN;
@@ -935,6 +936,37 @@ router.post('/bookings/expire-pending', adminAuth, async (req, res) => {
     } catch (err) {
         console.error('[Admin Expire Pending] Error:', err);
         res.status(500).json({ error: err.message || 'Ошибка обработки просроченных бронирований' });
+    }
+});
+
+/**
+ * POST /api/admin/trips/auto-complete
+ *
+ * Phase E.47.1 — Periodic sweep (intended cadence: every 30-60 minutes via
+ * the same external Render cron mechanism already used for
+ * /api/admin/bookings/expire-pending). Completes every active trip whose
+ * arrival + 12h grace period has elapsed, using the canonical completeTrip()
+ * service (pending_boarding -> no_show, then trip -> completed).
+ *
+ * Idempotent and safe under overlapping/duplicate invocations: each trip's
+ * completion is independently conditional on its live DB status, so a
+ * second concurrent sweep run cannot double-apply effects.
+ *
+ * Supports ?dry_run=true to preview eligible trips without mutating state.
+ */
+router.post('/trips/auto-complete', adminAuth, async (req, res) => {
+    try {
+        const dryRun = req.query.dry_run === 'true' || req.body?.dry_run === true;
+        const result = await sweepAutoCompleteTrips(supabase, { dryRun });
+
+        res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            ...result
+        });
+    } catch (err) {
+        console.error('[Admin Auto-Complete Trips] Error:', err);
+        res.status(500).json({ error: err.message || 'Ошибка автоматического завершения рейсов' });
     }
 });
 

@@ -25,6 +25,7 @@ const AUDIT_ACTIONS = Object.freeze({
     TICKET_REVERSED: 'ticket_reversed',
     TICKET_DELETED: 'ticket_deleted',
     TRIP_BUS_REPLACED: 'trip_bus_replaced',
+    TRIP_COMPLETED: 'trip_completed',
 
     // Team / Member Actions
     MEMBER_ADDED: 'member_added',
@@ -75,7 +76,8 @@ const FORBIDDEN_KEY_PATTERNS = [
 
 // Whitelist of allowed metadata keys
 const ALLOWED_METADATA_KEYS = new Set([
-    'channel', 'source', 'reason', 'seats_count', 'duration_minutes'
+    'channel', 'source', 'reason', 'seats_count', 'duration_minutes',
+    'no_show_count', 'boarded_count'
 ]);
 
 /**
