@@ -179,11 +179,11 @@ router.get('/tickets', async (req, res) => {
             return res.json([]);
         }
 
-        // Fetch all relevant bookings to calculate accurate reserved seats (including active pending_payment)
+        // Fetch all relevant bookings to calculate accurate reserved seats and seat gender metadata (including active pending_payment)
         const ticketIds = filteredTickets.map(t => t.id);
         const { data: allBookings, error: bErr } = await supabase
             .from('bus_ticket_bookings')
-            .select('id, bus_ticket_id, seat_numbers, status, created_at, hold_expires_at')
+            .select('id, bus_ticket_id, seat_numbers, status, created_at, hold_expires_at, passengers_data')
             .in('bus_ticket_id', ticketIds)
             .neq('status', 'cancelled');
 
@@ -195,15 +195,29 @@ router.get('/tickets', async (req, res) => {
             // We count 'confirmed' and active 'pending_payment' as reserved to prevent double booking
             const ticketBookings = (allBookings || []).filter(b => b.bus_ticket_id === t.id);
             const actuallyReserved = [];
+            const seatGenders = {};
             
             ticketBookings.forEach(b => {
                 if (isSeatLockedByBooking(b)) {
                     try {
                         const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                        const pData = typeof b.passengers_data === 'string' ? JSON.parse(b.passengers_data || '[]') : (b.passengers_data || []);
                         if (Array.isArray(seats)) {
                             actuallyReserved.push(...seats);
+                            seats.forEach((seatNum, idx) => {
+                                const num = Number(seatNum);
+                                const g = pData[idx]?.gender;
+                                if (!isNaN(num) && (g === 'male' || g === 'female')) {
+                                    seatGenders[num] = g;
+                                }
+                            });
                         } else if (seats) {
                             actuallyReserved.push(seats);
+                            const num = Number(seats);
+                            const g = pData[0]?.gender;
+                            if (!isNaN(num) && (g === 'male' || g === 'female')) {
+                                seatGenders[num] = g;
+                            }
                         }
                     } catch (e) {
                         console.error(`[BusAdmin] Error parsing seat_numbers for booking ${b.id}:`, e);
@@ -216,6 +230,8 @@ router.get('/tickets', async (req, res) => {
             return {
                 ...t,
                 reserved_seats: [...new Set(actuallyReserved)], // Unique seats
+                seat_genders: seatGenders,
+                seatGenders: seatGenders,
                 intermediate_stops: (typeof t.intermediate_stops === 'string' ? JSON.parse(t.intermediate_stops || '[]') : (t.intermediate_stops || [])).map(s => ({
                     ...s,
                     time: s.time ? s.time.substring(0, 5) : s.time
