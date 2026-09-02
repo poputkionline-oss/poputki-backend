@@ -5,16 +5,37 @@
  * Single Source of Truth matching PassengerTicket.vue 1:1 via Puppeteer HTML screenshot.
  */
 
-const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
 const fs = require('fs');
 const path = require('path');
 const { renderTicketHtml } = require('./ticketHtmlRenderer');
 
+let puppeteerModule = null;
+let chromiumModule = null;
+
+async function loadPuppeteerModules() {
+    if (!puppeteerModule) {
+        const pMod = await import('puppeteer-core');
+        puppeteerModule = pMod.default || pMod;
+    }
+    if (!chromiumModule) {
+        const cMod = await import('@sparticuz/chromium');
+        chromiumModule = cMod.default || cMod;
+    }
+    return { puppeteer: puppeteerModule, chromium: chromiumModule };
+}
+
 /**
  * Resolves local or production Chromium / Chrome executable path safely.
  */
-async function getExecutablePath() {
+async function getExecutablePath(chromium) {
+    // Windows local development fallback
+    const winChrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+    const winEdge = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+    if (process.platform === 'win32') {
+        if (fs.existsSync(winChrome)) return winChrome;
+        if (fs.existsSync(winEdge)) return winEdge;
+    }
+
     try {
         if (typeof chromium.executablePath === 'function') {
             const p = await chromium.executablePath();
@@ -25,12 +46,6 @@ async function getExecutablePath() {
     } catch (e) {
         console.warn('[TicketImage] Chromium executable resolution notice:', e.message);
     }
-
-    // Windows local development fallback
-    const winChrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-    const winEdge = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
-    if (fs.existsSync(winChrome)) return winChrome;
-    if (fs.existsSync(winEdge)) return winEdge;
 
     // Linux production fallback
     const linuxChrome = '/usr/bin/chromium-browser';
@@ -50,8 +65,9 @@ async function generateTicketPng(projection) {
         throw new Error('TICKET_PROJECTION_REQUIRED');
     }
 
+    const { puppeteer, chromium } = await loadPuppeteerModules();
     const htmlContent = await renderTicketHtml(projection);
-    const execPath = await getExecutablePath();
+    const execPath = await getExecutablePath(chromium);
 
     let browser = null;
     try {
