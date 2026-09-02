@@ -891,24 +891,26 @@ router.post('/bookings/manual', async (req, res) => {
         // Phase E.38.2 Manual Booking Handoff for Unregistered Contacts
         let handoff = { required: false };
         if (!isAutoClaimed) {
+            let session = null;
             try {
                 const { generateClaimSession } = require('../utils/claimHelper');
-                const { generateTicketVerificationToken } = require('../utils/ticketHelper');
-                const session = await generateClaimSession(booking.id, { supabaseClient: supabase });
-                const verificationToken = generateTicketVerificationToken(booking.id);
-                const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
-
-                handoff = {
-                    required: true,
-                    contact_role: effectiveContactRole,
-                    booking_id: booking.id,
-                    claim_url: session.deepLink,
-                    ticket_url: ticketUrl,
-                    expires_at: session.expiresAt
-                };
+                session = await generateClaimSession(booking.id);
             } catch (handoffErr) {
                 console.error('[ManualBooking] Error generating claim session handoff:', handoffErr.message);
             }
+
+            const { generateTicketVerificationToken } = require('../utils/ticketHelper');
+            const verificationToken = generateTicketVerificationToken(booking.id);
+            const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
+
+            handoff = {
+                required: true,
+                contact_role: effectiveContactRole,
+                booking_id: booking.id,
+                claim_url: session?.deepLink || null,
+                ticket_url: ticketUrl,
+                expires_at: session?.expiresAt || null
+            };
         }
 
         res.json({
@@ -969,7 +971,7 @@ router.post('/bookings/:bookingId/claim-link', async (req, res) => {
         const { generateClaimSession } = require('../utils/claimHelper');
         const { generateTicketVerificationToken } = require('../utils/ticketHelper');
 
-        const session = await generateClaimSession(booking.id, { supabaseClient: supabase });
+        const session = await generateClaimSession(booking.id);
         const verificationToken = generateTicketVerificationToken(booking.id);
         const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
 
