@@ -187,9 +187,108 @@ async function sendPoll(chatId, question, optionsArray, options = {}) {
     }
 }
 
+/**
+ * Sends a PDF or document buffer to a Telegram chat.
+ * @param {string|number} chatId - Telegram chat ID
+ * @param {Buffer} documentBuffer - Document buffer
+ * @param {string} filename - Filename (e.g. POPUTKI-TICKET-POP-000439.pdf)
+ * @param {string} [caption] - Short caption text
+ * @param {object} [options] - Additional options
+ */
+async function sendDocument(chatId, documentBuffer, filename, caption = '', options = {}) {
+    if (!chatId || !documentBuffer) {
+        console.error('Telegram Bot Document: Missing chatId or documentBuffer');
+        return false;
+    }
+
+    try {
+        const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
+        
+        const headerLines = [
+            `--${boundary}`,
+            'Content-Disposition: form-data; name="chat_id"',
+            '',
+            String(chatId)
+        ];
+
+        if (caption) {
+            headerLines.push(
+                `--${boundary}`,
+                'Content-Disposition: form-data; name="caption"',
+                '',
+                String(caption),
+                `--${boundary}`,
+                'Content-Disposition: form-data; name="parse_mode"',
+                '',
+                'HTML'
+            );
+        }
+
+        headerLines.push(
+            `--${boundary}`,
+            `Content-Disposition: form-data; name="document"; filename="${filename || 'document.pdf'}"`,
+            'Content-Type: application/pdf',
+            '',
+            ''
+        );
+
+        const headerStr = headerLines.join('\r\n');
+        const footerStr = `\r\n--${boundary}--\r\n`;
+
+        const payload = Buffer.concat([
+            Buffer.from(headerStr, 'utf-8'),
+            documentBuffer,
+            Buffer.from(footerStr, 'utf-8')
+        ]);
+
+        const response = await axios.post(`${BOT_API_URL}/sendDocument`, payload, {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${boundary}`
+            }
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error(`Telegram Bot Document Error (chatId: ${chatId}):`, error.response?.data?.description || error.message);
+        return false;
+    }
+}
+
+/**
+ * Sends a personal document to a user based on internal user ID.
+ * @param {string|number} userId - The user's internal ID in Supabase users table.
+ * @param {Buffer} documentBuffer - Document buffer
+ * @param {string} filename - Filename
+ * @param {string} [caption] - Short caption
+ * @param {object} [options]
+ */
+async function sendPersonalDocument(userId, documentBuffer, filename, caption = '', options = {}) {
+    if (!userId || !documentBuffer) return false;
+
+    try {
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('telegram_id')
+            .eq('id', userId)
+            .single();
+
+        if (error || !user || !user.telegram_id) {
+            console.error(`Telegram Bot: Could not resolve telegram_id for user ${userId}`);
+            return false;
+        }
+
+        return await sendDocument(user.telegram_id, documentBuffer, filename, caption, options);
+    } catch (error) {
+        console.error('Telegram Bot Personal Document Error:', error.message);
+        return false;
+    }
+}
+
 module.exports = {
     sendMessage,
     sendBroadcast,
     sendPersonalMessage,
-    sendPoll
+    sendPoll,
+    sendDocument,
+    sendPersonalDocument
 };

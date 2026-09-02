@@ -16,7 +16,9 @@
 
 const { renderTelegramNotification } = require('./telegramMessageRenderer');
 const { maskPhone } = require('./phoneHelper');
-const { sendMessage } = require('./telegramBot');
+const { sendMessage, sendDocument } = require('./telegramBot');
+const { buildPassengerTicketProjection } = require('./ticketHelper');
+const { generateTicketPdf } = require('./ticketPdfService');
 
 const DEFAULT_ALLOWED_RECIPIENT_TYPES = ['creator', 'coordinator', 'family_or_group'];
 
@@ -214,9 +216,35 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                     continue;
                 }
 
-                const sendRes = await sendMessage(intent.telegramChatId, rendered.text, {
-                    reply_markup: rendered.reply_markup
-                });
+                let sendRes = null;
+                let isPdfSent = false;
+
+                // PDF Ticket Document Delivery Path for ticket_issued / passenger_ticket_issued
+                const isTicketNotif = intent.notificationType === 'ticket_issued' || intent.notificationType === 'passenger_ticket_issued';
+                if (isTicketNotif && data.booking && data.trip) {
+                    try {
+                        const projection = buildPassengerTicketProjection(data.booking, data.trip, data.busMaster || null);
+                        if (projection) {
+                            const pdfBuffer = await generateTicketPdf(projection);
+                            const filename = `POPUTKI-TICKET-${projection.ticketNumber || 'POP-000000'}.pdf`;
+                            const caption = '🎫 Ваш электронный билет POPUTKI.ONLINE готов.';
+
+                            sendRes = await sendDocument(intent.telegramChatId, pdfBuffer, filename, caption);
+                            if (sendRes && (sendRes.ok || sendRes.message_id || sendRes.result?.message_id)) {
+                                isPdfSent = true;
+                            }
+                        }
+                    } catch (pdfErr) {
+                        console.error('[TelegramDelivery] PDF ticket generation error (falling back to text):', pdfErr.message);
+                    }
+                }
+
+                // Standard Text Message Path (Used for non-ticket notifications OR fallback if PDF send failed)
+                if (!isPdfSent) {
+                    sendRes = await sendMessage(intent.telegramChatId, rendered.text, {
+                        reply_markup: rendered.reply_markup
+                    });
+                }
 
                 if (sendRes && (sendRes.ok || sendRes.message_id || sendRes.result?.message_id)) {
                     const msgId = String(sendRes.message_id || sendRes.result?.message_id || 'sent');
@@ -225,6 +253,7 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                         recipientType: intent.recipientType,
                         status: 'sent',
                         providerMessageId: msgId,
+                        isPdfSent,
                         idempotencyKey: intent.idempotencyKey,
                         dryRun: false
                     });
