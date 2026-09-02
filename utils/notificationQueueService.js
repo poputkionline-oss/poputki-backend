@@ -17,7 +17,7 @@
  */
 
 const supabase = require('../db');
-const { getServiceRoleClient } = require('../dbServiceRole');
+const { getServiceRoleClient, getServiceRoleDiagnostics } = require('../dbServiceRole');
 const { maskPhone } = require('./phoneHelper');
 const { processNotificationIntents } = require('./telegramDeliveryService');
 
@@ -56,6 +56,17 @@ async function persistNotificationPlan(plan, context = {}, options = {}) {
 
     const rootBooking = context.booking || {};
     const linkedBookings = context.bookingsList || [rootBooking];
+
+    const diag = typeof getServiceRoleDiagnostics === 'function' ? getServiceRoleDiagnostics() : {};
+    console.log('[NotificationQueue] NOTIFICATION_QUEUE_RUNTIME_TRACE', {
+        bookingId: rootBooking.id || null,
+        processPid: process.pid,
+        moduleInstanceId: diag.moduleInstanceId || 'N/A',
+        envPresent: diag.serviceRoleEnvPresent ?? false,
+        clientCachedBefore: diag.serviceRoleClientCached ?? false,
+        queueClientResult: options.supabaseClient ? 'INJECTED_MOCK' : 'SERVICE_ROLE',
+        planCount: intents.length
+    });
 
     for (const intent of intents) {
         // Build server-side audit row

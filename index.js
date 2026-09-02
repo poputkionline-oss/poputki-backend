@@ -3,6 +3,21 @@ const cors = require('cors');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 require('dotenv').config();
+const { getServiceRoleClient, getServiceRoleDiagnostics } = require('./dbServiceRole');
+
+try {
+    const startupClient = getServiceRoleClient();
+    const diag = getServiceRoleDiagnostics();
+    if (startupClient) {
+        console.log('[ServiceRole] SERVICE_ROLE_STARTUP_READY', {
+            processPid: diag.processPid,
+            moduleInstanceId: diag.moduleInstanceId
+        });
+    }
+} catch (err) {
+    console.warn('[ServiceRole] SERVICE_ROLE_STARTUP_UNAVAILABLE:', err.message);
+}
+
 const { v2: cloudinary } = require('cloudinary');
 
 cloudinary.config({
