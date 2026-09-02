@@ -16,9 +16,10 @@
 
 const { renderTelegramNotification } = require('./telegramMessageRenderer');
 const { maskPhone } = require('./phoneHelper');
-const { sendMessage, sendDocument } = require('./telegramBot');
+const { sendMessage, sendDocument, sendPhoto } = require('./telegramBot');
 const { buildPassengerTicketProjection } = require('./ticketHelper');
 const { generateTicketPdf } = require('./ticketPdfService');
+const { generateTicketPng } = require('./ticketImageService');
 
 const DEFAULT_ALLOWED_RECIPIENT_TYPES = ['creator', 'coordinator', 'family_or_group'];
 
@@ -217,30 +218,29 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                 }
 
                 let sendRes = null;
-                let isPdfSent = false;
+                let isPhotoSent = false;
 
-                // PDF Ticket Document Delivery Path for ticket_issued / passenger_ticket_issued
                 const isTicketNotif = intent.notificationType === 'ticket_issued' || intent.notificationType === 'passenger_ticket_issued';
+
                 if (isTicketNotif && data.booking && data.trip) {
+                    // High-Resolution PNG Ticket V1.1 Inline Delivery Path
                     try {
                         const projection = buildPassengerTicketProjection(data.booking, data.trip, data.busMaster || null);
                         if (projection) {
-                            const pdfBuffer = await generateTicketPdf(projection);
-                            const filename = `POPUTKI-TICKET-${projection.ticketNumber || 'POP-000000'}.pdf`;
-                            const caption = '🎫 Ваш электронный билет POPUTKI.ONLINE готов.';
+                            const pngBuffer = await generateTicketPng(projection);
+                            const filename = `POPUTKI-TICKET-${projection.ticketNumber || 'POP-000000'}.png`;
 
-                            sendRes = await sendDocument(intent.telegramChatId, pdfBuffer, filename, caption);
+                            // ABSOLUTE RULE: ONLY ONE MESSAGE via Telegram sendPhoto, EMPTY caption
+                            sendRes = await sendPhoto(intent.telegramChatId, pngBuffer, filename, '');
                             if (sendRes && (sendRes.ok || sendRes.message_id || sendRes.result?.message_id)) {
-                                isPdfSent = true;
+                                isPhotoSent = true;
                             }
                         }
-                    } catch (pdfErr) {
-                        console.error('[TelegramDelivery] PDF ticket generation error (falling back to text):', pdfErr.message);
+                    } catch (photoErr) {
+                        console.error('[TelegramDelivery] PNG ticket image generation error:', photoErr.message);
                     }
-                }
-
-                // Standard Text Message Path (Used for non-ticket notifications OR fallback if PDF send failed)
-                if (!isPdfSent) {
+                } else if (!isTicketNotif) {
+                    // Non-ticket notifications use standard text message
                     sendRes = await sendMessage(intent.telegramChatId, rendered.text, {
                         reply_markup: rendered.reply_markup
                     });
@@ -253,7 +253,7 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                         recipientType: intent.recipientType,
                         status: 'sent',
                         providerMessageId: msgId,
-                        isPdfSent,
+                        isPhotoSent,
                         idempotencyKey: intent.idempotencyKey,
                         dryRun: false
                     });
@@ -262,7 +262,7 @@ async function processNotificationIntents(intents = [], data = {}, options = {})
                         channel: 'telegram',
                         recipientType: intent.recipientType,
                         status: 'failed',
-                        errorCode: 'TELEGRAM_SEND_FAILED',
+                        errorCode: isTicketNotif ? 'TICKET_IMAGE_DELIVERY_FAILED' : 'TELEGRAM_SEND_FAILED',
                         idempotencyKey: intent.idempotencyKey,
                         dryRun: false
                     });

@@ -255,6 +255,73 @@ async function sendDocument(chatId, documentBuffer, filename, caption = '', opti
 }
 
 /**
+ * Sends a high-resolution PNG photo buffer to a Telegram chat.
+ * @param {string|number} chatId - Telegram chat ID
+ * @param {Buffer} imageBuffer - PNG Image Buffer
+ * @param {string} filename - Filename (e.g. POPUTKI-TICKET-POP-000440.png)
+ * @param {string} [caption] - Caption (default empty)
+ * @param {object} [options]
+ */
+async function sendPhoto(chatId, imageBuffer, filename, caption = '', options = {}) {
+    if (!chatId || !imageBuffer) {
+        console.error('Telegram Bot Photo: Missing chatId or imageBuffer');
+        return false;
+    }
+
+    try {
+        const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
+        
+        const headerLines = [
+            `--${boundary}`,
+            'Content-Disposition: form-data; name="chat_id"',
+            '',
+            String(chatId)
+        ];
+
+        if (caption) {
+            headerLines.push(
+                `--${boundary}`,
+                'Content-Disposition: form-data; name="caption"',
+                '',
+                String(caption),
+                `--${boundary}`,
+                'Content-Disposition: form-data; name="parse_mode"',
+                '',
+                'HTML'
+            );
+        }
+
+        headerLines.push(
+            `--${boundary}`,
+            `Content-Disposition: form-data; name="photo"; filename="${filename || 'ticket.png'}"`,
+            'Content-Type: image/png',
+            '',
+            ''
+        );
+
+        const headerStr = headerLines.join('\r\n');
+        const footerStr = `\r\n--${boundary}--\r\n`;
+
+        const payload = Buffer.concat([
+            Buffer.from(headerStr, 'utf-8'),
+            imageBuffer,
+            Buffer.from(footerStr, 'utf-8')
+        ]);
+
+        const response = await axios.post(`${BOT_API_URL}/sendPhoto`, payload, {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${boundary}`
+            }
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error(`Telegram Bot Photo Error (chatId: ${chatId}):`, error.response?.data?.description || error.message);
+        return false;
+    }
+}
+
+/**
  * Sends a personal document to a user based on internal user ID.
  * @param {string|number} userId - The user's internal ID in Supabase users table.
  * @param {Buffer} documentBuffer - Document buffer
@@ -284,11 +351,38 @@ async function sendPersonalDocument(userId, documentBuffer, filename, caption = 
     }
 }
 
+/**
+ * Sends a personal high-resolution PNG photo to a user based on internal user ID.
+ */
+async function sendPersonalPhoto(userId, imageBuffer, filename, caption = '', options = {}) {
+    if (!userId || !imageBuffer) return false;
+
+    try {
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('telegram_id')
+            .eq('id', userId)
+            .single();
+
+        if (error || !user || !user.telegram_id) {
+            console.error(`Telegram Bot: Could not resolve telegram_id for user ${userId}`);
+            return false;
+        }
+
+        return await sendPhoto(user.telegram_id, imageBuffer, filename, caption, options);
+    } catch (error) {
+        console.error('Telegram Bot Personal Photo Error:', error.message);
+        return false;
+    }
+}
+
 module.exports = {
     sendMessage,
     sendBroadcast,
     sendPersonalMessage,
     sendPoll,
     sendDocument,
-    sendPersonalDocument
+    sendPersonalDocument,
+    sendPhoto,
+    sendPersonalPhoto
 };
