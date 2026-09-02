@@ -888,9 +888,101 @@ router.post('/bookings/manual', async (req, res) => {
             }
         }
 
-        res.json({ success: true, id: booking.id });
+        // Phase E.38.2 Manual Booking Handoff for Unregistered Contacts
+        let handoff = { required: false };
+        if (!isAutoClaimed) {
+            try {
+                const { generateClaimSession } = require('../utils/claimHelper');
+                const { generateTicketVerificationToken } = require('../utils/ticketHelper');
+                const session = await generateClaimSession(booking.id, { supabaseClient: supabase });
+                const verificationToken = generateTicketVerificationToken(booking.id);
+                const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
+
+                handoff = {
+                    required: true,
+                    contact_role: effectiveContactRole,
+                    booking_id: booking.id,
+                    claim_url: session.deepLink,
+                    ticket_url: ticketUrl,
+                    expires_at: session.expiresAt
+                };
+            } catch (handoffErr) {
+                console.error('[ManualBooking] Error generating claim session handoff:', handoffErr.message);
+            }
+        }
+
+        res.json({
+            success: true,
+            id: booking.id,
+            booking_id: booking.id,
+            is_auto_claimed: isAutoClaimed,
+            handoff
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/bookings/{bookingId}/claim-link:
+ *   post:
+ *     summary: Generate or regenerate a claim link for an unconfirmed/unclaimed booking (carrier tenant-scoped)
+ *     tags: [Bus Admin]
+ */
+router.post('/bookings/:bookingId/claim-link', async (req, res) => {
+    const { bookingId } = req.params;
+    const numId = Number(bookingId);
+    if (!numId || isNaN(numId)) {
+        return res.status(400).json({ error: 'INVALID_BOOKING_ID', message: 'Некорректный ID бронирования' });
+    }
+
+    try {
+        // 1. Fetch booking
+        const { data: booking, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, bus_ticket_id, status, claim_status, claimed_by_user_id, contact_role, phone')
+            .eq('id', numId)
+            .single();
+
+        if (bErr || !booking) {
+            return res.status(404).json({ error: 'BOOKING_NOT_FOUND', message: 'Бронирование не найдено' });
+        }
+
+        // 2. Strict tenant verification: verify the booking's trip belongs to current carrier
+        const hasAccess = await verifyTicketAccess(req.carrier, booking.bus_ticket_id);
+        if (!hasAccess) {
+            return res.status(403).json({ error: 'FORBIDDEN', message: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+        }
+
+        // 3. Cancelled booking check
+        if (booking.status === 'cancelled') {
+            return res.status(400).json({ error: 'BOOKING_CANCELLED', message: 'Нельзя создать ссылку для отмененного бронирования' });
+        }
+
+        // 4. Already claimed check
+        if (booking.claim_status === 'claimed' || booking.claimed_by_user_id) {
+            return res.status(409).json({ error: 'BOOKING_ALREADY_CLAIMED', message: 'Поездка уже подтверждена пассажиром' });
+        }
+
+        // 5. Generate fresh claim session
+        const { generateClaimSession } = require('../utils/claimHelper');
+        const { generateTicketVerificationToken } = require('../utils/ticketHelper');
+
+        const session = await generateClaimSession(booking.id, { supabaseClient: supabase });
+        const verificationToken = generateTicketVerificationToken(booking.id);
+        const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
+
+        return res.json({
+            success: true,
+            booking_id: booking.id,
+            claim_url: session.deepLink,
+            ticket_url: ticketUrl,
+            expires_at: session.expiresAt
+        });
+    } catch (err) {
+        console.error('[ClaimLink Regeneration] Error:', err);
+        return res.status(500).json({ error: 'INTERNAL_ERROR', message: err.message });
     }
 });
 

@@ -20,7 +20,7 @@ const { cleanPhoneForStorage } = require('./phoneHelper');
 const CLAIM_SESSION_TTL_MS = 15 * 60 * 1000;
 
 function getClaimDb(options = {}) {
-    return options.supabaseClient || getServiceRoleClient();
+    return options.supabaseClient || getServiceRoleClient() || require('../db');
 }
 
 function isInjectedMock(options = {}) {
