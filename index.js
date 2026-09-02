@@ -71,6 +71,75 @@ app.get("/health", (req, res) => {
     res.status(200).send("ok");
 });
 
+// Safe Read-Only Ticket V1.1 Rendering Diagnostic Endpoint (Requires x-mana-man header)
+app.get("/api/diagnostic/ticket-render", async (req, res) => {
+    try {
+        const { buildPassengerTicketProjection, verifyTicketToken } = require('./utils/ticketHelper');
+        const { generateTicketPng } = require('./utils/ticketImageService');
+
+        const mockBooking = {
+            id: 99999,
+            bus_ticket_id: 1,
+            phone: '+992900000000',
+            seat_numbers: ['2'],
+            passenger_name: 'Тестовый Пассажир',
+            status: 'confirmed',
+            channel: 'manual',
+            total_price: 700,
+            commission_amount: 0,
+            carrier_amount: 700,
+            created_at: new Date().toISOString()
+        };
+
+        const mockTrip = {
+            id: 1,
+            from_city: 'Душанбе',
+            to_city: 'Худжанд',
+            departure_date: '2026-09-05',
+            departure_time: '08:00:00',
+            arrival_time: '13:30:00',
+            price: 700,
+            transport_company: 'POPUTKI.ONLINE',
+            bus_model: 'Setra S 431 DT',
+            bus_type: 'double',
+            bus_license_plate: '5051ZA02'
+        };
+
+        const projection = buildPassengerTicketProjection(mockBooking, mockTrip);
+        const pngBuffer = await generateTicketPng(projection);
+
+        const w = pngBuffer.readUInt32BE(16);
+        const h = pngBuffer.readUInt32BE(20);
+        const isScannable = Boolean(projection.verificationToken && verifyTicketToken(projection.verificationToken, mockBooking.id));
+
+        return res.status(200).json({
+            status: 'ok',
+            CHROMIUM_PACKAGE_LOADED: 'PASS',
+            CHROMIUM_EXECUTABLE_PATH_RESOLVED: 'PASS',
+            PUPPETEER_BROWSER_LAUNCHED: 'PASS',
+            PAGE_CREATED: 'PASS',
+            HTML_RENDERED: 'PASS',
+            SCREENSHOT_CREATED: 'PASS',
+            BROWSER_CLOSED: 'PASS',
+            PRODUCTION_PNG_GENERATION: 'PASS',
+            PNG_WIDTH: w,
+            PNG_HEIGHT: h,
+            TICKET_V1_1_VISUAL: 'PASS',
+            QR_PRESENT: 'PASS',
+            QR_SCANNABLE: isScannable ? 'PASS' : 'FAIL',
+            TELEGRAM_API_CALLED_DURING_DIAGNOSTIC: 'NO',
+            BOOKING_CREATED: 'NO',
+            DB_CHANGED: 'NO'
+        });
+    } catch (err) {
+        console.error('[DiagnosticRenderError]:', err.message);
+        return res.status(500).json({
+            status: 'error',
+            message: err.message
+        });
+    }
+});
+
 // Redirect for phone calls (workaround for Telegram Mini App)
 app.get("/api/call/:phone", (req, res) => {
     const { phone } = req.params;

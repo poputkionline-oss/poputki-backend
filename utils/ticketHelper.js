@@ -168,7 +168,7 @@ function buildPassengerTicketProjection(booking, ticket, busMaster = null, optio
             id: null,
             brand: null,
             model: ticket.bus_model || null,
-            license_plate: null,
+            license_plate: ticket.license_plate || ticket.bus_license_plate || ticket.plate_number || null,
             bus_type: ticket.bus_type || 'single',
             total_seats: Number(ticket.total_seats) || 53,
             photos: Array.isArray(ticket.photos) ? ticket.photos : []

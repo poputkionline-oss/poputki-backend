@@ -1,43 +1,83 @@
 /**
- * utils/ticketImageService.js — Ticket V1.1 High-Resolution PNG Renderer
+ * utils/ticketImageService.js — Ticket V1.1 High-Resolution PNG Image Renderer
  * 
  * POPUTKI.ONLINE
- * Renders canonical Ticket V1.1 projection as a crisp 1200px PNG image for Telegram photo delivery.
+ * Single Source of Truth matching PassengerTicket.vue 1:1 via Puppeteer HTML screenshot.
  */
 
-const { generateTicketPdf } = require('./ticketPdfService');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
+const fs = require('fs');
+const path = require('path');
+const { renderTicketHtml } = require('./ticketHtmlRenderer');
 
 /**
- * Generates a high-resolution PNG buffer for Ticket V1.1.
+ * Resolves local or production Chromium / Chrome executable path safely.
+ */
+async function getExecutablePath() {
+    try {
+        if (typeof chromium.executablePath === 'function') {
+            const p = await chromium.executablePath();
+            if (p && fs.existsSync(p)) return p;
+        } else if (typeof chromium.executablePath === 'string' && fs.existsSync(chromium.executablePath)) {
+            return chromium.executablePath;
+        }
+    } catch (e) {
+        console.warn('[TicketImage] Chromium executable resolution notice:', e.message);
+    }
+
+    // Windows local development fallback
+    const winChrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+    const winEdge = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+    if (fs.existsSync(winChrome)) return winChrome;
+    if (fs.existsSync(winEdge)) return winEdge;
+
+    // Linux production fallback
+    const linuxChrome = '/usr/bin/chromium-browser';
+    if (fs.existsSync(linuxChrome)) return linuxChrome;
+
+    throw new Error('NO_VALID_CHROMIUM_EXECUTABLE_FOUND');
+}
+
+/**
+ * Generates a high-resolution PNG image buffer matching PassengerTicket.vue 1:1.
  * 
  * @param {Object} projection - Canonical ticket projection from buildPassengerTicketProjection
- * @returns {Promise<Buffer>} PNG Buffer
+ * @returns {Promise<Buffer>} High-resolution PNG Buffer
  */
 async function generateTicketPng(projection) {
     if (!projection) {
         throw new Error('TICKET_PROJECTION_REQUIRED');
     }
 
-    // Step 1: Generate authoritative PDF Buffer
-    const pdfBuffer = await generateTicketPdf(projection);
+    const htmlContent = await renderTicketHtml(projection);
+    const execPath = await getExecutablePath();
 
-    // Step 2: Render PDF page as high-resolution PNG Buffer (width 1200px+)
+    let browser = null;
     try {
-        const pdf2img = require('pdf-img-convert');
-        const pages = await pdf2img.convert(pdfBuffer, {
-            scale: 2.0, // High-DPI scale for 1200px+ width & crisp QR
-            page_numbers: [1]
+        browser = await puppeteer.launch({
+            args: chromium.args || ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+            executablePath: execPath,
+            headless: true
         });
 
-        if (pages && pages.length > 0) {
-            return Buffer.from(pages[0]);
-        }
-    } catch (convertErr) {
-        console.warn('[TicketImage] pdf-img-convert fallback warning:', convertErr.message);
-    }
+        const page = await browser.newPage();
+        // High-DPI viewport (1400px width with scale factor 2 = 2800px crisp PNG)
+        await page.setViewport({ width: 1400, height: 1000, deviceScaleFactor: 2 });
+        await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
 
-    // Fallback: Return PDF buffer if PNG conversion library is unavailable
-    return pdfBuffer;
+        const element = await page.$('.ticket-outer-frame');
+        if (!element) {
+            throw new Error('TICKET_OUTER_FRAME_NOT_FOUND');
+        }
+
+        const pngBuffer = await element.screenshot({ type: 'png', omitBackground: true });
+        return pngBuffer;
+    } finally {
+        if (browser) {
+            await browser.close().catch(() => {});
+        }
+    }
 }
 
 module.exports = {

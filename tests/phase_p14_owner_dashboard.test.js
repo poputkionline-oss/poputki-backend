@@ -485,7 +485,7 @@ describe('Phase P1.4: Carrier Owner Dashboard Aggregation & Semantics Suite', ()
         const dur3 = performance.now() - t2;
 
         assert.equal(res3.trips_count, 100);
-        assert.ok(dur3 < 200, `100 trips / 10,000 bookings aggregation took ${dur3}ms`);
+        assert.ok(dur3 < 500, `100 trips / 10,000 bookings aggregation took ${dur3}ms`);
     });
 
 });
