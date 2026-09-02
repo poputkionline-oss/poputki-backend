@@ -152,6 +152,18 @@ async function resolveClaimSession(sessionToken, options = {}) {
     };
 }
 
+/**
+ * Phase E.45.3: eligibility is decided ENTIRELY by verified identity evidence
+ * (Telegram sender authentication + exact phone match), never by
+ * booking.contact_role. contact_role remains on the booking row for backward
+ * compatibility / display / legacy data, but is not read as an authorization
+ * condition anywhere below. This does NOT weaken E.38.1: a bare DB phone
+ * match or a self-reported/typed phone number was never sufficient here —
+ * both paths still hard-require a Telegram-authenticated sender identity
+ * (telegramSenderId, supplied by the bot webhook and therefore controlled by
+ * Telegram, not the client) that is cryptographically tied to a specific
+ * platform user, plus an exact match against the booking's stored phone.
+ */
 function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {}, telegramSenderId = null) {
     if (!booking || booking.claim_status === 'claimed' || booking.claimed_by_user_id) {
         return { canAutoClaim: false, reason: 'ALREADY_CLAIMED' };
@@ -174,33 +186,31 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
 
     const bookingPhone = cleanPhoneForStorage(booking.phone);
 
-    // SAFE KNOWN-USER AUTO-CLAIM PATH:
+    // SAFE KNOWN-USER AUTO-CLAIM PATH (the path actually exercised by
+    // production: routes/claims.js always resolves verifiedUser via a
+    // telegram_id lookup or resolveOrCreateTelegramPassenger(), both of which
+    // only ever yield a user whose telegram_id already equals the
+    // Telegram-authenticated telegramSenderId — so this condition captures
+    // every real "verified native Telegram phone" claim).
     // If the Telegram sender is an existing platform user (verifiedUser.telegram_id === telegramSenderId)
     // AND the user has a verified phone that matches the booking phone 100%,
-    // allow auto-claim for passenger & unknown contact roles WITHOUT requiring Telegram contact button re-share!
+    // allow auto-claim WITHOUT requiring a fresh Telegram contact-share —
+    // contact_role plays no part in this decision.
     if (telegramSenderId && verifiedUser.telegram_id != null && String(verifiedUser.telegram_id) === String(telegramSenderId)) {
         const userPhone = cleanPhoneForStorage(verifiedUser.phone);
 
-        if (booking.contact_role === 'family_or_group') {
-            return { canAutoClaim: false, reason: 'FAMILY_GROUP_CONTACT_REQUIRES_APPROVAL' };
-        }
-
-        if (booking.contact_role === 'coordinator') {
-            return { canAutoClaim: false, reason: 'COORDINATOR_CONTACT_REQUIRES_APPROVAL' };
-        }
-
-        if (booking.contact_role === 'unknown') {
-            return { canAutoClaim: false, reason: 'UNKNOWN_ROLE_REQUIRES_APPROVAL' };
-        }
-
         if (userPhone && bookingPhone && userPhone === bookingPhone) {
-            if (booking.contact_role === 'passenger') {
-                return { canAutoClaim: true, method: 'known_user_phone_match' };
-            }
+            return { canAutoClaim: true, method: 'known_user_phone_match' };
         }
+        // Phone doesn't match this known user: fall through to the native
+        // contact-share fallback below rather than hard-failing here, in
+        // case a freshly-shared contact card proves a different, valid match.
     }
 
-    // FALLBACK: Native Telegram Contact Verification Path
+    // FALLBACK: Native Telegram Contact Verification Path — reached when the
+    // platform user has no telegram_id linked yet (or it doesn't match this
+    // sender). A fresh Telegram contact-share is mandatory here since there
+    // is no pre-established, verified sender<->user link to rely on.
     if (!telegramContact || !telegramContact.user_id || !telegramSenderId
         || String(telegramContact.user_id) !== String(telegramSenderId)) {
         return { canAutoClaim: false, reason: 'TELEGRAM_CONTACT_USER_ID_MISMATCH' };
@@ -216,17 +226,6 @@ function evaluateAutoClaimEligibility(booking, verifiedUser, telegramContact = {
     }
 
     const sharedPhone = cleanPhoneForStorage(telegramContact.phone_number);
-
-    if (booking.contact_role !== 'passenger') {
-        return {
-            canAutoClaim: false,
-            reason: booking.contact_role === 'family_or_group'
-                ? 'FAMILY_GROUP_CONTACT_REQUIRES_APPROVAL'
-                : booking.contact_role === 'coordinator'
-                    ? 'COORDINATOR_CONTACT_REQUIRES_APPROVAL'
-                    : 'UNKNOWN_ROLE_REQUIRES_APPROVAL'
-        };
-    }
 
     if (!bookingPhone || !sharedPhone || sharedPhone !== bookingPhone) {
         return { canAutoClaim: false, reason: 'PHONE_MISMATCH_REQUIRES_APPROVAL' };

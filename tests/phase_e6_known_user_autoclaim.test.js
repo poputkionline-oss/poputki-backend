@@ -3,10 +3,10 @@
  *
  * Verifies:
  * A. Known Telegram user + verified matching phone + passenger → AUTO-CLAIM (no contact prompt)
- * B. Known Telegram user + verified matching phone + unknown → AUTO-CLAIM (no contact prompt)
+ * B. Known Telegram user + verified matching phone + unknown → AUTO-CLAIM (no contact prompt) [Phase E.45.3]
  * C. Known Telegram user + mismatched phone → NO AUTO-CLAIM (requires approval/contact)
- * D. family_or_group → NO AUTO-CLAIM (requires approval)
- * E. coordinator → NO AUTO-CLAIM (requires approval)
+ * D. family_or_group → AUTO-CLAIM (Phase E.45.3: contact_role no longer gates auto-claim)
+ * E. coordinator → AUTO-CLAIM (Phase E.45.3: contact_role no longer gates auto-claim)
  * F. Unknown Telegram user → native contact flow preserved
  * G. Already claimed by same user → idempotent safe result
  * H. Already claimed by different user → cannot overwrite owner
@@ -88,7 +88,7 @@ describe('Phase E.6 — Known Telegram User Safe Auto-Claim Tests', () => {
         assert.strictEqual(res.method, 'known_user_phone_match');
     });
 
-    it('[E6-B] Known Telegram user + verified matching phone + unknown role -> NO AUTO-CLAIM (E.38.1 hardening)', () => {
+    it('[E6-B] Known Telegram user + verified matching phone + unknown role -> AUTO-CLAIM (Phase E.45.3: contact_role no longer gates)', () => {
         const res = evaluateAutoClaimEligibility(
             matchingBookingUnknown,
             verifiedUser,
@@ -96,8 +96,8 @@ describe('Phase E.6 — Known Telegram User Safe Auto-Claim Tests', () => {
             '99887766'
         );
 
-        assert.strictEqual(res.canAutoClaim, false);
-        assert.strictEqual(res.reason, 'UNKNOWN_ROLE_REQUIRES_APPROVAL');
+        assert.strictEqual(res.canAutoClaim, true);
+        assert.strictEqual(res.method, 'known_user_phone_match');
     });
 
     it('[E6-C] Known Telegram user + mismatched phone -> NO AUTO-CLAIM', () => {
@@ -112,7 +112,7 @@ describe('Phase E.6 — Known Telegram User Safe Auto-Claim Tests', () => {
         assert.strictEqual(res.reason, 'TELEGRAM_CONTACT_USER_ID_MISMATCH');
     });
 
-    it('[E6-D] Known Telegram user + matching phone + family_or_group -> NO AUTO-CLAIM', () => {
+    it('[E6-D] Known Telegram user + matching phone + family_or_group -> AUTO-CLAIM (Phase E.45.3)', () => {
         const res = evaluateAutoClaimEligibility(
             familyGroupBooking,
             verifiedUser,
@@ -120,11 +120,11 @@ describe('Phase E.6 — Known Telegram User Safe Auto-Claim Tests', () => {
             '99887766'
         );
 
-        assert.strictEqual(res.canAutoClaim, false);
-        assert.strictEqual(res.reason, 'FAMILY_GROUP_CONTACT_REQUIRES_APPROVAL');
+        assert.strictEqual(res.canAutoClaim, true);
+        assert.strictEqual(res.method, 'known_user_phone_match');
     });
 
-    it('[E6-E] Known Telegram user + matching phone + coordinator -> NO AUTO-CLAIM', () => {
+    it('[E6-E] Known Telegram user + matching phone + coordinator -> AUTO-CLAIM (Phase E.45.3)', () => {
         const res = evaluateAutoClaimEligibility(
             coordinatorBooking,
             verifiedUser,
@@ -132,8 +132,8 @@ describe('Phase E.6 — Known Telegram User Safe Auto-Claim Tests', () => {
             '99887766'
         );
 
-        assert.strictEqual(res.canAutoClaim, false);
-        assert.strictEqual(res.reason, 'COORDINATOR_CONTACT_REQUIRES_APPROVAL');
+        assert.strictEqual(res.canAutoClaim, true);
+        assert.strictEqual(res.method, 'known_user_phone_match');
     });
 
     it('[E6-F] Unknown Telegram user (no saved telegram_id match) falls back to native contact check', () => {

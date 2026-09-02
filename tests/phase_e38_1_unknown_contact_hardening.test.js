@@ -113,15 +113,22 @@ describe('PHASE E.38.1 — UNKNOWN CONTACT OWNERSHIP HARDENING', () => {
         const passengerIntent = plan.intents.find(i => i.recipientType === 'passenger');
         assert.strictEqual(passengerIntent, undefined, 'Must NOT send passenger ticket to matched user when role is unknown');
 
-        // Defense in depth check in claimHelper.js
+        // Phase E.45.3: the LATER, separate Telegram-verified claim flow
+        // (evaluateAutoClaimEligibility) is identity/phone-based and no
+        // longer gated on contact_role — it must succeed here on verified
+        // identity + phone match alone. This does not reintroduce the E.38.1
+        // risk above: that risk was a bare DB phone match silently granting
+        // ownership at booking-CREATION time with no Telegram verification
+        // at all, which simulateManualBookingRoleResolution above still
+        // correctly blocks regardless of this change.
         const eligibility = evaluateAutoClaimEligibility(
             { id: 502, phone: '+992900112233', contact_role: 'unknown', status: 'confirmed' },
             registeredUser,
             {},
             '99887766'
         );
-        assert.strictEqual(eligibility.canAutoClaim, false);
-        assert.strictEqual(eligibility.reason, 'UNKNOWN_ROLE_REQUIRES_APPROVAL');
+        assert.strictEqual(eligibility.canAutoClaim, true, 'contact_role=unknown must not block a verified-identity + phone-match claim');
+        assert.strictEqual(eligibility.method, 'known_user_phone_match');
     });
 
     it('CASE D: contact_role = unknown, phone does not match -> AUTO_CLAIM = NO', async () => {
@@ -139,15 +146,16 @@ describe('PHASE E.38.1 — UNKNOWN CONTACT OWNERSHIP HARDENING', () => {
         assert.strictEqual(result.claimed_by_user_id, null);
         assert.strictEqual(result.claim_status, 'unclaimed');
 
-        // Defense in depth check in claimHelper.js
+        // Phase E.45.3: verified-identity + phone-match claim must succeed
+        // regardless of legacy contact_role value.
         const eligibility = evaluateAutoClaimEligibility(
             { id: 503, phone: '+992900112233', contact_role: 'family_or_group', status: 'confirmed' },
             registeredUser,
             {},
             '99887766'
         );
-        assert.strictEqual(eligibility.canAutoClaim, false);
-        assert.strictEqual(eligibility.reason, 'FAMILY_GROUP_CONTACT_REQUIRES_APPROVAL');
+        assert.strictEqual(eligibility.canAutoClaim, true, 'contact_role=family_or_group must not block a verified-identity + phone-match claim');
+        assert.strictEqual(eligibility.method, 'known_user_phone_match');
     });
 
     it('CASE F: contact_role = coordinator, phone matches registered user -> AUTO_CLAIM = NO', async () => {
@@ -157,15 +165,16 @@ describe('PHASE E.38.1 — UNKNOWN CONTACT OWNERSHIP HARDENING', () => {
         assert.strictEqual(result.claimed_by_user_id, null);
         assert.strictEqual(result.claim_status, 'unclaimed');
 
-        // Defense in depth check in claimHelper.js
+        // Phase E.45.3: verified-identity + phone-match claim must succeed
+        // regardless of legacy contact_role value.
         const eligibility = evaluateAutoClaimEligibility(
             { id: 504, phone: '+992900112233', contact_role: 'coordinator', status: 'confirmed' },
             registeredUser,
             {},
             '99887766'
         );
-        assert.strictEqual(eligibility.canAutoClaim, false);
-        assert.strictEqual(eligibility.reason, 'COORDINATOR_CONTACT_REQUIRES_APPROVAL');
+        assert.strictEqual(eligibility.canAutoClaim, true, 'contact_role=coordinator must not block a verified-identity + phone-match claim');
+        assert.strictEqual(eligibility.method, 'known_user_phone_match');
     });
 
 });
