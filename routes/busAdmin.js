@@ -1596,10 +1596,15 @@ router.post('/tickets/:id/complete', async (req, res) => {
     }
 
     try {
-        const result = await completeTrip(supabase, { tripId: id, actorContext: req.carrier });
+        const result = await completeTrip({ tripId: id, actorContext: req.carrier });
 
         if (!result.success) {
-            const status = result.error === 'TRIP_NOT_FOUND' ? 404 : 400;
+            const statusByError = {
+                TRIP_NOT_FOUND: 404,
+                TRIP_OWNERSHIP_MISMATCH: 403,
+                RPC_FAILED: 500
+            };
+            const status = statusByError[result.error] || 400;
             return res.status(status).json({ error: result.error, details: result.details });
         }
 

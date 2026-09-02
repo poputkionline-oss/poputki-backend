@@ -957,7 +957,7 @@ router.post('/bookings/expire-pending', adminAuth, async (req, res) => {
 router.post('/trips/auto-complete', adminAuth, async (req, res) => {
     try {
         const dryRun = req.query.dry_run === 'true' || req.body?.dry_run === true;
-        const result = await sweepAutoCompleteTrips(supabase, { dryRun });
+        const result = await sweepAutoCompleteTrips({ dryRun });
 
         res.json({
             success: true,

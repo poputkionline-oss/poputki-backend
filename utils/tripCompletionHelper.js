@@ -2,32 +2,30 @@
  * tripCompletionHelper.js — Canonical Trip Completion & Auto-Complete Logic
  *
  * Phase E.47.1 — QR Boarding + Automatic Trip Completion
+ * Phase E.47.2 — Atomic completion via fn_complete_bus_trip() RPC
  *
  * Guarantees:
  * - Single canonical completion service used by BOTH manual ("Завершить рейс")
  *   and automatic (arrival + 12h sweep) completion paths.
- * - Idempotent: completing an already-completed trip is a safe no-op.
- * - Order-safe convergence: pending -> no_show is applied BEFORE the trip is
- *   marked completed, and both steps are individually idempotent, so a retry
- *   after a partial failure always converges to the correct final state
- *   without any duplicate financial or notification side-effects.
+ * - TRUE ACID atomicity: the actual mutation (STEP 1 pending_boarding ->
+ *   no_show, STEP 2 trip -> completed) happens inside ONE Postgres
+ *   transaction via the fn_complete_bus_trip(...) RPC — see
+ *   docs/migrations/20260902_atomic_trip_completion.sql. The RPC locks the
+ *   trip row (SELECT ... FOR UPDATE) for the duration of the transaction, so
+ *   a concurrent completion request for the SAME trip serializes behind it
+ *   instead of racing it.
+ * - Idempotent: completing an already-completed trip is a safe no-op
+ *   (verified inside the same locked transaction, not as a separate query).
  * - Never touches: boarded bookings, already no_show bookings, cancelled /
  *   non-confirmed bookings, payment fields, commission/payout fields,
  *   Ticket V1.1 data, or historical rows (nothing is deleted).
- *
- * IMPORTANT — Atomicity caveat (see docs/E47_1_REPORT for full detail):
- * Supabase (PostgREST) is used here via two sequential conditional UPDATE
- * statements rather than a single DB transaction/RPC. This is NOT ACID-atomic:
- * a crash between STEP 1 and STEP 2 can leave a trip 'active' with some
- * bookings already flipped to 'no_show'. This is intentional per project
- * instructions (no new RPC/migration without separate approval). The design
- * is instead made SAFE-BY-CONVERGENCE: STEP 1 only touches rows that are
- * still 'pending_boarding', so re-running completeTrip() (manually, or on
- * the next auto-complete sweep) always finishes the job correctly with zero
- * duplicate effects. True ACID atomicity would require a Postgres RPC
- * function wrapping both steps in one transaction.
+ * - The RPC is GRANTed to service_role only (REVOKEd from anon/authenticated),
+ *   so this module always calls it through the service-role client — see
+ *   dbServiceRole.js — mirroring the fn_claim_booking_auto convention already
+ *   established in utils/claimHelper.js.
  */
 
+const { getServiceRoleClient } = require('../dbServiceRole');
 const { logCarrierActivity, AUDIT_ACTIONS, AUDIT_ENTITY_TYPES } = require('./auditHelper');
 
 // Tajikistan does not observe DST; Asia/Dushanbe is a fixed UTC+5 zone.
@@ -121,94 +119,75 @@ function isTripEligibleForAutoComplete(trip, now = new Date()) {
 }
 
 /**
+ * Resolves the DB client used to call fn_complete_bus_trip(...) and to read
+ * candidate trips for the sweep. Defaults to the service-role client (the
+ * RPC is GRANTed to service_role only); tests may inject a fake via
+ * options.dbClient — see tests/phase_e47_2_atomic_trip_completion.test.js.
+ */
+function resolveCompletionDb(options = {}) {
+    return options.dbClient || getServiceRoleClient();
+}
+
+/**
  * CANONICAL trip completion service — the single source of truth used by
  * both the manual "Завершить рейс" action and the automatic arrival+12h
- * sweep. See file header for the atomicity caveat.
+ * sweep. Delegates the actual mutation to the fn_complete_bus_trip(...)
+ * Postgres RPC (docs/migrations/20260902_atomic_trip_completion.sql), which
+ * performs the lock + STEP 1 (pending_boarding -> no_show) + STEP 2
+ * (trip -> completed) as ONE database transaction.
  *
- * @param {Object} supabase - Supabase client
  * @param {Object} options
  * @param {number|string} options.tripId
- * @param {Object} [options.actorContext] - carrier-like context for audit logging
- *        (req.carrier for manual completion, or a synthetic system actor for
- *        the auto-complete sweep). If omitted, audit logging is skipped.
+ * @param {Object} [options.actorContext] - carrier-like context for audit
+ *        logging (req.carrier for manual completion, or a synthetic system
+ *        actor with role:'system' for the auto-complete sweep). A non-system
+ *        actorContext with a carrier_id is also passed to the RPC as
+ *        p_expected_operator_id for a defense-in-depth ownership re-check
+ *        inside the locked transaction.
+ * @param {Object} [options.dbClient] - override DB client (tests only).
  * @returns {Promise<Object>} result descriptor
  */
-async function completeTrip(supabase, { tripId, actorContext = null } = {}) {
+async function completeTrip({ tripId, actorContext = null, dbClient = null } = {}) {
     if (!tripId) {
         return { success: false, error: 'TRIP_ID_REQUIRED' };
     }
 
-    const { data: trip, error: tripErr } = await supabase
-        .from('bus_tickets')
-        .select('id, operator_id, status, from_city, to_city, departure_date, departure_time, arrival_date, arrival_time')
-        .eq('id', tripId)
-        .maybeSingle();
+    const db = resolveCompletionDb({ dbClient });
 
-    if (tripErr || !trip) {
-        return { success: false, error: 'TRIP_NOT_FOUND' };
+    const expectedOperatorId = (actorContext && actorContext.role !== 'system' && actorContext.carrier_id != null)
+        ? Number(actorContext.carrier_id)
+        : null;
+
+    const { data, error } = await db.rpc('fn_complete_bus_trip', {
+        p_trip_id: Number(tripId),
+        p_expected_operator_id: expectedOperatorId
+    });
+
+    if (error) {
+        console.error('[TripCompletion] fn_complete_bus_trip RPC error:', error);
+        return { success: false, error: 'RPC_FAILED', details: error.message };
     }
 
-    // Idempotency: completing an already-completed trip is a safe no-op.
-    if (trip.status === 'completed') {
-        return {
-            success: true,
-            already_completed: true,
-            trip_id: trip.id,
-            no_show_marked: 0,
-            boarded_preserved: true
-        };
+    if (!data || data.success !== true) {
+        return { success: false, error: (data && data.error) || 'COMPLETION_FAILED', status: data && data.status };
     }
 
-    if (trip.status !== 'active') {
-        return { success: false, error: 'TRIP_NOT_ACTIVE', status: trip.status };
-    }
-
-    // STEP 1: confirmed + pending_boarding -> no_show.
-    // Never touches boarded, already no_show, or non-confirmed bookings.
-    // Conditional filter makes this step itself idempotent/re-runnable.
-    const { data: noShowRows, error: noShowErr } = await supabase
-        .from('bus_ticket_bookings')
-        .update({ boarding_status: 'no_show' })
-        .eq('bus_ticket_id', tripId)
-        .eq('status', 'confirmed')
-        .or('boarding_status.eq.pending_boarding,boarding_status.is.null')
-        .select('id');
-
-    if (noShowErr) {
-        console.error('[TripCompletion] STEP1 no_show update failed:', noShowErr);
-        return { success: false, error: 'NO_SHOW_UPDATE_FAILED', details: noShowErr.message };
-    }
-
-    const noShowCount = Array.isArray(noShowRows) ? noShowRows.length : 0;
-
-    // STEP 2: mark trip completed, conditioned on still being 'active' so a
-    // concurrent completion (race) never double-applies STEP 1's effects.
-    const { data: updatedTripRows, error: completeErr } = await supabase
-        .from('bus_tickets')
-        .update({ status: 'completed' })
-        .eq('id', tripId)
-        .eq('status', 'active')
-        .select('id, status');
-
-    if (completeErr) {
-        console.error('[TripCompletion] STEP2 status update failed:', completeErr);
-        return { success: false, error: 'TRIP_STATUS_UPDATE_FAILED', details: completeErr.message, no_show_marked: noShowCount };
-    }
-
-    const tripWasCompletedNow = Array.isArray(updatedTripRows) && updatedTripRows.length > 0;
-
-    if (actorContext) {
+    // Audit logging is a secondary, non-atomicity-critical side-effect and
+    // stays outside the DB transaction, matching how fn_claim_booking_auto's
+    // callers log activity in JS after the RPC succeeds. Skipped on an
+    // idempotent no-op (already_completed) so a retry never double-logs.
+    if (actorContext && data.already_completed === false) {
         try {
             await logCarrierActivity({
-                supabase,
+                supabase: db,
                 carrierContext: actorContext,
                 action: AUDIT_ACTIONS.TRIP_COMPLETED,
                 entityType: AUDIT_ENTITY_TYPES.TICKET,
-                entityId: trip.id,
-                entityLabel: `Рейс ${trip.from_city || ''} → ${trip.to_city || ''} #${trip.id}`,
+                entityId: data.trip_id,
+                entityLabel: `Рейс #${data.trip_id}`,
                 oldData: { status: 'active' },
                 newData: { status: 'completed' },
-                metadata: { reason: 'trip_completion', seats_count: noShowCount }
+                metadata: { reason: 'trip_completion', seats_count: data.no_show_marked || 0 }
             });
         } catch (auditErr) {
             console.warn('[TripCompletion] Non-blocking audit error:', auditErr.message);
@@ -217,9 +196,9 @@ async function completeTrip(supabase, { tripId, actorContext = null } = {}) {
 
     return {
         success: true,
-        already_completed: !tripWasCompletedNow, // race: someone else completed it first
-        trip_id: trip.id,
-        no_show_marked: noShowCount,
+        already_completed: Boolean(data.already_completed),
+        trip_id: data.trip_id,
+        no_show_marked: data.no_show_marked || 0,
         boarded_preserved: true
     };
 }
@@ -231,19 +210,19 @@ async function completeTrip(supabase, { tripId, actorContext = null } = {}) {
  * used for POST /api/admin/bookings/expire-pending.
  *
  * Safe on restart / re-invocation: each completeTrip() call is independently
- * idempotent, and trips already completed are skipped by the eligibility
- * filter itself (status is re-checked in the DB query, not cached), so
- * overlapping sweep runs cannot double-apply effects.
+ * idempotent AND now atomic (fn_complete_bus_trip locks the trip row), so
+ * overlapping sweep runs — or a sweep overlapping a manual completion —
+ * cannot double-apply effects.
  *
- * @param {Object} supabase
- * @param {Object} options - { dryRun, now }
+ * @param {Object} options - { dryRun, now, dbClient }
  * @returns {Promise<Object>}
  */
-async function sweepAutoCompleteTrips(supabase, options = {}) {
-    const { dryRun = false, now = new Date() } = options;
+async function sweepAutoCompleteTrips(options = {}) {
+    const { dryRun = false, now = new Date(), dbClient = null } = options;
     const nowTime = now instanceof Date ? now : new Date(now);
+    const db = resolveCompletionDb({ dbClient });
 
-    const { data: activeTrips, error: fetchErr } = await supabase
+    const { data: activeTrips, error: fetchErr } = await db
         .from('bus_tickets')
         .select('id, operator_id, status, from_city, to_city, arrival_date, arrival_time')
         .eq('status', 'active');
@@ -275,7 +254,7 @@ async function sweepAutoCompleteTrips(supabase, options = {}) {
         };
 
         try {
-            const result = await completeTrip(supabase, { tripId: trip.id, actorContext: systemActor });
+            const result = await completeTrip({ tripId: trip.id, actorContext: systemActor, dbClient: db });
             if (result.success) {
                 completed++;
                 totalNoShow += result.no_show_marked || 0;
