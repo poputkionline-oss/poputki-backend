@@ -1159,22 +1159,35 @@ router.delete('/bookings/:id', async (req, res) => {
 
         if (delErr) throw delErr;
 
-        // 3. Release the seats in the bus_tickets table
-        const { data: ticket, error: tErr } = await supabase
+        // 3. Release the seats canonically by deriving from remaining active bookings
+        const { data: remainingBookings } = await supabase
+            .from('bus_ticket_bookings')
+            .select('seat_numbers, status, hold_expires_at, created_at')
+            .eq('bus_ticket_id', ticketId)
+            .neq('status', 'cancelled');
+
+        const remainingSeats = [];
+        (remainingBookings || []).forEach(b => {
+            if (isSeatLockedByBooking(b)) {
+                const sList = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                if (Array.isArray(sList)) {
+                    sList.forEach(s => {
+                        const num = Number(s);
+                        if (!isNaN(num)) remainingSeats.push(num);
+                    });
+                } else if (sList != null) {
+                    const num = Number(sList);
+                    if (!isNaN(num)) remainingSeats.push(num);
+                }
+            }
+        });
+
+        const canonicalReserved = [...new Set(remainingSeats)];
+
+        await supabase
             .from('bus_tickets')
-            .select('reserved_seats')
-            .eq('id', ticketId)
-            .single();
-
-        if (!tErr && ticket) {
-            const reserved = typeof ticket.reserved_seats === 'string' ? JSON.parse(ticket.reserved_seats || '[]') : (ticket.reserved_seats || []);
-            const newReserved = reserved.filter(s => !seatsToRelease.includes(s));
-
-            await supabase
-                .from('bus_tickets')
-                .update({ reserved_seats: newReserved })
-                .eq('id', ticketId);
-        }
+            .update({ reserved_seats: canonicalReserved })
+            .eq('id', ticketId);
 
         // Audit log booking cancellation
         await logCarrierActivity({
