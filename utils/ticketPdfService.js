@@ -1,7 +1,8 @@
 /**
- * utils/ticketPdfService.js — PDF Ticket Generator for Ticket V1.1
+ * utils/ticketPdfService.js — Canonical Server-Side Ticket V1.1 PDF Renderer
  * 
  * POPUTKI.ONLINE
+ * Single Source of Truth matching PassengerTicket.vue design 1:1.
  */
 
 const PDFDocument = require('pdfkit');
@@ -10,7 +11,7 @@ const path = require('path');
 const fs = require('fs');
 
 /**
- * Resolves font paths safely with fallback
+ * Resolves Cyrillic-capable font paths safely
  */
 function getFontPaths() {
     const localDir = path.join(__dirname, '..', 'assets', 'fonts');
@@ -21,7 +22,6 @@ function getFontPaths() {
         return { regular: regPath, bold: boldPath };
     }
 
-    // Windows fallback
     const winReg = 'C:\\Windows\\Fonts\\arial.ttf';
     const winBold = 'C:\\Windows\\Fonts\\arialbd.ttf';
     if (fs.existsSync(winReg) && fs.existsSync(winBold)) {
@@ -32,9 +32,9 @@ function getFontPaths() {
 }
 
 /**
- * Generates a clean, professional PDF Buffer matching Ticket V1.1 specs.
+ * Generates an authoritative PDF Buffer matching Ticket V1.1 layout.
  * 
- * @param {Object} projection - Ticket projection object from buildPassengerTicketProjection
+ * @param {Object} projection - Canonical ticket projection from buildPassengerTicketProjection
  * @returns {Promise<Buffer>} PDF Buffer
  */
 async function generateTicketPdf(projection) {
@@ -42,14 +42,59 @@ async function generateTicketPdf(projection) {
         throw new Error('TICKET_PROJECTION_REQUIRED');
     }
 
-    // Generate QR Code PNG Buffer
+    // Safely extract canonical properties from Ticket V1.1 projection
+    const ticketNumber = projection.ticketNumber || 'POP-000000';
     const verificationUrl = projection.verificationUrl || `https://www.poputki.online/ticket/${projection.verificationToken || ''}`;
+
+    const route = projection.route || {};
+    const passenger = projection.passenger || {};
+    const bus = projection.bus || {};
+    const payment = projection.payment || {};
+    const carrier = projection.carrier || {};
+    const support = projection.support || {};
+
+    const fromCity = route.fromCity || '—';
+    const toCity = route.toCity || '—';
+    const departureDate = route.departureDate || '—';
+    const departureTime = route.departureTime || '—';
+    const arrivalTime = route.arrivalTime || '';
+
+    const passengerName = passenger.primaryName || 'Пассажир';
+    const seats = Array.isArray(passenger.seats) && passenger.seats.length > 0 ? passenger.seats : [];
+    const seatDisplay = seats.length > 0 ? seats.join(', ') : 'Без места / По посадке';
+
+    // Floor calculation for double-decker buses matching PassengerTicket.vue
+    let floorDisplay = null;
+    if (bus.bus_type === 'double') {
+        const sNum = seats[0] ? Number(seats[0]) : null;
+        floorDisplay = (sNum && sNum <= 20) ? '1 ЭТАЖ' : (sNum ? '2 ЭТАЖ' : '1 ЭТАЖ');
+    }
+
+    // Bus description
+    let busTitle = 'Автобус';
+    if (bus.brand || bus.model) {
+        busTitle = [bus.brand, bus.model].filter(Boolean).join(' ').trim();
+    }
+    const licensePlate = bus.license_plate || null;
+
+    // Pricing & Payment breakdown
+    const totalPrice = Number(payment.totalPrice || 0);
+    const paidAmount = Number(payment.paidAmount || 0);
+    const remainingAmount = Number(payment.remainingAmount || 0);
+    const isManual = Boolean(payment.isManual);
+
+    // Carrier & Escort
+    const carrierName = carrier.companyName || 'Перевозчик POPUTKI.ONLINE';
+    const escortName = support.name || null;
+    const escortPhone = support.phone || null;
+
+    // Generate QR Code PNG Buffer (High contrast, scalable)
     const qrBuffer = await QRCode.toBuffer(verificationUrl, {
         errorCorrectionLevel: 'M',
         margin: 1,
-        width: 300,
+        width: 320,
         color: {
-            dark: '#1e293b',
+            dark: '#0f172a',
             light: '#ffffff'
         }
     });
@@ -60,9 +105,9 @@ async function generateTicketPdf(projection) {
                 size: 'A4',
                 margin: 36,
                 info: {
-                    Title: `POPUTKI-TICKET-${projection.ticketNumber || 'POP-000000'}`,
+                    Title: `POPUTKI-TICKET-${ticketNumber}`,
                     Author: 'POPUTKI.ONLINE',
-                    Subject: 'Электронный билет на рейс'
+                    Subject: 'Электронный билет / Маршрутный лист'
                 }
             });
 
@@ -81,162 +126,147 @@ async function generateTicketPdf(projection) {
             doc.on('end', () => resolve(Buffer.concat(buffers)));
             doc.on('error', err => reject(err));
 
-            const primaryColor = '#2563eb'; // Poputki blue
-            const darkText = '#1e293b';
+            const primaryColor = '#2563eb';
+            const darkText = '#0f172a';
             const grayText = '#64748b';
             const lightBg = '#f8fafc';
-            const borderBg = '#e2e8f0';
+            const borderBg = '#cbd5e1';
 
-            // --- HEADER BRANDING ---
-            doc.rect(36, 36, 523, 60).fill('#0f172a');
+            // --- HEADER BRANDING BAR ---
+            doc.rect(36, 36, 523, 62).fill('#0f172a');
             
-            doc.fillColor('#38bdf8').font(fontBold).fontSize(20).text('POPUTKI', 50, 48, { continued: true });
-            doc.fillColor('#ffffff').fontSize(20).text('.ONLINE');
+            doc.fillColor('#38bdf8').font(fontBold).fontSize(22).text('POPUTKI', 52, 48, { continued: true });
+            doc.fillColor('#ffffff').fontSize(22).text('.ONLINE');
 
-            doc.fillColor('#94a3b8').font(fontReg).fontSize(10).text('СЛУЖБА МЕЖДУГОРОДНИХ ПОЕЗДОК', 50, 72);
+            doc.fillColor('#94a3b8').font(fontReg).fontSize(9).text('СЛУЖБА МЕЖДУГОРОДНИХ ПОЕЗДОК', 52, 74);
 
-            // Ticket Number Tag (Top Right)
-            doc.rect(410, 48, 135, 36).fill('#1e293b');
-            doc.fillColor('#94a3b8').font(fontReg).fontSize(8).text('БИЛЕТ №', 420, 53);
-            doc.fillColor('#38bdf8').font(fontBold).fontSize(13).text(projection.ticketNumber || 'POP-000000', 420, 65);
+            // Ticket Number Tag (Top Right Pill)
+            doc.rect(400, 48, 145, 38).fill('#1e293b');
+            doc.fillColor('#94a3b8').font(fontReg).fontSize(8).text('ЭЛЕКТРОННЫЙ БИЛЕТ №', 410, 53);
+            doc.fillColor('#38bdf8').font(fontBold).fontSize(14).text(ticketNumber, 410, 65);
 
-            // Sub-header title
-            doc.fillColor(grayText).font(fontBold).fontSize(11).text('ЭЛЕКТРОННЫЙ БИЛЕТ / МАРШРУТНЫЙ ЛИСТ', 36, 110);
+            // Sub-header title line
+            doc.fillColor(grayText).font(fontBold).fontSize(10).text('МАРШРУТНЫЙ ЛИСТ ПАССАЖИРА', 36, 112);
             doc.moveTo(36, 126).lineTo(559, 126).strokeColor(borderBg).lineWidth(1).stroke();
 
-            // --- MAIN CARD ---
-            let y = 140;
-
-            // Route Section
-            doc.rect(36, y, 523, 70).fill(lightBg).strokeColor(borderBg).lineWidth(1).stroke();
+            // --- MAIN ROUTE CARD ---
+            let y = 138;
+            doc.rect(36, y, 523, 72).fill(lightBg).strokeColor(borderBg).lineWidth(1).stroke();
             
-            const fromCity = projection.route?.fromCity || '—';
-            const toCity = projection.route?.toCity || '—';
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('МАРШРУТ СЛЕДОВАНИЯ', 52, y + 12);
+            doc.fillColor(darkText).font(fontBold).fontSize(18).text(`${fromCity}  →  ${toCity}`, 52, y + 28);
 
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('МАРШРУТ СЛЕДОВАНИЯ', 50, y + 10);
-            doc.fillColor(darkText).font(fontBold).fontSize(18).text(`${fromCity}  →  ${toCity}`, 50, y + 26);
-
-            if (projection.route?.intermediateStops && projection.route.intermediateStops.length > 0) {
-                const stopsText = 'Через: ' + projection.route.intermediateStops.join(', ');
-                doc.fillColor(grayText).font(fontReg).fontSize(9).text(stopsText, 50, y + 52);
+            if (route.intermediateStops && route.intermediateStops.length > 0) {
+                const stopsText = 'Промежуточные остановки: ' + route.intermediateStops.join(' — ');
+                doc.fillColor(grayText).font(fontReg).fontSize(8.5).text(stopsText, 52, y + 54);
             }
 
-            y += 85;
+            y += 86;
 
             // --- TRIP & SEAT DETAILS (2 COLUMNS) ---
-            const colWidth = 250;
+            const colWidth = 252;
             const col1X = 36;
-            const col2X = 309;
+            const col2X = 307;
 
             // Column 1: Departure & Bus
-            doc.rect(col1X, y, colWidth, 140).fill('#ffffff').strokeColor(borderBg).lineWidth(1).stroke();
+            doc.rect(col1X, y, colWidth, 145).fill('#ffffff').strokeColor(borderBg).lineWidth(1).stroke();
             
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ДАТА И ВРЕМЯ ОТПРАВЛЕНИЯ', col1X + 12, y + 10);
-            doc.fillColor(primaryColor).font(fontBold).fontSize(14).text(`${projection.departureDate || '—'} в ${projection.departureTime || '—'}`, col1X + 12, y + 24);
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ДАТА И ВРЕМЯ ОТПРАВЛЕНИЯ', col1X + 14, y + 12);
+            doc.fillColor(primaryColor).font(fontBold).fontSize(14).text(`${departureDate} в ${departureTime}`, col1X + 14, y + 26);
 
-            if (projection.arrivalTime) {
-                doc.fillColor(grayText).font(fontReg).fontSize(8).text(`Прибытие (ориент.): ${projection.arrivalTime}`, col1X + 12, y + 42);
+            if (arrivalTime) {
+                doc.fillColor(grayText).font(fontReg).fontSize(8.5).text(`Прибытие (ориентировочно): ${arrivalTime}`, col1X + 14, y + 46);
             }
 
-            doc.moveTo(col1X + 12, y + 56).lineTo(col1X + colWidth - 12, y + 56).strokeColor('#f1f5f9').stroke();
+            doc.moveTo(col1X + 14, y + 60).lineTo(col1X + colWidth - 14, y + 60).strokeColor('#f1f5f9').stroke();
 
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ТРАНСПОРТНОЕ СРЕДСТВО', col1X + 12, y + 66);
-            const busTitle = projection.bus?.model ? `${projection.bus.brand || ''} ${projection.bus.model}`.trim() : 'Автобус / Микроавтобус';
-            doc.fillColor(darkText).font(fontBold).fontSize(11).text(busTitle, col1X + 12, y + 80);
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ТРАНСПОРТНОЕ СРЕДСТВО', col1X + 14, y + 70);
+            doc.fillColor(darkText).font(fontBold).fontSize(11).text(busTitle, col1X + 14, y + 84);
 
-            if (projection.bus?.license_plate) {
-                doc.fillColor(grayText).font(fontReg).fontSize(9).text(`Гос. номер: ${projection.bus.license_plate}`, col1X + 12, y + 96);
+            if (licensePlate) {
+                doc.fillColor(grayText).font(fontReg).fontSize(9).text(`Гос. номер: ${licensePlate}`, col1X + 14, y + 100);
             }
 
-            if (projection.bus?.bus_type === 'double') {
-                doc.fillColor('#7c3aed').font(fontBold).fontSize(9).text('Двухэтажный автобус', col1X + 12, y + 112);
+            if (bus.bus_type === 'double') {
+                doc.fillColor('#7c3aed').font(fontBold).fontSize(8.5).text('Двухэтажный автобус', col1X + 14, y + 118);
             }
 
             // Column 2: Passenger & Seat
-            doc.rect(col2X, y, colWidth, 140).fill('#ffffff').strokeColor(borderBg).lineWidth(1).stroke();
+            doc.rect(col2X, y, colWidth, 145).fill('#ffffff').strokeColor(borderBg).lineWidth(1).stroke();
 
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ПАССАЖИР', col2X + 12, y + 10);
-            doc.fillColor(darkText).font(fontBold).fontSize(12).text(projection.passenger?.name || 'Пассажир', col2X + 12, y + 24);
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ПАССАЖИР', col2X + 14, y + 12);
+            doc.fillColor(darkText).font(fontBold).fontSize(13).text(passengerName, col2X + 14, y + 26);
 
-            doc.moveTo(col2X + 12, y + 56).lineTo(col2X + colWidth - 12, y + 56).strokeColor('#f1f5f9').stroke();
+            doc.moveTo(col2X + 14, y + 60).lineTo(col2X + colWidth - 14, y + 60).strokeColor('#f1f5f9').stroke();
 
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('МЕСТО В САЛОНЕ', col2X + 12, y + 66);
-            const seatText = (projection.passenger?.seats && projection.passenger.seats.length > 0)
-                ? projection.passenger.seats.join(', ')
-                : 'Без места / По посадке';
-            doc.fillColor('#0284c7').font(fontBold).fontSize(16).text(`МЕСТО № ${seatText}`, col2X + 12, y + 80);
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('МЕСТО В САЛОНЕ', col2X + 14, y + 70);
+            doc.fillColor('#0284c7').font(fontBold).fontSize(16).text(`МЕСТО № ${seatDisplay}`, col2X + 14, y + 84);
 
-            if (projection.bus?.bus_type === 'double' && projection.passenger?.seats?.[0]) {
-                const sNum = Number(projection.passenger.seats[0]);
-                const floorText = sNum <= 20 ? '1 ЭТАЖ' : '2 ЭТАЖ';
-                doc.fillColor('#7c3aed').font(fontBold).fontSize(9).text(`Расположение: ${floorText}`, col2X + 12, y + 104);
+            if (floorDisplay) {
+                doc.rect(col2X + 14, y + 108, 80, 22).fill('#f3e8ff');
+                doc.fillColor('#7c3aed').font(fontBold).fontSize(9).text(floorDisplay, col2X + 22, y + 114);
             }
 
-            y += 155;
+            y += 160;
 
-            // --- CARRIER & SUPPORT SECTION ---
+            // --- CARRIER & ESCORT SECTION ---
             doc.rect(36, y, 523, 65).fill(lightBg).strokeColor(borderBg).lineWidth(1).stroke();
 
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ПЕРЕВОЗЧИК И ПОДДЕРЖКА', 50, y + 10);
-            const carrierName = projection.carrier?.name || 'Официальный перевозчик POPUTKI.ONLINE';
-            doc.fillColor(darkText).font(fontBold).fontSize(11).text(carrierName, 50, y + 24);
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('ПЕРЕВОЗЧИК И СОПРОВОЖДЕНИЕ', 52, y + 10);
+            doc.fillColor(darkText).font(fontBold).fontSize(11).text(carrierName, 52, y + 24);
 
-            if (projection.support?.name) {
-                const suppContact = `Сопровождающий: ${projection.support.name}` + (projection.support.phone ? ` (${projection.support.phone})` : '');
-                doc.fillColor(grayText).font(fontReg).fontSize(9).text(suppContact, 50, y + 42);
+            if (escortName) {
+                const suppContact = `Сопровождающий на рейсе: ${escortName}` + (escortPhone ? ` (${escortPhone})` : '');
+                doc.fillColor(grayText).font(fontReg).fontSize(9).text(suppContact, 52, y + 44);
             } else {
-                doc.fillColor(grayText).font(fontReg).fontSize(8).text('Поддержка POPUTKI.ONLINE: www.poputki.online', 50, y + 42);
+                doc.fillColor(grayText).font(fontReg).fontSize(8.5).text('Служба поддержки POPUTKI.ONLINE: www.poputki.online', 52, y + 44);
             }
 
-            y += 80;
+            y += 78;
 
             // --- FINANCIAL BREAKDOWN & PAYMENT STATUS ---
-            doc.rect(36, y, 523, 50).fill('#f1f5f9').strokeColor(borderBg).lineWidth(1).stroke();
+            doc.rect(36, y, 523, 54).fill('#f1f5f9').strokeColor(borderBg).lineWidth(1).stroke();
 
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('СТОИМОСТЬ ПОЕЗДКИ', 50, y + 10);
-            doc.fillColor(darkText).font(fontBold).fontSize(12).text(`${projection.pricing?.totalPrice || 0} сомони`, 50, y + 26);
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('СТОИМОСТЬ БИЛЕТА', 52, y + 10);
+            doc.fillColor(darkText).font(fontBold).fontSize(13).text(`${totalPrice} сомони`, 52, y + 26);
 
-            const isManual = projection.isManual;
-            const paidOnline = projection.pricing?.paidOnline || 0;
-            const remaining = projection.pricing?.remainingToCarrier || 0;
-
-            doc.fillColor(grayText).font(fontReg).fontSize(9).text('СТАТУС ОПЛАТЫ', 300, y + 10);
+            doc.fillColor(grayText).font(fontReg).fontSize(9).text('СТАТУС И ДЕТАЛИ ОПЛАТЫ', 290, y + 10);
             if (isManual) {
-                doc.fillColor('#d97706').font(fontBold).fontSize(11).text(`К оплате водителю: ${remaining} сомони`, 300, y + 26);
+                doc.fillColor('#d97706').font(fontBold).fontSize(11).text(`Оплата на месте водителю: ${remainingAmount} сом.`, 290, y + 26);
             } else {
-                doc.fillColor('#16a34a').font(fontBold).fontSize(11).text(`Оплачено онлайн: ${paidOnline} сом. (К оплате на месте: ${remaining} сом.)`, 300, y + 26);
+                doc.fillColor('#16a34a').font(fontBold).fontSize(11).text(`Оплачено онлайн: ${paidAmount} сом. (Водителю: ${remainingAmount} сом.)`, 290, y + 26);
             }
 
-            y += 65;
+            y += 68;
 
             // --- SECURE QR VERIFICATION BOX ---
             const qrBoxY = y;
             doc.rect(36, qrBoxY, 523, 150).fill('#ffffff').strokeColor(primaryColor).lineWidth(1.5).stroke();
 
             // Embed QR Image (Left side of box)
-            doc.image(qrBuffer, 50, qrBoxY + 10, { width: 130, height: 130 });
+            doc.image(qrBuffer, 52, qrBoxY + 10, { width: 130, height: 130 });
 
             // Verification Description (Right side of box)
-            const qrTextX = 200;
-            doc.fillColor(primaryColor).font(fontBold).fontSize(12).text('ПРОВЕРИТЬ ПОДЛИННОСТЬ БИЛЕТА', qrTextX, qrBoxY + 18);
+            const qrTextX = 198;
+            doc.fillColor(primaryColor).font(fontBold).fontSize(12).text('ПРОВЕРИТЬ ПОДЛИННОСТЬ БИЛЕТА', qrTextX, qrBoxY + 16);
             
             doc.fillColor(darkText).font(fontReg).fontSize(9).text(
-                'Данный билет защищен цифровой подписью POPUTKI.ONLINE.\n' +
-                'Водитель или контролер может отсканировать QR-код кассовым сканером\n' +
-                'или камерой смартфона для моментальной проверки статуса бронирования.',
-                qrTextX, qrBoxY + 38, { width: 340, lineGap: 3 }
+                'Данный электронный билет защищен цифровой подписью POPUTKI.ONLINE.\n' +
+                'Водитель или контролер может отсканировать QR-код камерой смартфона\n' +
+                'для моментального подтверждения статуса и права на посадку.',
+                qrTextX, qrBoxY + 36, { width: 340, lineGap: 3 }
             );
 
             doc.fillColor(grayText).font(fontReg).fontSize(8).text(
-                `Ссылка верификации:\n${verificationUrl}`,
-                qrTextX, qrBoxY + 95, { width: 340, lineGap: 2 }
+                `Прямая ссылка верификации:\n${verificationUrl}`,
+                qrTextX, qrBoxY + 96, { width: 340, lineGap: 2 }
             );
 
             // --- FOOTER SECURITY DISCLAIMER ---
             const footerY = 770;
             doc.moveTo(36, footerY).lineTo(559, footerY).strokeColor(borderBg).lineWidth(1).stroke();
             doc.fillColor(grayText).font(fontReg).fontSize(7.5).text(
-                'POPUTKI.ONLINE — Автоматизированная система бронирования межгородских поездок. Билет действителен при предъявлении документа, удостоверяющего личность.',
+                'POPUTKI.ONLINE — Официальный сервис межгородских маршрутных перевозок. Настоящий документ является действительным электронным билетом.',
                 36, footerY + 8, { align: 'center', width: 523 }
             );
 
