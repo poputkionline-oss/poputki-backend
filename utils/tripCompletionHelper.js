@@ -36,6 +36,24 @@ const BUSINESS_TIME_ZONE = 'Asia/Dushanbe';
 const AUTO_COMPLETE_GRACE_MS = 12 * 60 * 60 * 1000; // arrival + 12 hours
 
 /**
+ * Phase E.47.6 — Auto-Complete V1 release watermark.
+ *
+ * Trips created BEFORE this instant predate automatic trip completion and
+ * must NEVER be auto-completed, even if they already satisfy arrival+12h.
+ * They remain fully available for MANUAL completion ("Завершить рейс");
+ * only the automatic sweep is gated by this watermark.
+ *
+ * Derived from a production audit (E.47.6, 2026-09-03): the last pre-Fleet
+ * trip was created 2026-08-06T17:31:56Z; the first Fleet-linked trip (#73,
+ * the first trip to carry a real bus_id and participate in the QR boarding
+ * workflow) was created 2026-08-29T10:20:00Z. This UTC boundary sits safely
+ * inside that ~3-week gap, so it does not depend on any single trip's exact
+ * creation instant and generalizes to all future trips via their immutable
+ * bus_tickets.created_at — no new DB column required.
+ */
+const AUTO_COMPLETE_WATERMARK_AT = new Date('2026-08-15T00:00:00.000Z');
+
+/**
  * Converts a "wall clock" date/time pair, interpreted in the given IANA
  * timezone, into the correct UTC Date instant. Handles fixed and
  * DST-observing zones alike via a single-pass offset resolution (safe for
@@ -102,9 +120,30 @@ function getTripArrivalInstant(trip) {
 }
 
 /**
+ * Determines whether a trip belongs to the post-watermark population, i.e.
+ * whether it was created on/after AUTO_COMPLETE_WATERMARK_AT and is
+ * therefore in scope for AUTOMATIC completion at all. A trip with no
+ * created_at (should not happen for real rows, but defensively) is treated
+ * as legacy/out-of-scope rather than eligible.
+ *
+ * @param {Object} trip - must have created_at (bus_tickets.created_at)
+ * @returns {boolean}
+ */
+function isPostWatermarkTrip(trip) {
+    if (!trip || !trip.created_at) return false;
+    const createdAt = trip.created_at instanceof Date ? trip.created_at : new Date(trip.created_at);
+    if (Number.isNaN(createdAt.getTime())) return false;
+    return createdAt.getTime() >= AUTO_COMPLETE_WATERMARK_AT.getTime();
+}
+
+/**
  * Determines whether a trip is eligible for AUTOMATIC completion.
- * Rule: status === 'active' AND arrival is a valid date/time AND
- * now >= arrival + 12 hours.
+ * Rule: status === 'active' AND trip is post-watermark (Phase E.47.6 —
+ * created on/after Auto-Complete V1 activation) AND arrival is a valid
+ * date/time AND now >= arrival + 12 hours.
+ *
+ * Legacy (pre-watermark) trips are NEVER auto-completed, no matter how far
+ * past arrival+12h they are — they remain manual-completion only.
  *
  * @param {Object} trip
  * @param {Date} [now]
@@ -112,6 +151,7 @@ function getTripArrivalInstant(trip) {
  */
 function isTripEligibleForAutoComplete(trip, now = new Date()) {
     if (!trip || trip.status !== 'active') return false;
+    if (!isPostWatermarkTrip(trip)) return false;
     const arrival = getTripArrivalInstant(trip);
     if (!arrival) return false;
     const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
@@ -224,7 +264,7 @@ async function sweepAutoCompleteTrips(options = {}) {
 
     const { data: activeTrips, error: fetchErr } = await db
         .from('bus_tickets')
-        .select('id, operator_id, status, from_city, to_city, arrival_date, arrival_time')
+        .select('id, operator_id, status, from_city, to_city, arrival_date, arrival_time, created_at')
         .eq('status', 'active');
 
     if (fetchErr) {
@@ -284,8 +324,10 @@ async function sweepAutoCompleteTrips(options = {}) {
 module.exports = {
     BUSINESS_TIME_ZONE,
     AUTO_COMPLETE_GRACE_MS,
+    AUTO_COMPLETE_WATERMARK_AT,
     zonedTimeToUtcDate,
     getTripArrivalInstant,
+    isPostWatermarkTrip,
     isTripEligibleForAutoComplete,
     completeTrip,
     sweepAutoCompleteTrips

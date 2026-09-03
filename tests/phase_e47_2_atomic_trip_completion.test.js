@@ -157,11 +157,14 @@ function makeMockSupabase(mockDb) {
 function freshMockDb() {
     return {
         bus_tickets: [
-            { id: 720, operator_id: 301, status: 'active', from_city: 'Душанбе', to_city: 'Канибадам' },
-            { id: 710, operator_id: 301, status: 'active', from_city: 'A', to_city: 'B', arrival_date: '2020-01-01', arrival_time: '00:00:00' }, // long past -> eligible
-            { id: 711, operator_id: 301, status: 'active', from_city: 'A', to_city: 'B', ...(() => { const f = formatInBusinessTz(new Date(Date.now() - 3600 * 1000)); return { arrival_date: f.date, arrival_time: f.time }; })() }, // arrived 1h ago -> not yet 12h
-            { id: 712, operator_id: 301, status: 'active', from_city: 'A', to_city: 'B', arrival_date: null, arrival_time: null }, // missing arrival
-            { id: 801, operator_id: 401, status: 'active', from_city: 'Москва', to_city: 'Душанбе' } // different carrier
+            // All fixture trips are created well after the E.47.6 watermark
+            // (2026-08-15T00:00:00Z) — this suite tests general eligibility
+            // behavior, not legacy protection (see phase_e47_6_watermark.test.js).
+            { id: 720, operator_id: 301, status: 'active', from_city: 'Душанбе', to_city: 'Канибадам', created_at: '2026-09-01T00:00:00.000Z' },
+            { id: 710, operator_id: 301, status: 'active', from_city: 'A', to_city: 'B', created_at: '2026-09-01T00:00:00.000Z', arrival_date: '2020-01-01', arrival_time: '00:00:00' }, // long past -> eligible
+            { id: 711, operator_id: 301, status: 'active', from_city: 'A', to_city: 'B', created_at: '2026-09-01T00:00:00.000Z', ...(() => { const f = formatInBusinessTz(new Date(Date.now() - 3600 * 1000)); return { arrival_date: f.date, arrival_time: f.time }; })() }, // arrived 1h ago -> not yet 12h
+            { id: 712, operator_id: 301, status: 'active', from_city: 'A', to_city: 'B', created_at: '2026-09-01T00:00:00.000Z', arrival_date: null, arrival_time: null }, // missing arrival
+            { id: 801, operator_id: 401, status: 'active', from_city: 'Москва', to_city: 'Душанбе', created_at: '2026-09-01T00:00:00.000Z' } // different carrier
         ],
         bus_ticket_bookings: [
             { id: 9001, bus_ticket_id: 701, status: 'confirmed', boarding_status: 'pending_boarding', total_price: 700, commission_amount: 70, carrier_amount: 630 },
@@ -378,7 +381,9 @@ describe('Phase E.47.2 — Auto-complete eligibility & Asia/Dushanbe timezone', 
     });
 
     it('arrival + 12h boundary is respected', () => {
-        const trip = { status: 'active', arrival_date: '2026-09-01', arrival_time: '13:00:00' };
+        // created_at must be post-watermark (Phase E.47.6) for this trip to be
+        // in scope for auto-completion at all — see phase_e47_6_watermark.test.js.
+        const trip = { status: 'active', created_at: '2026-09-01T00:00:00.000Z', arrival_date: '2026-09-01', arrival_time: '13:00:00' };
         const arrival = getTripArrivalInstant(trip);
         const justBefore = new Date(arrival.getTime() + 12 * 3600 * 1000 - 1000);
         const justAfter = new Date(arrival.getTime() + 12 * 3600 * 1000 + 1000);
