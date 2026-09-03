@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { verifyAndMigrateDurable, hashPassword } = require('../utils/passwordSecurity');
 const { resolveCarrierRole } = require('../utils/carrierAuth');
+const { issueUserToken } = require('../utils/userAuth');
 
 
 // Professional Telegram initData verification & server-side user extraction
@@ -161,9 +162,10 @@ router.post('/login', async (req, res) => {
 
             console.log('[Auth/Login] New user created with ID:', newUser.id);
             newUser.isNew = true;
+            const token = issueUserToken(newUser);
             return res.json({
                 user: newUser,
-                token: 'mock-token-' + newUser.id
+                token
             });
         }
 
@@ -171,6 +173,7 @@ router.post('/login', async (req, res) => {
         if (!user.password) {
             console.log('[Auth/Login] User exists but no password. Profile complete:', user.name && user.age);
             const isNew = !user.name || !user.age || user.age <= 0;
+            const token = issueUserToken(user);
             return res.json({
                 user: {
                     id: user.id,
@@ -181,7 +184,7 @@ router.post('/login', async (req, res) => {
                     role: user.role,
                     isNew: isNew
                 },
-                token: 'mock-token-' + user.id
+                token
             });
         }
 
@@ -198,7 +201,8 @@ router.post('/login', async (req, res) => {
         const sanitizedUser = { ...user };
         delete sanitizedUser.password;
         sanitizedUser.isNew = !sanitizedUser.phone || !sanitizedUser.age || !sanitizedUser.name || sanitizedUser.age <= 0;
-        return res.json({ user: sanitizedUser, token: 'mock-token-' + user.id });
+        const token = issueUserToken(user);
+        return res.json({ user: sanitizedUser, token });
     } catch (err) {
         console.error('[Auth/Login] Catch error:', err);
         res.status(500).json({ error: 'Ошибка входа: ' + err.message });
@@ -302,10 +306,11 @@ router.post('/register-mobile', async (req, res) => {
         const sanitizedUser = { ...user };
         delete sanitizedUser.password;
 
+        const token = issueUserToken(user);
         res.json({ 
             success: true,
             user: sanitizedUser,
-            token: 'mock-token-' + user.id 
+            token
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -656,7 +661,8 @@ router.post('/telegram-login', async (req, res) => {
         user.isNew = !user.name;
 
         console.log('[Auth/Telegram] Login successful for user:', user.id);
-        res.json({ user, token: 'mock-token-' + user.id });
+        const token = issueUserToken(user);
+        res.json({ user, token });
     } catch (err) {
         console.error("[Auth/Telegram] Login error:", err);
         res.status(500).json({ error: 'Ошибка Telegram входа: ' + err.message });
@@ -761,24 +767,7 @@ router.post('/telegram-miniapp', async (req, res) => {
             user = newUser;
         }
 
-        const jwtSecret = process.env.JWT_SECRET;
-        let token = 'mock-token-' + user.id;
-        if (jwtSecret) {
-            token = jwt.sign(
-                {
-                    sub: String(user.id),
-                    role: user.role || 'passenger',
-                    phone: user.phone || null
-                },
-                jwtSecret,
-                {
-                    algorithm: 'HS256',
-                    expiresIn: '30d',
-                    issuer: 'poputki.online',
-                    audience: 'poputki-passenger'
-                }
-            );
-        }
+        const token = issueUserToken(user);
 
         const sanitizedUser = { ...user };
         delete sanitizedUser.password;
