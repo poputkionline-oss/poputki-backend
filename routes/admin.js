@@ -985,6 +985,12 @@ router.post('/trips/auto-complete', adminAuth, async (req, res) => {
  * mutation-free for both tasks, since both underlying helpers already skip
  * their mutating branch entirely (only a read-only SELECT runs) when
  * dryRun is true.
+ *
+ * Phase E.47.8.1 — Authorization: this route is exempt from the global
+ * x-mana-man check (index.js) because that header is not confidential (it
+ * ships in the public frontend/mobile clients) and must never be treated as
+ * meaningful auth. The real, server-side-only authorization boundary here
+ * is adminAuth below (X-Admin-Token / ADMIN_SECRET_TOKEN).
  */
 router.post('/maintenance/tick', adminAuth, async (req, res) => {
     try {
