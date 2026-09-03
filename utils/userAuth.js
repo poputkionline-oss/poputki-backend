@@ -1,7 +1,7 @@
 /**
  * utils/userAuth.js
  *
- * Phase E.48.3: Canonical Passenger JWT Authentication Foundation
+ * Phase E.48.3 & E.48.4: Canonical Passenger JWT Authentication Foundation
  *
  * Implements canonical token issuance, verification, and Express middleware
  * for passengers and ordinary users:
@@ -145,10 +145,59 @@ function userAuth(req, res, next) {
     }
 }
 
+/**
+ * Optional Express middleware for public endpoints that enhance projection
+ * when an authenticated owner is present (e.g. GET /api/users/:id/profile).
+ *
+ * If a Bearer token is supplied, it is validated. If valid, req.user is set.
+ * If token is missing, invalid, or expired, req.user remains null without returning 401.
+ */
+function optionalUserAuth(req, res, next) {
+    try {
+        const authHeader = req.headers['authorization'];
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            req.user = null;
+            return next();
+        }
+
+        const token = authHeader.substring(7).trim();
+        const jwtSecret = process.env.JWT_SECRET;
+        if (!token || !jwtSecret || token.startsWith('mock-token-')) {
+            req.user = null;
+            return next();
+        }
+
+        try {
+            const decoded = jwt.verify(token, jwtSecret, {
+                algorithms: ['HS256'],
+                issuer: JWT_ISSUER,
+                audience: PASSENGER_AUDIENCE
+            });
+            const userId = parseInt(decoded.sub, 10);
+            if (userId && !isNaN(userId) && userId > 0) {
+                req.user = {
+                    id: userId,
+                    sub: String(decoded.sub)
+                };
+            } else {
+                req.user = null;
+            }
+        } catch {
+            req.user = null;
+        }
+
+        next();
+    } catch {
+        req.user = null;
+        next();
+    }
+}
+
 module.exports = {
     issueUserToken,
     verifyUserToken,
     userAuth,
+    optionalUserAuth,
     JWT_ISSUER,
     PASSENGER_AUDIENCE,
     PASSENGER_TOKEN_EXPIRES_IN
