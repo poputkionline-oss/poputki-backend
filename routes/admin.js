@@ -4,6 +4,7 @@ const supabase = require('../db');
 const { hashPassword } = require('../utils/passwordSecurity');
 const { expirePendingPaymentBookings } = require('../utils/paymentExpirationHelper');
 const { sweepAutoCompleteTrips } = require('../utils/tripCompletionHelper');
+const { runMaintenanceTick } = require('../utils/maintenanceHelper');
 
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE;
 const ADMIN_SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN;
@@ -967,6 +968,32 @@ router.post('/trips/auto-complete', adminAuth, async (req, res) => {
     } catch (err) {
         console.error('[Admin Auto-Complete Trips] Error:', err);
         res.status(500).json({ error: err.message || 'Ошибка автоматического завершения рейсов' });
+    }
+});
+
+/**
+ * POST /api/admin/maintenance/tick
+ *
+ * Phase E.47.7.2 — Unified maintenance entry point, intended as the single
+ * endpoint an external scheduler calls going forward. Runs both periodic
+ * maintenance tasks (expire-pending, auto-complete) via their existing
+ * canonical helpers, with per-task failure isolation: a failure in one task
+ * never prevents the other from running. The two legacy single-task
+ * endpoints above are kept for backward compatibility / manual diagnostics.
+ *
+ * Supports ?dry_run=true (or {"dry_run": true} body) — provably
+ * mutation-free for both tasks, since both underlying helpers already skip
+ * their mutating branch entirely (only a read-only SELECT runs) when
+ * dryRun is true.
+ */
+router.post('/maintenance/tick', adminAuth, async (req, res) => {
+    try {
+        const dryRun = req.query.dry_run === 'true' || req.body?.dry_run === true;
+        const result = await runMaintenanceTick({ dryRun });
+        res.json(result);
+    } catch (err) {
+        console.error('[Admin Maintenance Tick] Error:', err);
+        res.status(500).json({ success: false, error: err.message || 'Ошибка планового обслуживания' });
     }
 });
 
