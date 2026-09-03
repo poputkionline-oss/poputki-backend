@@ -3,6 +3,9 @@ const router = express.Router();
 const supabase = require('../db');
 const { sendPersonalMessage } = require('../utils/telegramBot');
 const { isSeatLockedByBooking, DEFAULT_HOLD_TTL_SECONDS } = require('../utils/paymentExpirationHelper');
+const { optionalUserAuth } = require('../utils/userAuth');
+const { normalizePhone } = require('../utils/phoneHelper');
+const { checkIpRateLimit } = require('../utils/paymentRateLimiter');
 
 const SMARTPAY_API_KEY = process.env.SMARTPAY_API_KEY;
 const SMARTPAY_BASE_URL = 'https://ecomm.smartpay.tj/api/merchant';
@@ -111,28 +114,79 @@ async function processSuccessfulPayment(booking) {
  * POST /api/payments/create-invoice
  * Creates a booking with pending_payment status and a SmartPay invoice
  */
-router.post('/create-invoice', async (req, res) => {
-    const { bus_ticket_id, passenger_id, seat_numbers, passengers_data, phone, pickup_city, drop_off_city } = req.body;
-
-    // Verify user
-    const { data: userExists, error: userError } = await supabase
-        .from('users')
-        .select('id')
-        .eq('id', passenger_id)
-        .maybeSingle();
-
-    if (userError || !userExists) {
-        return res.status(401).json({ error: 'Пользователь не найден' });
+router.post('/create-invoice', optionalUserAuth, async (req, res) => {
+    // 1. IP Rate Limiting
+    const clientIp = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    if (!checkIpRateLimit(clientIp)) {
+        return res.status(429).json({ error: 'Слишком много запросов на оплату. Пожалуйста, подождите минуту.' });
     }
-    if (!seat_numbers || !seat_numbers.length) {
-        return res.status(400).json({ error: 'Seat numbers required' });
+
+    const { bus_ticket_id, seat_numbers, passengers_data, phone, pickup_city, drop_off_city } = req.body;
+    let requestedPassengerId = req.body.passenger_id ? parseInt(req.body.passenger_id, 10) : null;
+
+    if (!bus_ticket_id || !seat_numbers || !seat_numbers.length || !phone) {
+        return res.status(400).json({ error: 'Не все обязательные поля заполнены' });
     }
     if (!passengers_data || !passengers_data.length) {
         return res.status(400).json({ error: 'Passenger data required' });
     }
 
+    // 2. Derive Passenger Identity & Enforce Ownership
+    let effectivePassengerId = null;
+
+    if (req.user && req.user.id) {
+        // Authenticated Passenger Flow
+        effectivePassengerId = req.user.id;
+        if (requestedPassengerId && requestedPassengerId !== req.user.id) {
+            return res.status(403).json({ error: 'Доступ запрещен: нельзя оформлять билет на чужой профиль' });
+        }
+    } else {
+        // Guest / Unauthenticated Passenger Flow
+        if (!requestedPassengerId) {
+            return res.status(401).json({ error: 'Укажите идентификатор пассажира или авторизуйтесь' });
+        }
+
+        const { data: userExists, error: userError } = await supabase
+            .from('users')
+            .select('id, phone, role')
+            .eq('id', requestedPassengerId)
+            .maybeSingle();
+
+        if (userError || !userExists) {
+            return res.status(401).json({ error: 'Пользователь не найден' });
+        }
+
+        // Guest callers can never impersonate carrier or admin accounts
+        if (userExists.role === 'carrier' || userExists.role === 'admin' || userExists.role === 'bus_driver') {
+            return res.status(403).json({ error: 'Доступ запрещен для данной роли пользователя' });
+        }
+
+        // Guest verification: If user has a registered phone, booking contact phone must match
+        if (userExists.phone && phone) {
+            const normUserPhone = normalizePhone(userExists.phone);
+            const normReqPhone = normalizePhone(phone);
+            if (normUserPhone && normReqPhone && normUserPhone !== normReqPhone) {
+                return res.status(403).json({ error: 'Контактный номер не совпадает с номером в профиле' });
+            }
+        }
+
+        effectivePassengerId = userExists.id;
+    }
+
+    // 3. Active Holds Limit per Passenger (Anti-seat-locking abuse)
     try {
-        // Fetch ticket
+        const { data: activeUserHolds } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, hold_expires_at')
+            .eq('passenger_id', effectivePassengerId)
+            .eq('status', 'pending_payment')
+            .gt('hold_expires_at', new Date().toISOString());
+
+        if (activeUserHolds && activeUserHolds.length >= 3) {
+            return res.status(429).json({ error: 'Превышен лимит активных неоплаченных бронирований. Завершите оплату существующих заказов.' });
+        }
+
+        // 4. Fetch Ticket
         const { data: ticket, error: ticketError } = await supabase
             .from('bus_tickets')
             .select('*')
@@ -140,6 +194,9 @@ router.post('/create-invoice', async (req, res) => {
             .single();
 
         if (ticketError || !ticket) return res.status(404).json({ error: 'Ticket not found' });
+        if (ticket.status !== 'active') {
+            return res.status(400).json({ error: 'Рейс недоступен для бронирования' });
+        }
 
         // Fetch operator's service fee percent (defaults to 10 if not set)
         let feePercent = 10;
@@ -154,13 +211,36 @@ router.post('/create-invoice', async (req, res) => {
             }
         }
 
-        // Check seat availability against active seat locks (confirmed OR active pending hold)
+        // 5. Existing Bookings: Check Idempotency & Seat Availability
         const { data: existingBookings } = await supabase
             .from('bus_ticket_bookings')
-            .select('seat_numbers, status, created_at, hold_expires_at')
+            .select('id, passenger_id, seat_numbers, status, created_at, hold_expires_at, payment_order_id, payment_link')
             .eq('bus_ticket_id', bus_ticket_id)
             .neq('status', 'cancelled');
 
+        const now = new Date();
+
+        // Idempotency: Reuse active pending booking for the exact same ticket, passenger, and seats
+        const existingPending = (existingBookings || []).find(b => {
+            if (b.status !== 'pending_payment') return false;
+            if (b.passenger_id !== effectivePassengerId) return false;
+            if (!b.payment_link) return false;
+            if (b.hold_expires_at && new Date(b.hold_expires_at) <= now) return false;
+            const bSeats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+            if (bSeats.length !== seat_numbers.length) return false;
+            return seat_numbers.every(s => bSeats.includes(s));
+        });
+
+        if (existingPending) {
+            return res.json({
+                booking_id: existingPending.id,
+                payment_link: existingPending.payment_link,
+                order_id: existingPending.payment_order_id,
+                reused: true
+            });
+        }
+
+        // Check seat conflicts with any active locked seats
         const takenSeats = [];
         (existingBookings || []).forEach(b => {
             if (isSeatLockedByBooking(b)) {
@@ -172,7 +252,7 @@ router.post('/create-invoice', async (req, res) => {
         const conflict = seat_numbers.some(s => takenSeats.includes(s));
         if (conflict) return res.status(400).json({ error: 'Одно или несколько мест уже заняты' });
 
-        // Calculate price
+        // 6. Calculate Price strictly server-side (ignoring any client amount)
         const premiumSeatNums = ticket.bus_type === 'double' ? [1, 2, 3, 4, 69, 70, 71, 72, 73, 74, 75, 76] : [];
         const premiumPrice = ticket.premium_price || ticket.price;
         let totalPrice = 0;
@@ -187,11 +267,7 @@ router.post('/create-invoice', async (req, res) => {
         } = req.body;
 
         // Generate unique order_id
-        const paymentOrderId = `bus_${bus_ticket_id}_${passenger_id}_${Date.now()}`;
-
-        if (!bus_ticket_id || !passenger_id || !seat_numbers || !phone) {
-            return res.status(400).json({ error: 'Не все обязательные поля заполнены' });
-        }
+        const paymentOrderId = `bus_${bus_ticket_id}_${effectivePassengerId}_${Date.now()}`;
 
         // Validate and sanitize attribution parameters
         const validChannels = ['web', 'telegram', 'manual'];
@@ -205,7 +281,6 @@ router.post('/create-invoice', async (req, res) => {
         if (finalSourceType === 'carrier_link' && finalSourceId) {
             const claimedCarrierId = parseInt(finalSourceId, 10);
             if (!claimedCarrierId || ticket.operator_id !== claimedCarrierId) {
-                // False attribution prevention: Reset to direct if carrier ID does not match ticket owner
                 finalSourceType = 'direct';
                 finalSourceId = null;
             }
@@ -218,7 +293,7 @@ router.post('/create-invoice', async (req, res) => {
             .from('bus_ticket_bookings')
             .insert([{
                 bus_ticket_id,
-                passenger_id,
+                passenger_id: effectivePassengerId,
                 seat_numbers,
                 passenger_count: seat_numbers.length,
                 passengers_data,
@@ -236,7 +311,6 @@ router.post('/create-invoice', async (req, res) => {
             }])
             .select('id')
             .single();
-
 
         if (insertError) throw insertError;
 
