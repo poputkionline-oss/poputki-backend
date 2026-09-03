@@ -255,21 +255,41 @@ describe('Phase E.48.5 — Carpool Rides & Bookings Authorization', () => {
             assert.equal(result.statusCode, 401);
         });
 
-        it('[E48.5-19] fallback to TELEGRAM_BOT_TOKEN works if BOT_SERVICE_TOKEN is not explicitly configured', () => {
+        it('[E48.5.1-19] TELEGRAM_BOT_TOKEN is rejected as X-Bot-Service-Token (no fallback)', () => {
             const savedServiceToken = process.env.BOT_SERVICE_TOKEN;
             const savedBotToken = process.env.TELEGRAM_BOT_TOKEN;
             try {
-                delete process.env.BOT_SERVICE_TOKEN;
-                process.env.TELEGRAM_BOT_TOKEN = 'telegram-fallback-bot-token-secret';
+                process.env.BOT_SERVICE_TOKEN = TEST_BOT_SERVICE_TOKEN;
+                process.env.TELEGRAM_BOT_TOKEN = 'telegram-bot-api-token-value';
 
                 const { req } = createMockReqRes('POST', '/', {
-                    'x-bot-service-token': 'telegram-fallback-bot-token-secret'
+                    'x-bot-service-token': 'telegram-bot-api-token-value'
                 });
-                assert.equal(verifyBotServiceToken(req), true);
+                assert.equal(verifyBotServiceToken(req), false, 'TELEGRAM_BOT_TOKEN must be rejected as service credential');
             } finally {
                 process.env.BOT_SERVICE_TOKEN = savedServiceToken;
                 process.env.TELEGRAM_BOT_TOKEN = savedBotToken;
             }
+        });
+
+        it('[E48.5.1-20] verifyBotServiceToken fails closed when BOT_SERVICE_TOKEN is missing', () => {
+            const savedServiceToken = process.env.BOT_SERVICE_TOKEN;
+            try {
+                delete process.env.BOT_SERVICE_TOKEN;
+
+                const { req } = createMockReqRes('POST', '/', {
+                    'x-bot-service-token': TEST_BOT_SERVICE_TOKEN
+                });
+                assert.equal(verifyBotServiceToken(req), false, 'Must fail closed when BOT_SERVICE_TOKEN is unset');
+            } finally {
+                process.env.BOT_SERVICE_TOKEN = savedServiceToken;
+            }
+        });
+
+        it('[E48.5.1-21] utils/botAuth.js source contains NO reference or fallback to TELEGRAM_BOT_TOKEN or BOT_TOKEN', () => {
+            const source = fs.readFileSync(path.join(__dirname, '../utils/botAuth.js'), 'utf8');
+            assert.equal(source.includes('TELEGRAM_BOT_TOKEN'), false, 'utils/botAuth.js must not reference TELEGRAM_BOT_TOKEN');
+            assert.equal(source.includes('process.env.BOT_TOKEN'), false, 'utils/botAuth.js must not reference BOT_TOKEN');
         });
     });
 
