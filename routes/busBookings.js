@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../db');
 const { isSeatLockedByBooking } = require('../utils/paymentExpirationHelper');
 const { sendPersonalMessage } = require('../utils/telegramBot');
+const { userAuth } = require('../utils/userAuth');
 
 /**
  * @swagger
@@ -32,8 +33,9 @@ const { sendPersonalMessage } = require('../utils/telegramBot');
  *               phone:
  *                 type: string
  */
-router.post('/', async (req, res) => {
-    const { bus_ticket_id, passenger_id, seat_numbers, passengers_data, phone, pickup_city, drop_off_city } = req.body;
+router.post('/', userAuth, async (req, res) => {
+    const { bus_ticket_id, seat_numbers, passengers_data, phone, pickup_city, drop_off_city } = req.body;
+    const passenger_id = req.user.id;
 
     // Verify user exists to avoid foreign key violation (common after DB reset)
     const { data: userExists, error: userError } = await supabase

@@ -44,43 +44,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// Security Header Check Middleware
-//
-// Phase E.47.8.1: x-mana-man is NOT confidential — its value is already
-// shipped in the public frontend bundle, the Flutter mobile binary, and the
-// server-side bot, so it must never be treated as a meaningful
-// authorization boundary. It is left in place globally for now (broader
-// removal is tracked separately as E.48), but the maintenance scheduler
-// endpoint is carved out here: its real, server-side-only authorization is
-// X-Admin-Token / ADMIN_SECRET_TOKEN (enforced by adminAuth in
-// routes/admin.js), which this exemption does not touch or weaken.
-app.use((req, res, next) => {
-    // Skip security check for: CORS, Health, API Docs, and Phone Redirects
-    // /api/claims/bot/* endpoints are exempt: Telegram cannot send x-mana-man;
-    // they are individually secured by requireClaimBotSecret (X-Claim-Bot-Secret).
-    // POST /api/admin/maintenance/tick is exempt: it is a server-to-server
-    // scheduler endpoint authorized solely by adminAuth (X-Admin-Token);
-    // req.path (not req.url) is used so ?dry_run=true doesn't defeat the
-    // exact-path match, and the check is POST-only — no other method/route
-    // under /api/admin is exempted.
-    if (
-        req.method === 'OPTIONS' ||
-        req.url === '/health' ||
-        req.url.startsWith('/api-docs') ||
-        req.url.startsWith('/api/call/') ||
-        req.url.startsWith('/api/claims/bot/') ||
-        (req.method === 'POST' && req.path === '/api/admin/maintenance/tick')
-    ) {
-        return next();
-    }
 
-    const clientHeader = req.headers['x-mana-man'];
-    if (clientHeader !== 'nasa.2006') {
-        console.warn(`[SECURITY] 403 Forbidden - Missing or invalid header from ${req.ip} for ${req.url}`);
-        return res.status(403).json({ error: 'Forbidden' });
-    }
-    next();
-});
 
 app.get("/health", (req, res) => {
     res.status(200).send("ok");

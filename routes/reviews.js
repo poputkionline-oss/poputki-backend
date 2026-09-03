@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
+const { userAuth } = require('../utils/userAuth');
 
 /**
  * @swagger
@@ -26,8 +27,9 @@ const supabase = require('../db');
  *               comment:
  *                 type: string
  */
-router.post('/', async (req, res) => {
-    const { ride_id, reviewer_id, driver_id, rating, comment } = req.body;
+router.post('/', userAuth, async (req, res) => {
+    const { ride_id, driver_id, rating, comment } = req.body;
+    const reviewer_id = req.user.id;
     try {
         const { data: ride } = await supabase
             .from('rides')
