@@ -1,0 +1,44 @@
+name: Production Maintenance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    name: Run Maintenance Tick
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Execute Maintenance Tick
+        run: |
+          set -e
+          echo "Triggering production maintenance tick on Render..."
+
+          RESPONSE=$(curl --fail --silent --show-error \
+            --max-time 120 \
+            --retry 3 \
+            --retry-delay 10 \
+            --retry-all-errors \
+            -X POST "https://poputki-backend-9dv6.onrender.com/api/admin/maintenance/tick" \
+            -H "X-Admin-Token: ${{ secrets.ADMIN_SECRET_TOKEN }}")
+
+          echo "Response summary:"
+          echo "$RESPONSE" | jq .
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // empty')
+          EXPIRE_SUCCESS=$(echo "$RESPONSE" | jq -r '.tasks.expire_pending.success // empty')
+          AUTO_SUCCESS=$(echo "$RESPONSE" | jq -r '.tasks.auto_complete.success // empty')
+
+          if [ "$SUCCESS" != "true" ] || [ "$EXPIRE_SUCCESS" != "true" ] || [ "$AUTO_SUCCESS" != "true" ]; then
+            echo "::error::Maintenance tick reported failure: success=$SUCCESS, expire_pending=$EXPIRE_SUCCESS, auto_complete=$AUTO_SUCCESS"
+            exit 1
+          fi
+
+          echo "Production maintenance tick completed successfully."
