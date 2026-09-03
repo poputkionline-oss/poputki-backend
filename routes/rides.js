@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 const { sendBroadcast, sendPersonalMessage } = require('../utils/telegramBot');
+const { userAuth, optionalUserAuth, verifyUserToken } = require('../utils/userAuth');
+const { verifyBotServiceToken } = require('../utils/botAuth');
 
 /**
  * @swagger
@@ -80,9 +82,8 @@ const { sendBroadcast, sendPersonalMessage } = require('../utils/telegramBot');
  *                 $ref: '#/components/schemas/Ride'
  */
 
-router.get('/check-limit', async (req, res) => {
-    const { driver_id } = req.query;
-    if (!driver_id) return res.status(400).json({ error: 'Missing driver_id' });
+router.get('/check-limit', userAuth, async (req, res) => {
+    const driver_id = req.user.id;
     
     try {
         const { data: activeRides } = await supabase
@@ -162,7 +163,6 @@ router.get('/', async (req, res) => {
                 ...r,
                 driver_name: driverName,
                 driver_rating: r.driver_id === 694 ? 5.0 : userData.rating,
-                driver_phone: driverPhone,
                 time: r.time ? r.time.substring(0, 5) : r.time,
                 booked_seats: r.bookings ? r.bookings.length : 0
             };
@@ -190,9 +190,8 @@ router.get('/', async (req, res) => {
  *       200:
  *         description: List of rides
  */
-router.get('/my', async (req, res) => {
-    const { userId } = req.query;
-    if (!userId) return res.status(400).json({ error: 'userId required' });
+router.get('/my', userAuth, async (req, res) => {
+    const userId = req.user.id;
 
     try {
         // Query 1: Rides where user is driver
@@ -292,7 +291,7 @@ router.get('/my', async (req, res) => {
  *       404:
  *         description: Ride not found
  */
-router.get('/:id', async (req, res) => {
+router.get('/:id', optionalUserAuth, async (req, res) => {
     const id = req.params.id;
     try {
         const { data: rideRaw, error: rideError } = await supabase
@@ -326,11 +325,25 @@ router.get('/:id', async (req, res) => {
             }
         }
 
+        const currentUserId = req.user ? req.user.id : null;
+        const isDriver = currentUserId && currentUserId === rideRaw.driver_id;
+        const { data: bookingsRaw, error: bookingsError } = await supabase
+            .from('bookings')
+            .select(`
+                *,
+                users:passenger_id (name, age, phone)
+            `)
+            .eq('ride_id', id);
+
+        if (bookingsError) throw bookingsError;
+
+        const hasBooked = currentUserId && (bookingsRaw || []).some(b => b.passenger_id === currentUserId);
+
         const ride = {
             ...rideRaw,
             driver_name: driverName,
             driver_rating: rideRaw.driver_id === 694 ? 5.0 : userData.rating,
-            driver_phone: driverPhone,
+            driver_phone: (isDriver || hasBooked) ? driverPhone : undefined,
             driver_preferences: typeof userData.preferences === 'string' ? JSON.parse(userData.preferences || '[]') : (userData.preferences || []),
             time: rideRaw.time ? rideRaw.time.substring(0, 5) : rideRaw.time
         };
@@ -359,23 +372,13 @@ router.get('/:id', async (req, res) => {
             vehicle = vData;
         }
 
-        const { data: bookingsRaw, error: bookingsError } = await supabase
-            .from('bookings')
-            .select(`
-                *,
-                users:passenger_id (name, age, phone)
-            `)
-            .eq('ride_id', id);
-
-        if (bookingsError) throw bookingsError;
-
         const bookings = (bookingsRaw || []).map(b => {
             const pData = b.users || {};
             delete b.users;
             return {
                 ...b,
                 passenger_name: pData.name,
-                passenger_phone: pData.phone,
+                passenger_phone: isDriver ? pData.phone : undefined,
                 age: pData.age
             };
         });
@@ -405,8 +408,35 @@ router.get('/:id', async (req, res) => {
  *         description: Bad request
  */
 router.post('/', async (req, res) => {
-    const { driver_id, from_city, to_city, date, time, price, seats, description, is_passenger_entry, reserved_seats, allows_delivery, from_address, to_address, total_seats, row_prices, scraper_metadata } = req.body;
-    console.log(`[Ride Creation] Attempting to create ride for driver_id: ${driver_id}`);
+    let effectiveDriverId = null;
+    let isBot = false;
+
+    // 1. Telegram Bot Service Authentication
+    if (verifyBotServiceToken(req)) {
+        isBot = true;
+        effectiveDriverId = parseInt(req.body.driver_id, 10) || 694;
+    } else {
+        // 2. Normal Driver JWT Authentication
+        const authHeader = req.headers['authorization'];
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Необходима авторизация: отсутствует Bearer токен' });
+        }
+        try {
+            const token = authHeader.substring(7).trim();
+            const decoded = verifyUserToken(token);
+            effectiveDriverId = parseInt(decoded.sub, 10);
+        } catch (jwtErr) {
+            return res.status(401).json({ error: 'Недействительный или истекший токен авторизации' });
+        }
+    }
+
+    if (!effectiveDriverId || isNaN(effectiveDriverId)) {
+        return res.status(401).json({ error: 'Некорректный идентификатор водителя' });
+    }
+
+    const driver_id = effectiveDriverId;
+    const { from_city, to_city, date, time, price, seats, description, is_passenger_entry, reserved_seats, allows_delivery, from_address, to_address, total_seats, row_prices, scraper_metadata } = req.body;
+    console.log(`[Ride Creation] Attempting to create ride for driver_id: ${driver_id} (isBot: ${isBot})`);
 
     try {
         // Verify user exists to avoid foreign key violation (common after DB reset)
@@ -546,9 +576,9 @@ router.post('/', async (req, res) => {
  *               driver_id:
  *                 type: integer
  */
-router.post('/:id/complete', async (req, res) => {
+router.post('/:id/complete', userAuth, async (req, res) => {
     const { id } = req.params;
-    const { driver_id } = req.body;
+    const driver_id = req.user.id;
     try {
         const { data: ride } = await supabase
             .from('rides')
@@ -615,9 +645,9 @@ router.post('/:id/complete', async (req, res) => {
  *         schema:
  *           type: integer
  */
-router.post('/:id/cancel', async (req, res) => {
+router.post('/:id/cancel', userAuth, async (req, res) => {
     const { id } = req.params;
-    const { driver_id } = req.body;
+    const driver_id = req.user.id;
     try {
         const { data: ride } = await supabase
             .from('rides')
@@ -688,10 +718,39 @@ router.post('/:id/cancel', async (req, res) => {
  *         schema:
  *           type: integer
  */
-router.put('/:id', async (req, res) => {
+router.put('/:id', userAuth, async (req, res) => {
     const { id } = req.params;
-    const updates = req.body;
+    const { from_city, to_city, date, time, price, seats, description, allows_delivery, from_address, to_address, total_seats, row_prices } = req.body;
+
     try {
+        const { data: existingRide, error: findError } = await supabase
+            .from('rides')
+            .select('driver_id')
+            .eq('id', id)
+            .single();
+
+        if (findError || !existingRide) {
+            return res.status(404).json({ error: 'Поездка не найдена' });
+        }
+
+        if (existingRide.driver_id !== req.user.id) {
+            return res.status(403).json({ error: 'Доступ запрещен: нельзя редактировать чужую поездку' });
+        }
+
+        const updates = {};
+        if (from_city !== undefined) updates.from_city = from_city;
+        if (to_city !== undefined) updates.to_city = to_city;
+        if (date !== undefined) updates.date = date;
+        if (time !== undefined) updates.time = time;
+        if (price !== undefined) updates.price = price;
+        if (seats !== undefined) updates.seats = seats;
+        if (description !== undefined) updates.description = description;
+        if (allows_delivery !== undefined) updates.allows_delivery = allows_delivery;
+        if (from_address !== undefined) updates.from_address = from_address;
+        if (to_address !== undefined) updates.to_address = to_address;
+        if (total_seats !== undefined) updates.total_seats = total_seats;
+        if (row_prices !== undefined) updates.row_prices = row_prices;
+
         const { data: ride, error } = await supabase
             .from('rides')
             .update(updates)
@@ -727,7 +786,7 @@ router.put('/:id', async (req, res) => {
  *               driver_ride_id:
  *                 type: integer
  */
-router.post('/:id/share', async (req, res) => {
+router.post('/:id/share', userAuth, async (req, res) => {
     const passengerReqId = req.params.id;
     const { driver_ride_id } = req.body;
     try {
@@ -755,6 +814,10 @@ router.post('/:id/share', async (req, res) => {
         if (dError || !driverRide) {
             console.error('Share error (driverRide):', dError);
             return res.status(404).json({ error: 'Поездка водителя не найдена' });
+        }
+
+        if (driverRide.driver_id !== req.user.id) {
+            return res.status(403).json({ error: 'Доступ запрещен: вы можете предлагать только свою поездку' });
         }
 
         const dateStr = driverRide.date;
@@ -820,11 +883,9 @@ router.post('/:id/share', async (req, res) => {
  *               passenger_id:
  *                 type: integer
  */
-router.post('/:id/delivery-request', async (req, res) => {
+router.post('/:id/delivery-request', userAuth, async (req, res) => {
     const rideId = req.params.id;
-    const { passenger_id } = req.body;
-    
-    if (!passenger_id) return res.status(400).json({ error: 'ID пассажира обязателен' });
+    const passenger_id = req.user.id;
 
     try {
         const { data: ride, error: rideError } = await supabase

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 const { sendPersonalMessage, sendMessage } = require('../utils/telegramBot');
+const { userAuth } = require('../utils/userAuth');
 
 /**
  * @swagger
@@ -25,8 +26,9 @@ const { sendPersonalMessage, sendMessage } = require('../utils/telegramBot');
  *               passenger_gender:
  *                 type: string
  */
-router.post('/', async (req, res) => {
-    const { ride_id, passenger_id, seat_number, passenger_gender, seats } = req.body;
+router.post('/', userAuth, async (req, res) => {
+    const { ride_id, seat_number, passenger_gender, seats } = req.body;
+    const passenger_id = req.user.id;
 
     // Verify user exists to avoid foreign key violation
     const { data: userExists, error: userError } = await supabase
@@ -194,9 +196,8 @@ router.post('/bus', (req, res) => {
  *         schema:
  *           type: integer
  */
-router.post('/:id/cancel', async (req, res) => {
+router.post('/:id/cancel', userAuth, async (req, res) => {
     const { id } = req.params;
-    const { passenger_id } = req.body;
 
     try {
         const { data: booking, error } = await supabase
@@ -208,9 +209,15 @@ router.post('/:id/cancel', async (req, res) => {
             .eq('id', id)
             .single();
 
-        if (error) throw error;
-        if (!booking || booking.passenger_id !== passenger_id) {
-            return res.status(403).json({ error: 'Permission denied' });
+        if (error || !booking) {
+            return res.status(404).json({ error: 'Бронирование не найдено' });
+        }
+
+        const isPassenger = booking.passenger_id === req.user.id;
+        const isDriver = booking.rides && booking.rides.driver_id === req.user.id;
+
+        if (!isPassenger && !isDriver) {
+            return res.status(403).json({ error: 'Доступ запрещен: нельзя отменить чужое бронирование' });
         }
 
         const rideData = booking.rides;
