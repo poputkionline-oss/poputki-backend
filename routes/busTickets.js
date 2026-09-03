@@ -79,29 +79,79 @@ router.post('/', async (req, res) => {
         group_leader_name, group_leader_phone, group_leader_whatsapp
     } = req.body;
     try {
-        // Authenticate verified carrier context if Bearer token present
+        // -------------------------------------------------------------------
+        // Phase E.48.1: Secure Bus Trip Creation Authorization
+        //
+        // Eliminate unauthenticated body operator_id fallback:
+        // - Admin: Verified via X-Admin-Token === ADMIN_SECRET_TOKEN.
+        //   Admin may explicitly specify target operator_id in request body.
+        // - Carrier: Verified via Authorization: Bearer <JWT> (HS256,
+        //   issuer: poputki.online, audience: poputki-carrier).
+        //   Authoritative carrier ID is derived strictly SERVER-SIDE from
+        //   verified token (decoded.carrierId || decoded.sub). Any client-
+        //   supplied body operator_id / carrier_id is NEVER used to override
+        //   or cross-tenant to another carrier.
+        // - Unauthenticated / Invalid / Header-only: 401 Unauthorized. Zero mutation.
+        // -------------------------------------------------------------------
         let verifiedCarrierId = null;
         let verifiedRole = 'owner';
         let verifiedUserId = null;
-        const authHeader = req.headers['authorization'];
-        if (authHeader && authHeader.startsWith('Bearer ')) {
+        let effectiveOperatorId = null;
+        let isAdmin = false;
+
+        const adminTokenHeader = req.headers['x-admin-token'];
+        const adminSecret = process.env.ADMIN_SECRET_TOKEN;
+
+        if (adminTokenHeader !== undefined) {
+            // Admin auth attempt: must strictly match ADMIN_SECRET_TOKEN
+            if (!adminSecret || adminTokenHeader !== adminSecret) {
+                return res.status(401).json({ error: 'Unauthorized: Admin access required' });
+            }
+            isAdmin = true;
+            const parsedOpId = parseInt(operator_id || req.body?.carrier_id, 10);
+            if (!parsedOpId || isNaN(parsedOpId)) {
+                return res.status(400).json({ error: 'Не указан идентификатор перевозчика' });
+            }
+            effectiveOperatorId = parsedOpId;
+            verifiedCarrierId = parsedOpId;
+            verifiedRole = 'admin';
+            verifiedUserId = 1;
+        } else {
+            // Carrier JWT authentication
+            const authHeader = req.headers['authorization'];
+            if (!authHeader || !authHeader.startsWith('Bearer ')) {
+                return res.status(401).json({ error: 'Необходима авторизация перевозчика: отсутствует Bearer токен' });
+            }
+
+            const token = authHeader.substring(7).trim();
+            const jwtSecret = process.env.JWT_SECRET;
+            if (!jwtSecret) {
+                console.error('[BusTickets/Create] JWT_SECRET is not configured in environment!');
+                return res.status(500).json({ error: 'Внутренняя ошибка конфигурации безопасности сервера' });
+            }
+
+            let decoded;
             try {
-                const token = authHeader.split(' ')[1];
-                const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+                decoded = jwt.verify(token, jwtSecret, {
+                    algorithms: ['HS256'],
                     issuer: 'poputki.online',
                     audience: 'poputki-carrier'
                 });
-                verifiedCarrierId = parseInt(decoded.carrierId || decoded.sub, 10);
-                verifiedRole = decoded.role || 'owner';
-                verifiedUserId = parseInt(decoded.sub, 10);
-            } catch (e) {
-                // Ignore token decode error for unauthenticated/legacy fallback
+            } catch (jwtErr) {
+                return res.status(401).json({ error: 'Недействительный или истекший токен перевозчика' });
             }
-        }
 
-        const effectiveOperatorId = verifiedCarrierId || parseInt(operator_id, 10);
-        if (!effectiveOperatorId) {
-            return res.status(400).json({ error: 'Не указан идентификатор перевозчика' });
+            verifiedCarrierId = parseInt(decoded.carrierId || decoded.sub, 10);
+            if (!verifiedCarrierId || isNaN(verifiedCarrierId)) {
+                return res.status(401).json({ error: 'Некорректный идентификатор перевозчика в токене' });
+            }
+
+            verifiedRole = decoded.role || 'owner';
+            verifiedUserId = parseInt(decoded.sub, 10);
+
+            // Tenant isolation: authoritative operator ID comes strictly from verified token!
+            // Any client-supplied body.operator_id is ignored for authorization.
+            effectiveOperatorId = verifiedCarrierId;
         }
 
         // Check if operator is blocked
@@ -239,7 +289,7 @@ router.post('/', async (req, res) => {
             }
         });
 
-        res.json({ id: ticket.id, bus_id: effectiveBusId, ...req.body });
+        res.json({ ...req.body, id: ticket.id, bus_id: effectiveBusId, operator_id: effectiveOperatorId });
 
         // Telegram Notifications
         const dateStr = departure_date;
