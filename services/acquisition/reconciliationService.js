@@ -16,11 +16,26 @@
 
 'use strict';
 
+const os = require('os');
+const crypto = require('crypto');
 const { getServiceRoleClient } = require('../../dbServiceRole');
 const { enqueueOutboxEvent } = require('./outboxService');
 const { resolveCanonicalUserId } = require('../../utils/identityMergeHelper');
 
 const DEFAULT_WATERMARK_UTC = '2026-09-04T18:50:00.000Z';
+
+// Phase P.1G.3A: reconciliation acquires a lease-based distributed lock
+// before scanning, so an overlapping manual trigger can never run
+// concurrently with a scheduled pass (or another manual trigger). See
+// docs/migrations/20260904144755_reconciliation_maintenance_lock.sql for why
+// this is a row-lease upsert rather than a native pg_advisory_lock (RPC
+// calls here do not share a persistent session/connection).
+const RECONCILIATION_LOCK_KEY = 'reconciliation_lock';
+const RECONCILIATION_LEASE_SECONDS = 300;
+
+function makeLockHolderId() {
+    return `${os.hostname() || 'unknown'}:${process.pid}:${crypto.randomBytes(4).toString('hex')}`;
+}
 
 /**
  * Retrieves the controlled launch watermark timestamp from the database.
@@ -58,13 +73,58 @@ async function getReconciliationWatermark(dbClient = null) {
 
 /**
  * Executes a full reconciliation pass over operations created after the launch watermark.
+ * Lock-guarded: if another run already holds the reconciliation lock, this
+ * returns immediately with { skipped: true, reason: 'LOCK_HELD_BY_ANOTHER_RUN' }
+ * rather than scanning concurrently.
  *
  * @param {Object} [options]
  * @param {string} [options.overrideWatermark] Optional watermark for isolated testing
  * @param {Object} [options.dbClient] Optional DB client
+ * @param {boolean} [options.skipLock] Test-only: bypass lock acquisition entirely
  * @returns {Promise<Object>} Reconciliation summary
  */
-async function runReconciliationPass({ overrideWatermark = null, dbClient = null } = {}) {
+async function runReconciliationPass({ overrideWatermark = null, dbClient = null, skipLock = false } = {}) {
+    const db = dbClient || getServiceRoleClient();
+
+    if (!skipLock) {
+        const holder = makeLockHolderId();
+        const { data: acquired, error: lockErr } = await db.rpc('fn_try_acquire_maintenance_lock', {
+            p_lock_key: RECONCILIATION_LOCK_KEY,
+            p_holder: holder,
+            p_lease_seconds: RECONCILIATION_LEASE_SECONDS
+        });
+
+        if (lockErr) {
+            console.error('[Reconciliation] Lock acquisition RPC error:', lockErr.message);
+            return { skipped: true, reason: 'LOCK_RPC_ERROR', error: lockErr.message };
+        }
+
+        if (!acquired) {
+            return { skipped: true, reason: 'LOCK_HELD_BY_ANOTHER_RUN' };
+        }
+
+        try {
+            const result = await runReconciliationPassUnlocked({ overrideWatermark, dbClient: db });
+            return { skipped: false, ...result };
+        } finally {
+            await db.rpc('fn_release_maintenance_lock', {
+                p_lock_key: RECONCILIATION_LOCK_KEY,
+                p_holder: holder
+            }).catch((releaseErr) => {
+                console.warn('[Reconciliation] Lock release warning (will expire via lease):', releaseErr.message);
+            });
+        }
+    }
+
+    const result = await runReconciliationPassUnlocked({ overrideWatermark, dbClient: db });
+    return { skipped: false, ...result };
+}
+
+/**
+ * The actual scan/recover logic, run only while the reconciliation lock is held.
+ * @private
+ */
+async function runReconciliationPassUnlocked({ overrideWatermark = null, dbClient = null } = {}) {
     const db = dbClient || getServiceRoleClient();
     const watermarkInfo = overrideWatermark
         ? { watermark_utc: overrideWatermark, source: 'test_override' }

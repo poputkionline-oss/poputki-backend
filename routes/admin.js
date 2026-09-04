@@ -5,18 +5,18 @@ const { hashPassword } = require('../utils/passwordSecurity');
 const { expirePendingPaymentBookings } = require('../utils/paymentExpirationHelper');
 const { sweepAutoCompleteTrips } = require('../utils/tripCompletionHelper');
 const { runMaintenanceTick } = require('../utils/maintenanceHelper');
+const { runAcquisitionMaintenanceSweep } = require('../services/acquisition/maintenanceSweepService');
+const { requireAdminToken } = require('../utils/adminTokenAuth');
 
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE;
 const ADMIN_SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN;
 
-// Middleware to verify admin token
+// Middleware to verify admin token (Phase P.1G.3A: delegates to the shared
+// constant-time helper; kept as a named local function so Express route
+// introspection — router.stack.find(l => l.name === 'adminAuth') — still
+// resolves it by name).
 function adminAuth(req, res, next) {
-    const token = req.headers['x-admin-token'];
-    if (token === ADMIN_SECRET_TOKEN) {
-        next();
-    } else {
-        res.status(401).json({ error: 'Unauthorized: Admin access required' });
-    }
+    return requireAdminToken(req, res, next);
 }
 
 /**
@@ -1008,6 +1008,39 @@ router.post('/maintenance/tick', adminAuth, async (req, res) => {
     } catch (err) {
         console.error('[Admin Maintenance Tick] Error:', err);
         res.status(500).json({ success: false, error: err.message || 'Ошибка планового обслуживания' });
+    }
+});
+
+/**
+ * POST /api/admin/maintenance/acquisition-sweep
+ *
+ * Phase P.1G.3A — Scheduled acquisition-funnel reliability sweep. The P.1G.3
+ * recovery audit found that neither the outbox worker's dedicated retry
+ * sweep nor the reconciliation gap-recovery pass were ever automatically
+ * invoked in production (both only ran opportunistically, in-band, right
+ * after a fresh event was enqueued). This endpoint runs both explicitly, is
+ * intended to be called on a schedule by the same GitHub Actions workflow
+ * that already reliably drives /maintenance/tick (maintenance.yml), and
+ * shares that authorization model: adminAuth (X-Admin-Token /
+ * ADMIN_SECRET_TOKEN) — not the HMAC-signed /api/internal/acquisition/*
+ * path, which is reserved for genuine bot<->backend service calls. No new
+ * secret is required for this endpoint.
+ *
+ * Idempotent: outbox draining is protected by fn_claim_outbox_events'
+ * FOR UPDATE SKIP LOCKED leasing, and reconciliation is protected by its own
+ * lease-based distributed lock (services/acquisition/reconciliationService.js)
+ * — an overlapping trigger is reported as a graceful skip, never a race.
+ * Task isolation: a failure in outbox_sweep never prevents reconciliation
+ * from running, and vice versa. Response contains only aggregate counts —
+ * zero PII.
+ */
+router.post('/maintenance/acquisition-sweep', adminAuth, async (req, res) => {
+    try {
+        const result = await runAcquisitionMaintenanceSweep();
+        res.json(result);
+    } catch (err) {
+        console.error('[Admin Acquisition Sweep] Error:', err);
+        res.status(500).json({ success: false, error: err.message || 'Ошибка планового обслуживания воронки' });
     }
 });
 

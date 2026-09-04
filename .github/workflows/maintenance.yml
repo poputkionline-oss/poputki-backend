@@ -44,3 +44,35 @@ jobs:
           fi
 
           echo "Production maintenance tick completed successfully."
+
+      - name: Execute Acquisition Funnel Sweep (outbox drain + reconciliation)
+        run: |
+          set -e
+          echo "Triggering production acquisition-funnel maintenance sweep on Render..."
+
+          RESPONSE=$(curl --fail --silent --show-error \
+            --max-time 120 \
+            --retry 3 \
+            --retry-delay 10 \
+            --retry-all-errors \
+            -X POST "https://poputki-backend-9dv6.onrender.com/api/admin/maintenance/acquisition-sweep" \
+            -H "X-Admin-Token: ${{ secrets.ADMIN_SECRET_TOKEN }}")
+
+          echo "Response summary:"
+          echo "$RESPONSE" | jq .
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // empty')
+          OUTBOX_SUCCESS=$(echo "$RESPONSE" | jq -r '.tasks.outbox_sweep.success // empty')
+          RECON_SUCCESS=$(echo "$RESPONSE" | jq -r '.tasks.reconciliation.success // empty')
+          RECON_SKIPPED=$(echo "$RESPONSE" | jq -r '.tasks.reconciliation.skipped // false')
+
+          if [ "$SUCCESS" != "true" ] || [ "$OUTBOX_SUCCESS" != "true" ] || [ "$RECON_SUCCESS" != "true" ]; then
+            echo "::error::Acquisition sweep reported failure: success=$SUCCESS, outbox_sweep=$OUTBOX_SUCCESS, reconciliation=$RECON_SUCCESS"
+            exit 1
+          fi
+
+          if [ "$RECON_SKIPPED" = "true" ]; then
+            echo "Reconciliation was skipped this run (lock held by an overlapping run) — expected occasionally, not an error."
+          fi
+
+          echo "Production acquisition-funnel sweep completed successfully."

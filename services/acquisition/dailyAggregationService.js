@@ -11,6 +11,7 @@
 'use strict';
 
 const { getServiceRoleClient } = require('../../dbServiceRole');
+const { getReconciliationWatermark } = require('./reconciliationService');
 
 let lastSuccessfulAggregationAt = null;
 
@@ -43,24 +44,36 @@ async function aggregateDailyMetrics(param1 = null, param2 = {}) {
         dateStr = d.toISOString().slice(0, 10);
     }
 
-    const startIso = `${dateStr}T00:00:00.000Z`;
+    const dayStartIso = `${dateStr}T00:00:00.000Z`;
     const endIso = `${dateStr}T23:59:59.999Z`;
 
+    // Phase P.1G.3A: never aggregate pre-launch-watermark data into daily
+    // metrics / Admin Funnel API, even for the launch calendar day itself
+    // (which straddles the watermark instant). effectiveStartIso is the
+    // later of the day boundary and the watermark, so same-day pre-launch
+    // rows (including the known pre-launch smoke visitor/session/event) are
+    // excluded without needing to hardcode any specific ID.
+    const { watermark_utc: watermarkUtc } = await getReconciliationWatermark(db);
+    // Compare as Date instants, never as raw strings (P.1G.3A requirement).
+    const effectiveStartIso = watermarkUtc && new Date(watermarkUtc).getTime() > new Date(dayStartIso).getTime()
+        ? watermarkUtc
+        : dayStartIso;
+
     try {
-        // Fetch sessions for the target date
+        // Fetch sessions for the target date (post-watermark only)
         const { data: sessions, error: sessErr } = await db
             .from('acquisition_sessions')
             .select('anonymous_visitor_id, source_platform, source_medium, attribution_type, campaign_id, partner_id, content_code, placement_code')
-            .gte('started_at', startIso)
+            .gte('started_at', effectiveStartIso)
             .lte('started_at', endIso);
 
         if (sessErr) throw sessErr;
 
-        // Fetch events for the target date
+        // Fetch events for the target date (post-watermark only)
         const { data: events, error: evErr } = await db
             .from('acquisition_events')
             .select('event_name, campaign_id, partner_id, properties')
-            .gte('occurred_at', startIso)
+            .gte('occurred_at', effectiveStartIso)
             .lte('occurred_at', endIso);
 
         if (evErr) throw evErr;

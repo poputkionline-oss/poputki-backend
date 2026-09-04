@@ -14,27 +14,10 @@ const express = require('express');
 const router = express.Router();
 const { getServiceRoleClient } = require('../dbServiceRole');
 const { aggregateDailyMetrics, runRetentionCleanup, getLastSuccessfulAggregationAt } = require('../services/acquisition/dailyAggregationService');
+const { requireAdminToken } = require('../utils/adminTokenAuth');
 
-const ADMIN_SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN;
-
-/**
- * Admin authorization gatekeeper (fails closed).
- */
-function adminAuthGate(req, res, next) {
-    const token = req.headers['x-admin-token'];
-    if (!ADMIN_SECRET_TOKEN) {
-        console.error('[AdminFunnel] ADMIN_SECRET_TOKEN is not configured in environment!');
-        return res.status(500).json({ error: 'Internal server security configuration error' });
-    }
-
-    if (token === ADMIN_SECRET_TOKEN) {
-        return next();
-    }
-
-    return res.status(401).json({ error: 'Unauthorized: Platform admin access required' });
-}
-
-router.use(adminAuthGate);
+// Admin authorization gatekeeper (fails closed) — Phase P.1G.3A: shared constant-time helper.
+router.use(requireAdminToken);
 
 // -----------------------------------------------------------------------------
 // GET /api/admin/acquisition-funnel

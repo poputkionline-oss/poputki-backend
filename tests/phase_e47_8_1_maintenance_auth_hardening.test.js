@@ -3,21 +3,20 @@
  *
  * PHASE E.47.8.1 — Maintenance Auth Hardening / Remove Public Header Dependency
  *
- * x-mana-man is NOT confidential (its value ships in the public frontend
- * bundle, the Flutter mobile binary, and the server-side bot), so it must
- * never be treated as a meaningful authorization boundary. This suite
- * verifies that POST /api/admin/maintenance/tick no longer depends on it —
- * its real, server-side-only authorization is X-Admin-Token /
- * ADMIN_SECRET_TOKEN (adminAuth) — while every other route's existing
- * x-mana-man requirement is completely untouched.
+ * Originally verified a narrow exemption carving POST
+ * /api/admin/maintenance/tick out of a global x-mana-man header check.
+ * Superseded: a later commit ("security: remove legacy public header
+ * authorization") removed the x-mana-man middleware from index.js entirely
+ * (across backend, frontend, and mobile), confirmed via Phase P.1G.3's
+ * recovery audit — there is no global header check left to test an
+ * exemption against, so those tests were retired rather than kept passing
+ * against a mechanism that no longer exists. adminAuth (X-Admin-Token /
+ * ADMIN_SECRET_TOKEN) remains the endpoint's real authorization boundary,
+ * exercised directly in tests/phase_e47_7_2_maintenance_tick.test.js and
+ * tests/phase_e48_7_legacy_header_removal.test.js.
  *
- * Two layers of verification, matching the convention established in
- * tests/phase_e44_bot_claim_middleware.test.js:
- *  1. A hand-mirrored replica of index.js's global security middleware
- *     (pure function, no live server needed).
- *  2. A static source-inspection check on the real index.js, guarding
- *     against the mirror drifting from reality and directly confirming the
- *     exemption is scoped to exactly this one POST route, not /api/admin/*.
+ * What remains here: cross-cutting regression checks unrelated to the
+ * retired auth mechanism, kept as a general safety net for this area.
  */
 
 'use strict';
@@ -36,152 +35,6 @@ const {
 const { generateTicketVerificationToken } = require('../utils/ticketHelper');
 const { evaluateAutoClaimEligibility } = require('../utils/claimHelper');
 const { runMaintenanceTick } = require('../utils/maintenanceHelper');
-
-// ---------------------------------------------------------------------------
-// Mirror of index.js's global security middleware, updated for E.47.8.1.
-// req.path (query-string-free) vs req.url (may carry ?dry_run=true) are
-// modeled separately, exactly as Express provides them.
-// ---------------------------------------------------------------------------
-function runGlobalSecurityMiddleware(method, reqPath, headers = {}, fullUrl = null) {
-    const req = { method, path: reqPath, url: fullUrl || reqPath, headers };
-    let statusCode = null;
-    let responseBody = null;
-    let nextCalled = false;
-    const next = () => { nextCalled = true; };
-
-    if (
-        req.method === 'OPTIONS' ||
-        req.url === '/health' ||
-        req.url.startsWith('/api-docs') ||
-        req.url.startsWith('/api/call/') ||
-        req.url.startsWith('/api/claims/bot/') ||
-        (req.method === 'POST' && req.path === '/api/admin/maintenance/tick')
-    ) {
-        next();
-    } else {
-        const clientHeader = req.headers['x-mana-man'];
-        if (clientHeader !== 'nasa.2006') {
-            statusCode = 403;
-            responseBody = { error: 'Forbidden' };
-        } else {
-            next();
-        }
-    }
-
-    return { statusCode, responseBody, nextCalled };
-}
-
-// Mirror of routes/admin.js's adminAuth
-function runAdminAuth(headers = {}, configuredToken = 'test-admin-secret') {
-    const token = headers['x-admin-token'];
-    return token === configuredToken;
-}
-
-// Full pipeline a real request to POST /api/admin/maintenance/tick goes
-// through: global security middleware, then adminAuth.
-function runMaintenanceTickAuthPipeline(headers = {}) {
-    const security = runGlobalSecurityMiddleware('POST', '/api/admin/maintenance/tick', headers, '/api/admin/maintenance/tick?dry_run=true');
-    if (!security.nextCalled) {
-        return { blocked: true, blockedBy: 'x-mana-man', statusCode: security.statusCode };
-    }
-    if (!runAdminAuth(headers)) {
-        return { blocked: true, blockedBy: 'admin-auth', statusCode: 401 };
-    }
-    return { blocked: false, statusCode: 200 };
-}
-
-describe('Phase E.47.8.1 — maintenance/tick no longer requires x-mana-man', () => {
-    it('A. no x-mana-man, no admin token -> blocked', () => {
-        const r = runMaintenanceTickAuthPipeline({});
-        assert.strictEqual(r.blocked, true);
-        assert.strictEqual(r.blockedBy, 'admin-auth', 'must be blocked by the real auth boundary, not the public header');
-    });
-
-    it('B. no x-mana-man, wrong admin token -> blocked', () => {
-        const r = runMaintenanceTickAuthPipeline({ 'x-admin-token': 'wrong-token' });
-        assert.strictEqual(r.blocked, true);
-        assert.strictEqual(r.blockedBy, 'admin-auth');
-    });
-
-    it('C. no x-mana-man, valid admin token -> allowed (reaches handler)', () => {
-        const r = runMaintenanceTickAuthPipeline({ 'x-admin-token': 'test-admin-secret' });
-        assert.strictEqual(r.blocked, false);
-    });
-
-    it('D. x-mana-man alone (any value), no admin token -> blocked', () => {
-        // Deliberately NOT the real value — proves it's irrelevant to this
-        // route now: the global middleware skips the header check entirely
-        // for POST /api/admin/maintenance/tick before ever inspecting it.
-        const r = runMaintenanceTickAuthPipeline({ 'x-mana-man': 'placeholder-not-the-real-value' });
-        assert.strictEqual(r.blocked, true);
-        assert.strictEqual(r.blockedBy, 'admin-auth');
-    });
-
-    it('E. unrelated protected endpoint without x-mana-man -> still blocked by the global middleware', () => {
-        const r1 = runGlobalSecurityMiddleware('POST', '/api/admin/bookings/expire-pending', {}, '/api/admin/bookings/expire-pending');
-        assert.strictEqual(r1.nextCalled, false);
-        assert.strictEqual(r1.statusCode, 403);
-
-        const r2 = runGlobalSecurityMiddleware('POST', '/api/admin/trips/auto-complete', {}, '/api/admin/trips/auto-complete');
-        assert.strictEqual(r2.nextCalled, false);
-        assert.strictEqual(r2.statusCode, 403);
-
-        const r3 = runGlobalSecurityMiddleware('GET', '/api/cities', {}, '/api/cities');
-        assert.strictEqual(r3.nextCalled, false);
-        assert.strictEqual(r3.statusCode, 403);
-
-        const r4 = runGlobalSecurityMiddleware('DELETE', '/api/admin/purge', {}, '/api/admin/purge');
-        assert.strictEqual(r4.nextCalled, false, '/api/admin/* is NOT globally exempted, only the exact maintenance/tick POST route');
-        assert.strictEqual(r4.statusCode, 403);
-    });
-
-    it('F. existing /health exemption unchanged', () => {
-        const r = runGlobalSecurityMiddleware('GET', '/health', {}, '/health');
-        assert.strictEqual(r.nextCalled, true);
-        assert.strictEqual(r.statusCode, null);
-    });
-
-    it('G. existing OPTIONS behavior unchanged', () => {
-        const r = runGlobalSecurityMiddleware('OPTIONS', '/api/admin/maintenance/tick', {}, '/api/admin/maintenance/tick');
-        assert.strictEqual(r.nextCalled, true);
-        assert.strictEqual(r.statusCode, null);
-    });
-
-    it('GET to the maintenance/tick path is NOT exempted (only POST is)', () => {
-        const r = runGlobalSecurityMiddleware('GET', '/api/admin/maintenance/tick', {}, '/api/admin/maintenance/tick');
-        assert.strictEqual(r.nextCalled, false, 'GET must still require x-mana-man like any other route — only POST is carved out');
-        assert.strictEqual(r.statusCode, 403);
-    });
-
-    it('the ?dry_run=true query string does not defeat the exact-path exemption match', () => {
-        const r = runGlobalSecurityMiddleware('POST', '/api/admin/maintenance/tick', { 'x-admin-token': 'test-admin-secret' }, '/api/admin/maintenance/tick?dry_run=true');
-        assert.strictEqual(r.nextCalled, true);
-    });
-});
-
-describe('Phase E.47.8.1 — source parity: real index.js matches the mirror, exemption is narrow', () => {
-    const indexPath = path.resolve(__dirname, '../index.js');
-    const source = fs.readFileSync(indexPath, 'utf8');
-
-    it('index.js contains the exact narrow POST + path exemption', () => {
-        assert.ok(
-            source.includes("req.method === 'POST' && req.path === '/api/admin/maintenance/tick'"),
-            'the exemption must be scoped to exactly this method+path, not a prefix'
-        );
-    });
-
-    it('index.js does NOT exempt /api/admin/* broadly', () => {
-        assert.ok(!source.includes("req.url.startsWith('/api/admin')"), 'no broad /api/admin prefix exemption must exist');
-        assert.ok(!source.includes("req.path.startsWith('/api/admin')"), 'no broad /api/admin prefix exemption must exist');
-    });
-
-    it('the maintenance/tick route documents that x-mana-man is not a security boundary here', () => {
-        const adminRoutesPath = path.resolve(__dirname, '../routes/admin.js');
-        const adminSource = fs.readFileSync(adminRoutesPath, 'utf8');
-        assert.ok(adminSource.includes('exempt from the global\n * x-mana-man check'));
-        assert.ok(adminSource.includes("router.post('/maintenance/tick', adminAuth,"), 'adminAuth must still gate the route');
-    });
-});
 
 describe('Phase E.47.8.1 — cross-cutting regressions unaffected', () => {
     it('H. maintenance dry_run is still provably mutation-free (unrelated to the auth change)', async () => {

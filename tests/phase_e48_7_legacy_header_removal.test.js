@@ -149,8 +149,14 @@ describe('Phase E.48.7 — Legacy Header Removal & Real Authorization Verificati
         });
 
         it('[E48.7-17] x-mana-man alone cannot access admin operations', () => {
+            // Phase P.1G.3A: the token comparison moved into a shared,
+            // constant-time helper (utils/adminTokenAuth.js) used by both
+            // routes/admin.js and routes/adminAcquisitionFunnel.js — verify
+            // the real implementation instead of a literal `===` string.
+            const adminTokenAuthSource = fs.readFileSync(path.join(__dirname, '../utils/adminTokenAuth.js'), 'utf8');
+            assert.ok(adminTokenAuthSource.includes('crypto.timingSafeEqual'), 'admin token comparison must be constant-time');
             const adminSource = fs.readFileSync(path.join(__dirname, '../routes/admin.js'), 'utf8');
-            assert.ok(adminSource.includes("token === ADMIN_SECRET_TOKEN"));
+            assert.ok(adminSource.includes('requireAdminToken'), 'admin.js must delegate to the shared constant-time helper');
             const req = { headers: { 'x-mana-man': 'nasa.2006' } };
             let statusCode = null;
             const res = { status: (c) => { statusCode = c; return res; }, json: () => {} };
