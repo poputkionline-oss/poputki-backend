@@ -32,7 +32,15 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors({
     origin: '*',
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Token', 'x-mana-man']
+    allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Admin-Token',
+        'x-mana-man',
+        'x-visitor-id',
+        'X-Visitor-Id',
+        'x-internal-service-secret'
+    ]
 })); // Allow all origins
 
 app.use(express.json({ limit: '50mb' }));
@@ -161,6 +169,10 @@ const ridesRoutes = require('./routes/rides');
 const smartpayRoutes = require('./routes/smartpay');
 const ocrRoutes = require('./routes/ocr');
 const claimRoutes = require('./routes/claims');
+const acquisitionRoutes = require('./routes/acquisition');
+const consentRoutes = require('./routes/consents');
+const referralRoutes = require('./routes/referrals');
+const internalAcquisitionRoutes = require('./routes/internalAcquisition');
 
 // Use Routes
 app.use('/api/auth', authRoutes);
@@ -177,6 +189,13 @@ app.use('/api/rides', ridesRoutes);
 app.use('/api/payments', smartpayRoutes);
 app.use('/api/ocr', ocrRoutes);
 app.use('/api/claims', claimRoutes);
+
+// Phase P.1G.2: Acquisition, Funnel, Marketing Consents & Referrals
+app.use('/api/acquisition', acquisitionRoutes);
+app.use('/api/marketing-consents', consentRoutes);
+app.use('/api/referrals', referralRoutes);
+app.use('/api/internal/acquisition', internalAcquisitionRoutes);
+app.use('/', acquisitionRoutes); // For GET /l/:rawToken and GET /r/:rawCode redirect routes
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);

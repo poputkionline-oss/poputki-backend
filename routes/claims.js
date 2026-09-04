@@ -221,23 +221,117 @@ async function loadBotClaimSession(claimDb, sessionId) {
     return { success: true, session, booking };
 }
 
+/**
+ * @swagger
+ * /api/claims/track-open:
+ *   post:
+ *     summary: Track passenger opening the verified ticket view (LINK_OPENED journey event)
+ *     tags: [Claims]
+ */
+router.post('/track-open', claimRateLimiter(60, 60000), async (req, res) => {
+    try {
+        const { ticketToken, handoffId, preview } = req.body;
+
+        // 1. Carrier preview exclusion: never record journey event for preview
+        if (preview === 'carrier' || req.query.preview === 'carrier') {
+            return res.json({ success: true, ignored: 'CARRIER_PREVIEW' });
+        }
+        if (req.user && ['carrier', 'admin', 'dispatcher'].includes(req.user.role)) {
+            return res.json({ success: true, ignored: 'CARRIER_AUTH' });
+        }
+
+        // 2. Crawler & bot exclusion (WhatsApp/Telegram/Slack/Social scrapers)
+        const userAgent = String(req.headers['user-agent'] || '').toLowerCase();
+        const crawlerSignatures = [
+            'bot', 'crawler', 'spider', 'preview', 'facebookexternalhit',
+            'facebot', 'whatsapp', 'telegrambot', 'twitterbot', 'linkedinbot',
+            'vkshare', 'slackbot', 'yandexbot', 'googlebot', 'bingbot',
+            'baiduspider', 'duckduckbot', 'applebot'
+        ];
+        if (crawlerSignatures.some(sig => userAgent.includes(sig))) {
+            return res.json({ success: true, ignored: 'CRAWLER' });
+        }
+
+        if (!ticketToken) {
+            return res.status(400).json({ error: 'TICKET_TOKEN_REQUIRED' });
+        }
+
+        // 3. Cryptographic ticket token validation
+        const { verifyTicketToken, extractBookingIdFromToken } = require('../utils/ticketHelper');
+        const derivedBookingId = extractBookingIdFromToken(ticketToken);
+
+        if (!derivedBookingId || !verifyTicketToken(ticketToken, derivedBookingId)) {
+            return res.status(403).json({ error: 'INVALID_TICKET_TOKEN' });
+        }
+
+        // If client also supplied bookingId, verify strict equality
+        if (req.body.bookingId && Number(req.body.bookingId) !== Number(derivedBookingId)) {
+            return res.status(403).json({ error: 'BOOKING_ID_MISMATCH' });
+        }
+
+        const claimDb = getServiceRoleClient();
+        let verifiedChannel = null;
+
+        // 4. Validate handoffId binding if present
+        if (handoffId) {
+            const { data: handoffRow, error: hErr } = await claimDb
+                .from('booking_handoffs')
+                .select('id, booking_id, channel')
+                .eq('id', handoffId)
+                .maybeSingle();
+
+            if (hErr || !handoffRow || Number(handoffRow.booking_id) !== Number(derivedBookingId)) {
+                return res.status(400).json({ error: 'HANDOFF_BOOKING_MISMATCH' });
+            }
+
+            verifiedChannel = handoffRow.channel;
+        }
+
+        // 5. Record LINK_OPENED journey event
+        const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+        const eventRes = await recordJourneyEvent(derivedBookingId, {
+            eventType: JOURNEY_EVENT_TYPES.LINK_OPENED,
+            handoffId: handoffId || null,
+            channel: verifiedChannel || null,
+            actorType: 'passenger',
+            metadata: {} // zero PII: no IP, no raw user-agent
+        }, { supabaseClient: claimDb });
+
+        return res.json({
+            success: true,
+            isDuplicate: Boolean(eventRes?.isDuplicate),
+            eventId: eventRes?.event?.id || null
+        });
+    } catch (err) {
+        console.warn('[Claims] track-open failed:', err.message);
+        // Failure isolation: never break client display on analytics error
+        return res.json({ success: false, error: err.message });
+    }
+});
+
 router.post('/start-session', claimRateLimiter(15, 60000), async (req, res) => {
     try {
-        const { ticketVerificationToken, bookingId } = req.body;
+        const { ticketVerificationToken, bookingId, handoffId } = req.body;
 
-        if (!ticketVerificationToken || !bookingId) {
+        if (!ticketVerificationToken) {
             return res.status(400).json({ error: 'Параметры билета обязательны' });
         }
 
-        if (!verifyTicketToken(ticketVerificationToken, bookingId)) {
+        const { verifyTicketToken, extractBookingIdFromToken } = require('../utils/ticketHelper');
+        const derivedBookingId = extractBookingIdFromToken(ticketVerificationToken);
+        if (!derivedBookingId || !verifyTicketToken(ticketVerificationToken, derivedBookingId)) {
             return res.status(403).json({ error: 'Недействительный токен билета' });
+        }
+
+        if (bookingId && Number(bookingId) !== Number(derivedBookingId)) {
+            return res.status(403).json({ error: 'Идентификатор бронирования не совпадает с токеном' });
         }
 
         const claimDb = getServiceRoleClient();
         const { data: booking, error: bookErr } = await claimDb
             .from('bus_ticket_bookings')
             .select('*')
-            .eq('id', bookingId)
+            .eq('id', derivedBookingId)
             .single();
 
         if (bookErr || !booking) {
@@ -252,7 +346,34 @@ router.post('/start-session', claimRateLimiter(15, 60000), async (req, res) => {
             return res.status(400).json({ error: 'Билет уже подтвержден в Telegram', isClaimed: true });
         }
 
-        const session = await generateClaimSession(booking.id);
+        // Validate and correlate handoffId if provided
+        let verifiedHandoffId = null;
+        if (handoffId) {
+            const { data: handoffRow } = await claimDb
+                .from('booking_handoffs')
+                .select('id, booking_id')
+                .eq('id', handoffId)
+                .maybeSingle();
+
+            if (handoffRow && Number(handoffRow.booking_id) === Number(booking.id)) {
+                verifiedHandoffId = handoffRow.id;
+            }
+        }
+
+        const session = await generateClaimSession(booking.id, { handoffId: verifiedHandoffId });
+
+        // Phase P.1B Journey Logging: TELEGRAM_CTA_CLICKED
+        try {
+            const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+            await recordJourneyEvent(booking.id, {
+                eventType: JOURNEY_EVENT_TYPES.TELEGRAM_CTA_CLICKED,
+                actorType: 'passenger',
+                handoffId: verifiedHandoffId || null,
+                sessionId: session?.id || null
+            }, { supabaseClient: claimDb });
+        } catch (ctaErr) {
+            console.warn('[Claims] TELEGRAM_CTA_CLICKED logging failed:', ctaErr.message);
+        }
 
         res.json({
             success: true,
@@ -363,6 +484,56 @@ router.post('/bot/open', claimRateLimiter(20, 60000), requireClaimBotSecret, asy
             .eq('id', booking.bus_ticket_id)
             .maybeSingle();
 
+        // Phase P.1B Journey Logging: TELEGRAM_BOT_STARTED and PHONE_SHARE_REQUESTED
+        const correlatedHandoffId = sessionResult.session.handoff_id || null;
+        try {
+            const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+            await recordJourneyEvent(booking.id, {
+                eventType: JOURNEY_EVENT_TYPES.TELEGRAM_BOT_STARTED,
+                sessionId: sessionResult.session.id,
+                handoffId: correlatedHandoffId,
+                actorType: 'passenger',
+                actorId: telegramUser?.id ? String(telegramUser.id) : null
+            }, { supabaseClient: claimDb });
+
+            if (isAutoClaimed) {
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.PHONE_VERIFIED,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system'
+                }, { supabaseClient: claimDb });
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.CLAIM_COMPLETED,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system'
+                }, { supabaseClient: claimDb });
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.BOOKING_LINKED_TO_USER,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system'
+                }, { supabaseClient: claimDb });
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.ACTIVATION_COMPLETED,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system'
+                }, { supabaseClient: claimDb });
+            } else if (!isAlreadyOwned && booking.claim_status !== 'claimed') {
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.PHONE_SHARE_REQUESTED,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'bot',
+                    actorId: telegramUser?.id ? String(telegramUser.id) : null
+                }, { supabaseClient: claimDb });
+            }
+        } catch (journeyBotErr) {
+            console.warn('[Claims] Bot journey logging failed:', journeyBotErr.message);
+        }
+
         return res.json({
             success: true,
             sessionId: sessionResult.session.id,
@@ -434,6 +605,22 @@ router.post('/bot/verify-and-claim', claimRateLimiter(10, 60000), requireClaimBo
             platformUser = identityResult.user;
         }
 
+        // Phase P.1B Journey Logging: PHONE_SHARED
+        const correlatedHandoffId = sessionResult.session.handoff_id || null;
+        try {
+            const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+            await recordJourneyEvent(booking.id, {
+                eventType: JOURNEY_EVENT_TYPES.PHONE_SHARED,
+                sessionId: sessionResult.session.id,
+                handoffId: correlatedHandoffId,
+                actorType: 'passenger',
+                actorId: String(telegramSenderId),
+                phone: telegramContact?.phone_number || null
+            }, { supabaseClient: claimDb });
+        } catch (phoneLogErr) {
+            console.warn('[Claims] PHONE_SHARED logging failed:', phoneLogErr.message);
+        }
+
         const evaluation = evaluateAutoClaimEligibility(
             booking,
             platformUser,
@@ -448,6 +635,42 @@ router.post('/bot/verify-and-claim', claimRateLimiter(10, 60000), requireClaimBo
 
             if (!claimRes.success) {
                 return res.status(409).json({ error: claimRes.error, code: 'CLAIM_FAILED' });
+            }
+
+            // Phase P.1B Journey Logging: CLAIM_COMPLETED, ACTIVATION_COMPLETED
+            try {
+                const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.PHONE_VERIFIED,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system',
+                    actorId: String(platformUser.id),
+                    phone: telegramContact?.phone_number || null
+                }, { supabaseClient: claimDb });
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.CLAIM_COMPLETED,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system',
+                    actorId: String(platformUser.id)
+                }, { supabaseClient: claimDb });
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.BOOKING_LINKED_TO_USER,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system',
+                    actorId: String(platformUser.id)
+                }, { supabaseClient: claimDb });
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.ACTIVATION_COMPLETED,
+                    sessionId: sessionResult.session.id,
+                    handoffId: correlatedHandoffId,
+                    actorType: 'system',
+                    actorId: String(platformUser.id)
+                }, { supabaseClient: claimDb });
+            } catch (claimLogErr) {
+                console.warn('[Claims] Claim completion journey logging failed:', claimLogErr.message);
             }
 
             return res.json({
@@ -467,6 +690,30 @@ router.post('/bot/verify-and-claim', claimRateLimiter(10, 60000), requireClaimBo
 
         if (!reqRes.success) {
             return res.status(409).json({ error: reqRes.error, code: 'CLAIM_REQUEST_FAILED' });
+        }
+
+        // Phase P.1B Journey Logging: PHONE_MISMATCH & CLAIM_REQUEST_CREATED
+        try {
+            const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+            await recordJourneyEvent(booking.id, {
+                eventType: JOURNEY_EVENT_TYPES.PHONE_MISMATCH,
+                sessionId: sessionResult.session.id,
+                handoffId: correlatedHandoffId,
+                actorType: 'system',
+                actorId: String(platformUser.id),
+                phone: telegramContact?.phone_number || null,
+                metadata: { reason: evaluation.reason }
+            }, { supabaseClient: claimDb });
+            await recordJourneyEvent(booking.id, {
+                eventType: JOURNEY_EVENT_TYPES.CLAIM_REQUEST_CREATED,
+                sessionId: sessionResult.session.id,
+                handoffId: correlatedHandoffId,
+                actorType: 'system',
+                actorId: String(platformUser.id),
+                metadata: { requestId: reqRes.requestId, reason: evaluation.reason }
+            }, { supabaseClient: claimDb });
+        } catch (reqLogErr) {
+            console.warn('[Claims] Claim request journey logging failed:', reqLogErr.message);
         }
 
         return res.json({
@@ -621,6 +868,39 @@ router.post('/carrier/requests/:id/review', carrierAuth, async (req, res) => {
         if (!reviewRes.success) {
             const status = reviewRes.error === 'TENANT_UNAUTHORIZED' ? 403 : 400;
             return res.status(status).json({ error: reviewRes.error });
+        }
+
+        if (decision === 'approved') {
+            try {
+                const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+                const claimDb = getServiceRoleClient();
+                const { data: reqRow } = await claimDb
+                    .from('booking_claim_requests')
+                    .select('booking_id, requesting_user_id')
+                    .eq('id', req.params.id)
+                    .maybeSingle();
+
+                if (reqRow) {
+                    await recordJourneyEvent(reqRow.booking_id, {
+                        eventType: JOURNEY_EVENT_TYPES.CLAIM_COMPLETED,
+                        actorType: 'carrier',
+                        actorId: String(reviewerUserId),
+                        metadata: { decision: 'approved', requestId: req.params.id }
+                    }, { supabaseClient: claimDb });
+                    await recordJourneyEvent(reqRow.booking_id, {
+                        eventType: JOURNEY_EVENT_TYPES.BOOKING_LINKED_TO_USER,
+                        actorType: 'carrier',
+                        actorId: String(reqRow.requesting_user_id)
+                    }, { supabaseClient: claimDb });
+                    await recordJourneyEvent(reqRow.booking_id, {
+                        eventType: JOURNEY_EVENT_TYPES.ACTIVATION_COMPLETED,
+                        actorType: 'carrier',
+                        actorId: String(reqRow.requesting_user_id)
+                    }, { supabaseClient: claimDb });
+                }
+            } catch (revLogErr) {
+                console.warn('[Claims] Review approval journey logging failed:', revLogErr.message);
+            }
         }
 
         res.json({ success: true, status: reviewRes.status });

@@ -234,6 +234,17 @@ async function completeTrip({ tripId, actorContext = null, dbClient = null } = {
         }
     }
 
+    // Phase P.1G.2: Server Event Ingestion for TRIP_COMPLETED (Non-blocking)
+    if (data.already_completed === false && data.trip_id) {
+        try {
+            const { recordTripCompleted } = require('../services/acquisition/serverEventService');
+            recordTripCompleted({ tripId: data.trip_id, dbClient: db })
+                .catch(err => console.warn('[Acquisition] recordTripCompleted error:', err.message));
+        } catch (acqErr) {
+            console.warn('[Acquisition] recordTripCompleted dispatch error:', acqErr.message);
+        }
+    }
+
     return {
         success: true,
         already_completed: Boolean(data.already_completed),

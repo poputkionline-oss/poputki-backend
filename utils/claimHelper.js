@@ -55,14 +55,20 @@ async function generateClaimSession(booking, options = {}) {
     const tokenHash = hashSessionToken(rawToken);
     const expiresAt = new Date(Date.now() + ttl).toISOString();
 
+    const sessionPayload = {
+        booking_id: bookingId,
+        session_token_hash: tokenHash,
+        expires_at: expiresAt,
+        created_at: new Date().toISOString()
+    };
+
+    if (options.handoffId) {
+        sessionPayload.handoff_id = options.handoffId;
+    }
+
     const { data: session, error } = await dbClient
         .from('booking_claim_sessions')
-        .insert([{
-            booking_id: bookingId,
-            session_token_hash: tokenHash,
-            expires_at: expiresAt,
-            created_at: new Date().toISOString()
-        }])
+        .insert([sessionPayload])
         .select('*')
         .single();
 
@@ -74,9 +80,11 @@ async function generateClaimSession(booking, options = {}) {
     const deepLink = `https://t.me/${botUsername}?start=claim_${rawToken}`;
 
     return {
+        id: session.id,
         sessionToken: rawToken,
         expiresAt,
-        deepLink
+        deepLink,
+        handoffId: session.handoff_id || null
     };
 }
 

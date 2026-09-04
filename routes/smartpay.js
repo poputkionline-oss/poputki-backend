@@ -107,6 +107,20 @@ async function processSuccessfulPayment(booking) {
         }
     }
 
+    // Phase P.1G.2: Server Event Ingestion for PAYMENT_COMPLETED
+    try {
+        const { recordPaymentCompleted } = require('../services/acquisition/serverEventService');
+        const paymentOrderId = booking.smartpay_payment_id || booking.payment_order_id || booking.id;
+        const amount = Number(booking.paid_amount || booking.total_price || 0);
+        recordPaymentCompleted({
+            bookingId: booking.id,
+            paymentOrderId: String(paymentOrderId),
+            amount
+        }).catch(err => console.warn('[Acquisition] recordPaymentCompleted error:', err.message));
+    } catch (acqErr) {
+        console.warn('[Acquisition] recordPaymentCompleted dispatch error:', acqErr.message);
+    }
+
     return { status: 'confirmed', booking_id: booking.id };
 }
 

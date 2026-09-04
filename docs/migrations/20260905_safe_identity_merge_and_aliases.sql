@@ -304,11 +304,6 @@ BEGIN
     -- 9e. Reassign mutable foreign keys where appropriate and conflict-free
     -- Note: Append-only tables (booking_journey_events) are strictly NOT touched!
     
-    -- booking_claim_sessions
-    UPDATE public.booking_claim_sessions
-    SET target_user_id = p_canonical_user_id
-    WHERE target_user_id = p_source_user_id;
-
     -- booking_claim_requests
     UPDATE public.booking_claim_requests
     SET requesting_user_id = p_canonical_user_id

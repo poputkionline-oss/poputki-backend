@@ -73,7 +73,12 @@ function getServiceRoleClient() {
     return serviceRoleClient;
 }
 
+function setServiceRoleClient(client) {
+    serviceRoleClient = client;
+}
+
 module.exports = {
     getServiceRoleClient,
-    getServiceRoleDiagnostics
+    getServiceRoleDiagnostics,
+    setServiceRoleClient
 };

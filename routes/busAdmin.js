@@ -854,6 +854,51 @@ router.post('/bookings/manual', async (req, res) => {
             }
         });
 
+        // Phase P.1B Journey Logging: BOOKING_CREATED
+        try {
+            const { recordJourneyEvent, JOURNEY_EVENT_TYPES } = require('../utils/journeyHelper');
+            await recordJourneyEvent(booking.id, {
+                eventType: JOURNEY_EVENT_TYPES.BOOKING_CREATED,
+                actorType: 'carrier',
+                actorId: String(req.carrier.user_id),
+                phone: cleanPhone,
+                metadata: {
+                    channel: 'manual',
+                    passenger_count: (seat_numbers || []).length,
+                    contact_role: effectiveContactRole
+                }
+            }, { supabaseClient: supabase });
+
+            if (isAutoClaimed && registeredPassenger) {
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.PHONE_VERIFIED,
+                    actorType: 'system',
+                    phone: cleanPhone,
+                    metadata: { method: 'registered_passenger_auto_claim' }
+                }, { supabaseClient: supabase });
+
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.CLAIM_COMPLETED,
+                    actorType: 'system',
+                    actorId: String(registeredPassenger.id)
+                }, { supabaseClient: supabase });
+
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.BOOKING_LINKED_TO_USER,
+                    actorType: 'system',
+                    actorId: String(registeredPassenger.id)
+                }, { supabaseClient: supabase });
+
+                await recordJourneyEvent(booking.id, {
+                    eventType: JOURNEY_EVENT_TYPES.ACTIVATION_COMPLETED,
+                    actorType: 'system',
+                    actorId: String(registeredPassenger.id)
+                }, { supabaseClient: supabase });
+            }
+        } catch (journeyErr) {
+            console.error('[ManualBooking] Journey event logging failed:', journeyErr.message);
+        }
+
         // Phase D / E.7 Notification Planning & Server-Side Queue Hook (Non-blocking)
         if (process.env.NOTIFICATION_ROUTING_ENABLED === 'true') {
             try {
@@ -993,6 +1038,88 @@ router.post('/bookings/:bookingId/claim-link', async (req, res) => {
         console.error('[ClaimLink Regeneration] Error:', err);
         return res.status(500).json({ error: 'INTERNAL_ERROR', message: err.message });
     }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/bookings/{bookingId}/handoff:
+ *   post:
+ *     summary: Record a ticket share attempt (WhatsApp, SMS, Telegram, Copy Link) and create handoff
+ *     tags: [Bus Admin]
+ */
+router.post('/bookings/:bookingId/handoff', async (req, res) => {
+    const { bookingId } = req.params;
+    const numId = Number(bookingId);
+    if (!numId || isNaN(numId)) {
+        return res.status(400).json({ error: 'INVALID_BOOKING_ID', message: 'Некорректный ID бронирования' });
+    }
+
+    const { channel, phone, claimSessionId } = req.body;
+    if (!channel || !['whatsapp', 'sms', 'telegram', 'copy_link'].includes(channel)) {
+        return res.status(400).json({ error: 'INVALID_CHANNEL', message: 'Недопустимый канал передачи билета' });
+    }
+
+    try {
+        const { data: booking, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, bus_ticket_id, status, claim_status, claimed_by_user_id, contact_role, phone')
+            .eq('id', numId)
+            .single();
+
+        if (bErr || !booking) {
+            return res.status(404).json({ error: 'BOOKING_NOT_FOUND', message: 'Бронирование не найдено' });
+        }
+
+        const hasAccess = await verifyTicketAccess(req.carrier, booking.bus_ticket_id);
+        if (!hasAccess) {
+            return res.status(403).json({ error: 'FORBIDDEN', message: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+        }
+
+        const { createBookingHandoff } = require('../utils/journeyHelper');
+        const effectivePhone = phone || booking.phone;
+
+        const result = await createBookingHandoff(numId, {
+            channel,
+            claimSessionId: claimSessionId || null,
+            phone: effectivePhone,
+            initiatedByUserId: req.carrier.user_id,
+            metadata: {
+                contact_role: booking.contact_role
+            }
+        }, { supabaseClient: supabase });
+
+        const { generateTicketVerificationToken } = require('../utils/ticketHelper');
+        const verificationToken = generateTicketVerificationToken(numId);
+        const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}?h=${result.handoff.id}`;
+
+        return res.json({
+            success: true,
+            handoffId: result.handoff.id,
+            ticketUrl,
+            maskedRecipientPhone: result.handoff.recipient_phone_masked,
+            createdAt: result.handoff.created_at,
+            handoff: result.handoff
+        });
+    } catch (err) {
+        console.error('[Booking Handoff] Error:', err);
+        return res.status(500).json({ error: 'INTERNAL_ERROR', message: err.message });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/bookings/{bookingId}/journey:
+ *   get:
+ *     summary: Blocked for carrier — activation funnel is admin-only (Phase P.1F)
+ *     tags: [Bus Admin]
+ */
+router.get('/bookings/:bookingId/journey', (req, res) => {
+    return res.status(403).json({
+        success: false,
+        code: 'ACCESS_DENIED',
+        error: 'ACCESS_DENIED',
+        message: 'Аналитика воронки пассажиров доступна только в главной панели администратора'
+    });
 });
 
 /**

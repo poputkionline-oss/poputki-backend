@@ -43,6 +43,14 @@ router.post('/login', (req, res) => {
 // Protect all following routes
 router.use(adminAuth);
 
+// Phase P.1F: Admin-Only Passenger Activation Funnel Routes
+const passengerFunnelRouter = require('./adminPassengerFunnel');
+router.use('/passenger-funnel', passengerFunnelRouter);
+
+// Phase P.1G.2: Admin-Only Acquisition Funnel Routes
+const acquisitionFunnelRouter = require('./adminAcquisitionFunnel');
+router.use('/acquisition-funnel', acquisitionFunnelRouter);
+
 // Dashboard Stats
 router.get('/stats', async (req, res) => {
     try {

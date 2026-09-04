@@ -1,0 +1,22 @@
+{
+  "project_ref": "xzvtjcqwmuezxyeerkki",
+  "project_name": "poputki-online-prod",
+  "snapshot_timestamp": "2026-09-04T15:48:00+05:00",
+  "row_counts": {
+    "users": 249,
+    "bus_tickets": 29,
+    "bus_ticket_bookings": 157,
+    "booking_claim_sessions": 25
+  },
+  "types_verified": {
+    "users.id": "int4",
+    "bus_ticket_bookings.id": "int4",
+    "booking_claim_sessions.id": "uuid"
+  },
+  "tables_prior_state": {
+    "booking_handoffs": "DOES_NOT_EXIST",
+    "booking_journey_events": "DOES_NOT_EXIST",
+    "booking_claim_sessions.handoff_id": "DOES_NOT_EXIST",
+    "fn_create_booking_handoff": "DOES_NOT_EXIST"
+  }
+}

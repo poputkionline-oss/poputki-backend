@@ -471,7 +471,7 @@ describe('Phase E.47.2 — fn_complete_bus_trip migration file shape', () => {
         // Strip SQL line comments first — the function is deliberately
         // commented to explain what it does NOT touch, which would otherwise
         // false-positive a naive substring scan of the executable body.
-        const fnBody = rawBody.split('\n').map(line => line.replace(/--.*$/, '')).join('\n');
+        const fnBody = rawBody.split('\n').map(line => line.replace(/\r/g, '').replace(/--.*$/, '')).join('\n');
         const forbidden = ['total_price', 'commission_', 'carrier_amount', 'payment', 'verification_token', 'DELETE '];
         forbidden.forEach(term => {
             assert.ok(!fnBody.includes(term), `executable migration body must never reference ${term}`);

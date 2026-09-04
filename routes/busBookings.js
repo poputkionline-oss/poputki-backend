@@ -115,6 +115,22 @@ router.post('/', userAuth, async (req, res) => {
 
         res.json({ id: booking.id, status: 'confirmed', total_price: totalPrice });
 
+        // Phase P.1G.2: Server Event Ingestion for BOOKING_CREATED & REPEAT_BOOKING
+        try {
+            const { recordBookingCreated } = require('../services/acquisition/serverEventService');
+            const visitorId = req.headers['x-visitor-id'] || req.body.anonymous_visitor_id || null;
+            const sessionId = req.body.acquisition_session_id || null;
+            recordBookingCreated({
+                bookingId: booking.id,
+                passengerId: passenger_id,
+                busTicketId: bus_ticket_id,
+                visitorId,
+                sessionId
+            }).catch(err => console.warn('[Acquisition] recordBookingCreated error:', err.message));
+        } catch (acqErr) {
+            console.warn('[Acquisition] recordBookingCreated dispatch error:', acqErr.message);
+        }
+
         // Telegram Notifications
         const dateStr = ticket.departure_date;
         const timeStr = ticket.departure_time ? ticket.departure_time.substring(0, 5) : '';
