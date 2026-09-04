@@ -26,7 +26,11 @@
 'use strict';
 
 function matchesFilters(row, filters) {
-    return filters.every(([col, val]) => String(row[col]) === String(val));
+    return filters.every(([col, val, op]) => {
+        if (op === 'gte') return row[col] >= val;
+        if (op === 'lte') return row[col] <= val;
+        return String(row[col]) === String(val);
+    });
 }
 
 function createFakeSupabaseClient(tables = {}) {
@@ -38,10 +42,23 @@ function createFakeSupabaseClient(tables = {}) {
             const builder = {
                 select() { return builder; },
                 eq(col, val) {
-                    filters.push([col, val]);
+                    filters.push([col, val, 'eq']);
                     return builder;
                 },
+                gte(col, val) {
+                    filters.push([col, val, 'gte']);
+                    return builder;
+                },
+                lte(col, val) {
+                    filters.push([col, val, 'lte']);
+                    return builder;
+                },
+                order() { return builder; },
                 limit() { return builder; },
+                then(resolve, reject) {
+                    const matches = rows.filter(row => matchesFilters(row, filters));
+                    return Promise.resolve({ data: matches, error: null }).then(resolve, reject);
+                },
                 async maybeSingle() {
                     const matches = rows.filter(row => matchesFilters(row, filters));
                     if (matches.length === 0) return { data: null, error: null };
@@ -53,10 +70,7 @@ function createFakeSupabaseClient(tables = {}) {
                     if (matches.length === 0) return { data: null, error: new Error('fakeSupabaseClient: no rows matched') };
                     if (matches.length > 1) return { data: null, error: new Error(`fakeSupabaseClient: ${matches.length} rows matched, expected exactly 1`) };
                     return { data: matches[0], error: null };
-                },
-                // Chains that only ever reach maybeSingle()/single() in this
-                // codebase still need `then` absent — no promise-shaped
-                // resolution is used without one of those two terminators.
+                }
             };
 
             return builder;
