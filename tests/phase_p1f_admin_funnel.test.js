@@ -11,6 +11,21 @@ const http = require('node:http');
 const express = require('express');
 const jwt = require('jsonwebtoken');
 
+// [P1F-BE-01] sends a real carrier JWT through the real carrierAuth
+// middleware (mounted via routes/busAdmin.js's router.use(carrierAuth)),
+// which does a mandatory real-time DB lookup as part of its fail-closed
+// design. Deterministic, offline fake of the `users` table it depends on —
+// see tests/helpers/fakeSupabaseClient.js for why (this repo's test env has
+// no reachable Supabase project). Must be installed BEFORE routes/busAdmin
+// is required, since that module requires utils/carrierAuth at load time.
+const { createFakeSupabaseClient, installFakeDbModule } = require('./helpers/fakeSupabaseClient');
+installFakeDbModule(createFakeSupabaseClient({
+    users: [
+        { id: 11, name: 'Тестовый Водитель', phone: '+992900000011', role: 'bus_driver', is_blocked: false, service_fee_percent: 10 }
+    ],
+    carrier_members: []
+}));
+
 // Import routers
 const busAdminRouter = require('../routes/busAdmin');
 const adminRouter = require('../routes/admin');
