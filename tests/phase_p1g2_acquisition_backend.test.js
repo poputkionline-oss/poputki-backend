@@ -468,6 +468,26 @@ describe('PHASE P.1G.2 — PRODUCTION BACKEND ACQUISITION & ATTRIBUTION', () => 
         let port;
 
         before(async () => {
+            // A validly-signed HMAC request reaches recordPersistentNonce(),
+            // which needs a working service-role client — mock it so this
+            // suite never makes a real network call.
+            const nonceStore = new Set();
+            setServiceRoleClient({
+                rpc: async (fnName, params) => {
+                    if (fnName === 'fn_record_internal_service_nonce') {
+                        if (nonceStore.has(params.p_nonce)) return { data: false, error: null };
+                        nonceStore.add(params.p_nonce);
+                        return { data: true, error: null };
+                    }
+                    return { data: null, error: null };
+                },
+                from: () => ({
+                    select: () => ({ maybeSingle: async () => ({ data: null, error: null }) }),
+                    upsert: () => ({ select: () => ({ maybeSingle: async () => ({ data: null, error: null }) }) }),
+                    insert: async () => ({ data: null, error: null })
+                })
+            });
+
             const app = express();
             app.use(express.json());
             app.use('/api/internal/acquisition', internalAcquisitionRoutes);
@@ -477,6 +497,7 @@ describe('PHASE P.1G.2 — PRODUCTION BACKEND ACQUISITION & ATTRIBUTION', () => 
         });
 
         after(() => {
+            setServiceRoleClient(null);
             if (server) server.close();
         });
 
@@ -504,18 +525,46 @@ describe('PHASE P.1G.2 — PRODUCTION BACKEND ACQUISITION & ATTRIBUTION', () => 
         });
 
         it('requires raw_token for consume-telegram-session', async () => {
-            const res = await fetch(`http://127.0.0.1:${port}/api/internal/acquisition/consume-telegram-session`, {
+            // Phase P.1G.3A: the legacy static x-internal-service-secret bypass was
+            // removed — real requests must carry a valid HMAC signature to reach the
+            // route handler at all, so this test now signs the request for real.
+            const { computeSignature } = require('../utils/internalServiceAuth');
+            const path = '/api/internal/acquisition/consume-telegram-session';
+            const timestamp = Date.now().toString();
+            const nonce = crypto.randomBytes(16).toString('hex');
+            const body = {};
+            const signature = computeSignature({
+                method: 'POST', path, timestamp, nonce, body,
+                secret: process.env.INTERNAL_SERVICE_SECRET
+            });
+
+            const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-internal-timestamp': timestamp,
+                    'x-internal-nonce': nonce,
+                    'x-internal-signature': signature
+                },
+                body: JSON.stringify(body)
+            });
+
+            assert.strictEqual(res.status, 400);
+            const resBody = await res.json();
+            assert.strictEqual(resBody.error, 'RAW_TOKEN_REQUIRED');
+        });
+
+        it('legacy x-internal-service-secret header alone is REJECTED (Phase P.1G.3A: bypass removed)', async () => {
+            const res = await fetch(`http://127.0.0.1:${port}/api/internal/acquisition/bot-start`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     'x-internal-service-secret': 'super-secure-internal-secret-2026'
                 },
-                body: JSON.stringify({})
+                body: JSON.stringify({ telegram_user_id: 12345 })
             });
 
-            assert.strictEqual(res.status, 400);
-            const body = await res.json();
-            assert.strictEqual(body.error, 'RAW_TOKEN_REQUIRED');
+            assert.strictEqual(res.status, 401, 'a correct legacy secret with no HMAC signature must still be rejected');
         });
     });
 

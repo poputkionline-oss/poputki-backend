@@ -18,14 +18,18 @@ const REPLAY_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const memoryNonceCache = new Map(); // Fast L1 cache
 
 /**
- * Returns configured internal secret.
- * Priority: INTERNAL_SERVICE_SECRET -> CLAIM_BOT_SHARED_SECRET -> TELEGRAM_BOT_TOKEN
+ * Returns the configured internal service secret.
+ *
+ * Phase P.1G.3A: this is now the ONLY source — no silent fallback to
+ * CLAIM_BOT_SHARED_SECRET or TELEGRAM_BOT_TOKEN. Those are separate secrets
+ * for separate concerns (the pre-existing ticket-claim flow's
+ * X-Claim-Bot-Secret header, and the raw bot token respectively); reusing
+ * either here would mean a leak of one secret compromises both mechanisms,
+ * and would make "distinct secret" claims false. If INTERNAL_SERVICE_SECRET
+ * is not set, every internal-service call fails closed (500 below).
  */
 function getInternalSecret() {
-    return process.env.INTERNAL_SERVICE_SECRET ||
-           process.env.CLAIM_BOT_SHARED_SECRET ||
-           process.env.TELEGRAM_BOT_TOKEN ||
-           null;
+    return process.env.INTERNAL_SERVICE_SECRET || null;
 }
 
 /**
@@ -99,12 +103,18 @@ async function recordPersistentNonce(nonce, ttlSeconds = 300, dbClient = null) {
 }
 
 /**
- * Express middleware for verifying internal service HMAC signature and persistent replay protection.
+ * Express middleware for verifying internal service HMAC signature and
+ * persistent replay protection.
+ *
+ * Phase P.1G.3A: the legacy static `x-internal-service-secret` bypass
+ * (zero nonce, zero timestamp, fully replayable) has been removed. Only a
+ * valid HMAC-SHA256 signature + timestamp + nonce is accepted; anything
+ * else fails closed with 401.
  */
 async function internalServiceAuth(req, res, next) {
     const secret = getInternalSecret();
     if (!secret) {
-        console.error('[InternalServiceAuth] Internal service secret is not configured in environment!');
+        console.error('[InternalServiceAuth] INTERNAL_SERVICE_SECRET is not configured in environment!');
         return res.status(500).json({ error: 'INTERNAL_SECURITY_NOT_CONFIGURED' });
     }
 
@@ -112,68 +122,54 @@ async function internalServiceAuth(req, res, next) {
     const tsHeader = req.headers['x-internal-timestamp'];
     const nonceHeader = req.headers['x-internal-nonce'];
 
-    // 1. Check for HMAC Signature Authentication
-    if (sigHeader && tsHeader && nonceHeader) {
-        // Timestamp Freshness Check (5-minute window)
-        const timestamp = parseInt(tsHeader, 10);
-        if (isNaN(timestamp)) {
-            return res.status(401).json({ error: 'INVALID_TIMESTAMP' });
-        }
-
-        const now = Date.now();
-        if (Math.abs(now - timestamp) > REPLAY_WINDOW_MS) {
-            return res.status(401).json({ error: 'STALE_TIMESTAMP' });
-        }
-
-        // Cryptographic Nonce Validation (Persistent Check)
-        if (typeof nonceHeader !== 'string' || nonceHeader.length < 8) {
-            return res.status(401).json({ error: 'INVALID_NONCE' });
-        }
-
-        // Signature Verification
-        const normalizedPath = (req.originalUrl || req.url || '').split('?')[0];
-        const expectedSignature = computeSignature({
-            method: req.method,
-            path: normalizedPath,
-            timestamp: tsHeader,
-            nonce: nonceHeader,
-            body: req.body,
-            secret
+    if (!sigHeader || !tsHeader || !nonceHeader) {
+        return res.status(401).json({
+            error: 'UNAUTHORIZED_SIGNATURE_REQUIRED',
+            message: 'Valid internal HMAC signature, timestamp, and nonce are required'
         });
-
-        const sigBuf = Buffer.from(sigHeader);
-        const expectedBuf = Buffer.from(expectedSignature);
-
-        if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
-            return res.status(401).json({ error: 'INVALID_SIGNATURE' });
-        }
-
-        // Atomically record nonce in persistent PostgreSQL table to prevent replays across restarts
-        const isFreshNonce = await recordPersistentNonce(nonceHeader, 300);
-        if (!isFreshNonce) {
-            return res.status(401).json({ error: 'NONCE_REPLAY_DETECTED' });
-        }
-
-        return next();
     }
 
-    // 2. Legacy / compatibility header check (x-internal-service-secret)
-    const legacySecret = req.headers['x-internal-service-secret'];
-    if (legacySecret && typeof legacySecret === 'string') {
-        const expectedBuf = Buffer.from(secret);
-        const providedBuf = Buffer.from(legacySecret);
-
-        if (expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf)) {
-            return next();
-        }
-        return res.status(401).json({ error: 'UNAUTHORIZED_INVALID_SECRET' });
+    // Timestamp Freshness Check (5-minute window)
+    const timestamp = parseInt(tsHeader, 10);
+    if (isNaN(timestamp)) {
+        return res.status(401).json({ error: 'INVALID_TIMESTAMP' });
     }
 
-    // Neither valid signature nor valid legacy header provided: fail closed
-    return res.status(401).json({
-        error: 'UNAUTHORIZED_SIGNATURE_REQUIRED',
-        message: 'Valid internal HMAC signature or service secret required'
+    const now = Date.now();
+    if (Math.abs(now - timestamp) > REPLAY_WINDOW_MS) {
+        return res.status(401).json({ error: 'STALE_TIMESTAMP' });
+    }
+
+    // Cryptographic Nonce Validation (Persistent Check)
+    if (typeof nonceHeader !== 'string' || nonceHeader.length < 8) {
+        return res.status(401).json({ error: 'INVALID_NONCE' });
+    }
+
+    // Signature Verification
+    const normalizedPath = (req.originalUrl || req.url || '').split('?')[0];
+    const expectedSignature = computeSignature({
+        method: req.method,
+        path: normalizedPath,
+        timestamp: tsHeader,
+        nonce: nonceHeader,
+        body: req.body,
+        secret
     });
+
+    const sigBuf = Buffer.from(sigHeader);
+    const expectedBuf = Buffer.from(expectedSignature);
+
+    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+        return res.status(401).json({ error: 'INVALID_SIGNATURE' });
+    }
+
+    // Atomically record nonce in persistent PostgreSQL table to prevent replays across restarts
+    const isFreshNonce = await recordPersistentNonce(nonceHeader, 300);
+    if (!isFreshNonce) {
+        return res.status(401).json({ error: 'NONCE_REPLAY_DETECTED' });
+    }
+
+    return next();
 }
 
 /**

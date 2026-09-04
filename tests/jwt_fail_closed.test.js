@@ -1,4 +1,17 @@
 const jwt = require('jsonwebtoken');
+// Deterministic, offline fake of the `users` table this suite's real
+// carrierAuth DB lookup depends on — see tests/helpers/fakeSupabaseClient.js
+// for why (this repo's test env has no reachable Supabase project). Must be
+// installed BEFORE utils/carrierAuth is required, since that module binds
+// `require('../db')` once at load time. carrierAuth's own logic, including
+// every fail-closed check this file exercises, is completely untouched.
+const { createFakeSupabaseClient, installFakeDbModule } = require('./helpers/fakeSupabaseClient');
+installFakeDbModule(createFakeSupabaseClient({
+    users: [
+        { id: 11, name: 'Test Bus Driver', phone: '+992900000011', role: 'bus_driver', is_blocked: false, service_fee_percent: 10 }
+    ],
+    carrier_members: []
+}));
 const { carrierAuth, verifyTicketAccess } = require('../utils/carrierAuth');
 const supabase = require('../db');
 
