@@ -173,6 +173,7 @@ const acquisitionRoutes = require('./routes/acquisition');
 const consentRoutes = require('./routes/consents');
 const referralRoutes = require('./routes/referrals');
 const internalAcquisitionRoutes = require('./routes/internalAcquisition');
+const adminAcquisitionRoutes = require('./routes/adminAcquisitionFunnel');
 
 // Use Routes
 app.use('/api/auth', authRoutes);
@@ -183,6 +184,8 @@ app.use('/api/bookings', bookingsRoutes);
 app.use('/api/reviews', reviewsRoutes);
 app.use('/api/bus-tickets', busTicketsRoutes);
 app.use('/api/bus-ticket-bookings', busBookingsRoutes);
+app.use('/api/admin/acquisition-funnel', adminAcquisitionRoutes);
+app.use('/api/admin/acquisition', adminAcquisitionRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/rides', ridesRoutes);
