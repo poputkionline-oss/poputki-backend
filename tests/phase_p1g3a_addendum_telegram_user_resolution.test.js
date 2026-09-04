@@ -34,6 +34,8 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { createFakeSupabaseClient, installFakeDbModule } = require('./helpers/fakeSupabaseClient');
 
 installFakeDbModule(createFakeSupabaseClient({
@@ -42,6 +44,7 @@ installFakeDbModule(createFakeSupabaseClient({
 }));
 
 const { resolveUserIdFromTelegramId } = require('../routes/internalAcquisition');
+const SYSTEM_PLACEHOLDER_VISITOR_ID = '00000000-0000-0000-0000-000000000000';
 
 describe('Phase P.1G.3A ADDENDUM — resolveUserIdFromTelegramId()', () => {
     it('resolves to the real internal users.id when a matching users.telegram_id row exists', async () => {
@@ -82,5 +85,34 @@ describe('Phase P.1G.3A ADDENDUM — resolveUserIdFromTelegramId()', () => {
         };
         const result = await resolveUserIdFromTelegramId(386189312, db);
         assert.equal(result, null);
+    });
+});
+
+describe('Phase P.1G.3A ADDENDUM — system placeholder visitor (second FK, same production incident)', () => {
+    it('outboxService.js still substitutes the exact well-known placeholder UUID for a missing anonymous_visitor_id', () => {
+        const src = fs.readFileSync(path.resolve(__dirname, '../services/acquisition/outboxService.js'), 'utf8');
+        assert.ok(src.includes(`|| '${SYSTEM_PLACEHOLDER_VISITOR_ID}'`), 'the fallback literal must match the seeded placeholder row exactly');
+    });
+
+    it('a migration seeding that exact placeholder row into acquisition_visitors exists', () => {
+        const files = fs.readdirSync(path.resolve(__dirname, '../supabase/migrations'));
+        const match = files.find(f => f.includes('seed_system_placeholder_visitor'));
+        assert.ok(match, 'seed migration file must exist');
+        const sql = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations', match), 'utf8');
+        assert.ok(sql.includes(SYSTEM_PLACEHOLDER_VISITOR_ID));
+        assert.ok(sql.includes('acquisition_visitors'));
+        assert.ok(sql.includes('ON CONFLICT'), 'must be idempotent (safe to re-run)');
+        assert.ok(!/DELETE|UPDATE|TRUNCATE/i.test(sql), 'must only insert - never mutate or delete existing rows');
+    });
+
+    it('the docs/migrations mirror is byte-identical to the supabase/migrations file (repo convention)', () => {
+        const supaFiles = fs.readdirSync(path.resolve(__dirname, '../supabase/migrations'));
+        const docsFiles = fs.readdirSync(path.resolve(__dirname, '../docs/migrations'));
+        const supaMatch = supaFiles.find(f => f.includes('seed_system_placeholder_visitor'));
+        const docsMatch = docsFiles.find(f => f.includes('seed_system_placeholder_visitor'));
+        assert.ok(supaMatch && docsMatch);
+        const supaContent = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations', supaMatch), 'utf8');
+        const docsContent = fs.readFileSync(path.resolve(__dirname, '../docs/migrations', docsMatch), 'utf8');
+        assert.equal(supaContent, docsContent);
     });
 });
