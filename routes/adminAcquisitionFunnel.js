@@ -19,8 +19,98 @@ const { requireAdminToken } = require('../utils/adminTokenAuth');
 // Admin authorization gatekeeper (fails closed) — Phase P.1G.3A: shared constant-time helper.
 router.use(requireAdminToken);
 
+const reportingService = require('../services/acquisition/acquisitionReportingService');
+
 // -----------------------------------------------------------------------------
-// GET /api/admin/acquisition-funnel
+// GET /summary (and GET /funnel)
+// -----------------------------------------------------------------------------
+router.get('/summary', async (req, res) => {
+    try {
+        const result = await reportingService.getFunnelSummary(req.query);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[AdminAcquisition] summary exception:', err.message);
+        return res.status(500).json({ error: 'FAILED_TO_LOAD_SUMMARY' });
+    }
+});
+
+router.get('/funnel', async (req, res) => {
+    try {
+        const result = await reportingService.getFunnelSummary(req.query);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[AdminAcquisition] funnel exception:', err.message);
+        return res.status(500).json({ error: 'FAILED_TO_LOAD_FUNNEL' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /sources
+// -----------------------------------------------------------------------------
+router.get('/sources', async (req, res) => {
+    try {
+        const result = await reportingService.getSourcesReport(req.query);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[AdminAcquisition] sources exception:', err.message);
+        return res.status(500).json({ error: 'FAILED_TO_LOAD_SOURCES' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /campaigns
+// -----------------------------------------------------------------------------
+router.get('/campaigns', async (req, res) => {
+    try {
+        const result = await reportingService.getCampaignsReport(req.query);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[AdminAcquisition] campaigns exception:', err.message);
+        return res.status(500).json({ error: 'FAILED_TO_LOAD_CAMPAIGNS' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /partners
+// -----------------------------------------------------------------------------
+router.get('/partners', async (req, res) => {
+    try {
+        const result = await reportingService.getPartnersReport(req.query);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[AdminAcquisition] partners exception:', err.message);
+        return res.status(500).json({ error: 'FAILED_TO_LOAD_PARTNERS' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /referrals
+// -----------------------------------------------------------------------------
+router.get('/referrals', async (req, res) => {
+    try {
+        const result = await reportingService.getReferralsReport(req.query);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[AdminAcquisition] referrals exception:', err.message);
+        return res.status(500).json({ error: 'FAILED_TO_LOAD_REFERRALS' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /guardrails
+// -----------------------------------------------------------------------------
+router.get('/guardrails', async (req, res) => {
+    try {
+        const result = await reportingService.getGuardrailsReport(req.query);
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[AdminAcquisition] guardrails exception:', err.message);
+        return res.status(500).json({ error: 'FAILED_TO_LOAD_GUARDRAILS' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET / (Backward-compatible Funnel Root Endpoint)
 // -----------------------------------------------------------------------------
 router.get('/', async (req, res) => {
     try {
