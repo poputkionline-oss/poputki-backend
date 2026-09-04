@@ -27,6 +27,45 @@ const { internalServiceAuth } = require('../utils/internalServiceAuth');
 const { enqueueOutboxEvent, processOutboxBatch, getOutboxMetrics } = require('../services/acquisition/outboxService');
 const { runReconciliationPass } = require('../services/acquisition/reconciliationService');
 
+/**
+ * Resolves a raw Telegram numeric user ID to this platform's internal
+ * users.id, via the real users.telegram_id linking column - then, only if a
+ * real user was actually found, runs that id through resolveCanonicalUserId
+ * for alias-chain resolution (in case that account has since been merged).
+ *
+ * Every caller of the three routes below sends a raw Telegram id (bot-side,
+ * that's always sender.id / contact.user_id, never an internal users.id) -
+ * resolveCanonicalUserId() alone is NOT the right tool for that value: it
+ * resolves an id that is ALREADY an internal users.id through the alias
+ * table, and falls back to returning its input unchanged when no alias row
+ * exists. Feeding it a raw Telegram id directly (as this file previously
+ * did) meant every first-time/unregistered Telegram user's outbox row got a
+ * user_id that doesn't exist in `users` at all, permanently failing the
+ * outbox worker's FK-constrained insert (Postgres error 23503) - the
+ * anonymous/unregistered case, which is the common one, must resolve to
+ * null instead.
+ *
+ * @param {string|number|null} telegramUserId
+ * @param {Object} db
+ * @returns {Promise<number|null>}
+ */
+async function resolveUserIdFromTelegramId(telegramUserId, db) {
+    if (!telegramUserId) return null;
+    try {
+        const { data, error } = await db
+            .from('users')
+            .select('id')
+            .eq('telegram_id', telegramUserId)
+            .maybeSingle();
+
+        if (error || !data) return null;
+        return await resolveCanonicalUserId(data.id);
+    } catch (err) {
+        console.warn('[InternalAcquisition] Telegram user resolution error:', err.message);
+        return null;
+    }
+}
+
 // Apply HMAC-SHA256 + persistent nonce replay authentication to all routes in this router
 router.use(internalServiceAuth);
 
@@ -57,7 +96,7 @@ router.post('/consume-telegram-session', async (req, res) => {
             });
         }
 
-        const canonicalUserId = telegram_user_id ? await resolveCanonicalUserId(telegram_user_id) : null;
+        const canonicalUserId = await resolveUserIdFromTelegramId(telegram_user_id, db);
         const sessionId = rpcResult.acquisition_session_id || rpcResult.session_id;
         const visitorId = rpcResult.anonymous_visitor_id;
 
@@ -108,7 +147,9 @@ router.post('/bot-start', async (req, res) => {
         } = req.body || {};
 
         const db = getServiceRoleClient();
-        const canonicalUserId = user_id ? await resolveCanonicalUserId(user_id) : null;
+        // NOTE: despite the generic field name, every real caller (the bot)
+        // sends a raw Telegram user id here, never an internal users.id.
+        const canonicalUserId = await resolveUserIdFromTelegramId(user_id, db);
 
         // Idempotency: One direct organic start per chat ID per day if no session
         const dateTag = new Date().toISOString().slice(0, 10);
@@ -153,8 +194,13 @@ router.post('/contact-shared', async (req, res) => {
         } = req.body || {};
 
         const db = getServiceRoleClient();
-        const resolvedUserId = user_id || telegram_user_id;
-        const canonicalUserId = resolvedUserId ? await resolveCanonicalUserId(resolvedUserId) : null;
+        // user_id (if ever sent) is already an internal users.id - only
+        // needs alias resolution. telegram_user_id (what the bot actually
+        // sends) is a raw Telegram id and must go through the real
+        // users.telegram_id lookup first.
+        const canonicalUserId = user_id
+            ? await resolveCanonicalUserId(user_id)
+            : await resolveUserIdFromTelegramId(telegram_user_id, db);
 
         const idempKey = `contact_shared_${canonicalUserId || visitor_id || crypto.randomBytes(8).toString('hex')}_${Date.now()}`;
 
@@ -261,5 +307,9 @@ router.get('/outbox/metrics', async (req, res) => {
         return res.status(500).json({ success: false, error: err.message });
     }
 });
+
+// Exposed for direct unit testing (Express routers are functions, so this
+// doesn't change how the router itself is mounted via app.use(...)).
+router.resolveUserIdFromTelegramId = resolveUserIdFromTelegramId;
 
 module.exports = router;
