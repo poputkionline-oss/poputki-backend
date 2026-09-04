@@ -33,6 +33,13 @@ router.post('/link', async (req, res) => {
         const canonicalUserId = await resolveCanonicalUserId(rawUserId);
         const db = getServiceRoleClient();
 
+        const rawCode = crypto.createHmac('sha256', process.env.INTERNAL_HMAC_SECRET || 'poputki_referral_salt')
+            .update(`ref_user_${canonicalUserId}`)
+            .digest('hex')
+            .slice(0, 12);
+        const codeHash = hashToken(rawCode);
+        const referralUrl = `${FRONTEND_BASE_URL}/r/${rawCode}`;
+
         // 1. Check if user already has an active referral link
         const { data: existingLink } = await db
             .from('referral_links')
@@ -46,13 +53,11 @@ router.post('/link', async (req, res) => {
             return res.status(200).json({
                 success: true,
                 message: 'ACTIVE_REFERRAL_LINK_EXISTS',
+                referral_code: rawCode,
+                referral_url: referralUrl,
                 referral_link_id: existingLink.id
             });
         }
-
-        // 2. Generate cryptographically random short code
-        const rawCode = crypto.randomBytes(6).toString('hex'); // 12 chars
-        const codeHash = hashToken(rawCode);
 
         const { data: newLink, error: insErr } = await db
             .from('referral_links')
@@ -68,8 +73,6 @@ router.post('/link', async (req, res) => {
             console.error('[Referral API] Insert error:', insErr.message);
             return res.status(500).json({ error: 'FAILED_TO_CREATE_REFERRAL_LINK' });
         }
-
-        const referralUrl = `${FRONTEND_BASE_URL}/r/${rawCode}`;
 
         return res.status(201).json({
             success: true,
@@ -92,6 +95,12 @@ router.get('/me', async (req, res) => {
         const canonicalUserId = await resolveCanonicalUserId(rawUserId);
         const db = getServiceRoleClient();
 
+        const rawCode = crypto.createHmac('sha256', process.env.INTERNAL_HMAC_SECRET || 'poputki_referral_salt')
+            .update(`ref_user_${canonicalUserId}`)
+            .digest('hex')
+            .slice(0, 12);
+        const referralUrl = `${FRONTEND_BASE_URL}/r/${rawCode}`;
+
         const { data: link } = await db
             .from('referral_links')
             .select('id, is_active, created_at')
@@ -108,6 +117,8 @@ router.get('/me', async (req, res) => {
         return res.status(200).json({
             success: true,
             has_active_link: Boolean(link),
+            referral_code: Boolean(link) ? rawCode : null,
+            referral_url: Boolean(link) ? referralUrl : null,
             referral_link_id: link ? link.id : null,
             total_invitees: invitedCount || 0
         });
