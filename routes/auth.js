@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const { verifyAndMigrateDurable, hashPassword } = require('../utils/passwordSecurity');
 const { resolveCarrierRole } = require('../utils/carrierAuth');
 const { issueUserToken } = require('../utils/userAuth');
+const { safeMergeUsers, resolveCanonicalUserId } = require('../utils/identityMergeHelper');
 
 
 // Professional Telegram initData verification & server-side user extraction
@@ -141,6 +142,21 @@ router.post('/login', async (req, res) => {
 
         console.log('[Auth/Login] User lookup result:', user ? `Found user ${user.id}` : 'User not found, creating new');
 
+        // If user was merged into another canonical user, resolve to canonical
+        if (user) {
+            const canonicalId = await resolveCanonicalUserId(user.id);
+            if (canonicalId && canonicalId !== user.id) {
+                const { data: canonicalUser } = await supabase
+                    .from('users')
+                    .select('*')
+                    .eq('id', canonicalId)
+                    .single();
+                if (canonicalUser) {
+                    user = canonicalUser;
+                }
+            }
+        }
+
         // Case 1: User does not exist at all — auto-create new user
         if (!user) {
             console.log('[Auth/Login] Creating new user with phone:', phone);
@@ -261,6 +277,20 @@ router.post('/register-mobile', async (req, res) => {
             .maybeSingle();
 
         if (findError) throw findError;
+        
+        if (existingUser) {
+            const canonicalId = await resolveCanonicalUserId(existingUser.id);
+            if (canonicalId && canonicalId !== existingUser.id) {
+                const { data: canonicalUser } = await supabase
+                    .from('users')
+                    .select('*')
+                    .eq('id', canonicalId)
+                    .single();
+                if (canonicalUser) {
+                    existingUser = canonicalUser;
+                }
+            }
+        }
 
         let user;
         if (existingUser) {
@@ -550,30 +580,27 @@ router.post('/telegram-login', async (req, res) => {
                     // Conflict: This TG account is already linked to another DB user
                     // If the existing linked user is just a skeleton (no phone), we can merge/transfer
                     if (!existingTgUser.phone) {
-                        // Delete the skeleton TG user
-                        await supabase.from('users').delete().eq('id', existingTgUser.id);
-                        // Now update the current user (phone user) with the TG info
+                        // Safe Identity Merge: soft-deactivate skeleton & link to canonical profile (NO DELETION)
+                        await safeMergeUsers({
+                            sourceUserId: existingTgUser.id,
+                            canonicalUserId: parseInt(userId, 10),
+                            reason: 'telegram_login_link',
+                            mergedBy: 'auth_telegram_login'
+                        });
+
                         const { data: updatedUser, error: updateError } = await supabase
                             .from('users')
-                            .update({
-                                telegram_id: id,
-                                username: username || null,
-                                photo_url: photo_url || null,
-                                name: fullName
-                            })
-                            .eq('id', userId)
-                            .select()
+                            .select('*')
+                            .eq('id', parseInt(userId, 10))
                             .single();
 
                         if (updateError) {
-                            console.error("Error updating user with TG info (merge):", updateError);
+                            console.error("Error retrieving canonical user after safe merge:", updateError);
                             throw updateError;
                         }
                         user = updatedUser;
                     } else {
-                        // Existing user has a phone! This is a real conflict. 
-                        // Just use the existing user instead of linking to the new one?
-                        // For now, prioritize the account that already has the phone.
+                        // Existing user has a phone! Real conflict.
                         user = existingTgUser;
                     }
                 } else {
@@ -654,6 +681,19 @@ router.post('/telegram-login', async (req, res) => {
                     throw insertError;
                 }
                 user = newUser;
+            }
+        }
+
+        // Resolve canonical profile if this account was merged into another
+        const canonicalId = await resolveCanonicalUserId(user.id);
+        if (canonicalId && canonicalId !== user.id) {
+            const { data: canonicalUser } = await supabase
+                .from('users')
+                .select('*')
+                .eq('id', canonicalId)
+                .single();
+            if (canonicalUser) {
+                user = canonicalUser;
             }
         }
 
@@ -765,6 +805,19 @@ router.post('/telegram-miniapp', async (req, res) => {
 
             if (createErr) throw createErr;
             user = newUser;
+        }
+
+        // Resolve canonical profile if this account was merged into another
+        const canonicalId = await resolveCanonicalUserId(user.id);
+        if (canonicalId && canonicalId !== user.id) {
+            const { data: canonicalUser } = await supabase
+                .from('users')
+                .select('*')
+                .eq('id', canonicalId)
+                .single();
+            if (canonicalUser) {
+                user = canonicalUser;
+            }
         }
 
         const token = issueUserToken(user);
