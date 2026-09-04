@@ -62,11 +62,24 @@ function parseCookies(req) {
 /**
  * Determines cookie domain: .poputki.online for production domain requests,
  * or undefined for localhost/internal/test environments to ensure browser acceptance.
+ *
+ * Uses an exact-or-real-subdomain match, not a substring check: Host/
+ * X-Forwarded-Host are attacker-controllable on any request that reaches
+ * this origin directly (e.g. the onrender.com URL, with no trust-proxy
+ * upstream stripping them), and `.includes('poputki.online')` would also
+ * match a spoofed value like 'poputki.online.attacker.example'. A browser
+ * would reject a Domain attribute that doesn't match the response's real
+ * origin regardless, but the match itself should not be sloppy.
  */
+function isPoputkiOnlineHost(hostHeader) {
+    const host = String(hostHeader || '').toLowerCase().split(':')[0];
+    return host === 'poputki.online' || host.endsWith('.poputki.online');
+}
+
 function getCookieDomain(req) {
     const fwdHost = req.get('x-forwarded-host') || '';
     const host = req.get('host') || '';
-    if (fwdHost.includes('poputki.online') || host.includes('poputki.online')) {
+    if (isPoputkiOnlineHost(fwdHost) || isPoputkiOnlineHost(host)) {
         return '.poputki.online';
     }
     return undefined;

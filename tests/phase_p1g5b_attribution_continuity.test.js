@@ -339,6 +339,27 @@ describe('Phase P.1G.5B: Attribution Continuity & Cookie Transport Suite', () =>
         assert.strictEqual(visitorInDb.last_non_direct_campaign_id, campaignId);
     });
 
+    it('3b. A malformed Cookie header never causes a 500 - parseCookies fails safe per-pair', async () => {
+        const visitorId = crypto.randomUUID();
+        const res = await fetch(`${baseUrl}/api/acquisition/session`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                // '%' with no valid escape sequence throws inside decodeURIComponent
+                'Cookie': '__poputki_acq_token=%E0%A4%A; __poputki_ref_code=; ===; ;stray=value'
+            },
+            body: JSON.stringify({
+                anonymous_visitor_id: visitorId,
+                landing_path: '/search'
+            })
+        });
+
+        assert.notStrictEqual(res.status, 500, 'a malformed Cookie header must never crash the endpoint');
+        assert.strictEqual(res.status, 200);
+        const body = await res.json();
+        assert.strictEqual(body.success, true);
+    });
+
     it('4. Event ingestion inherits verified campaign_id from session', async () => {
         const visitorId = crypto.randomUUID();
         const sessionId = crypto.randomUUID();
@@ -447,5 +468,30 @@ describe('Phase P.1G.5B: Attribution Continuity & Cookie Transport Suite', () =>
         // Cookie is set without cross-domain reject (no domain=.poputki.online when on onrender.com host)
         const setCookie = res.headers.get('set-cookie');
         assert.ok(!setCookie.includes('Domain=.poputki.online'), 'Must not attempt cross-domain on onrender host');
+    });
+
+    it('8. A spoofed Host/X-Forwarded-Host that merely contains "poputki.online" as a substring does not trigger the production cookie domain', async () => {
+        const rawToken = 'spoofed-host-token-456';
+        const tokenHash = hashToken(rawToken);
+        const linkId = crypto.randomUUID();
+
+        mockDbState.links.set(linkId, {
+            id: linkId,
+            short_token_hash: tokenHash,
+            target_path: '/search?tab=bus',
+            is_active: true
+        });
+
+        const res = await fetch(`${baseUrl}/l/${rawToken}`, {
+            headers: {
+                'host': 'poputki.online.attacker-controlled.example',
+                'x-forwarded-host': 'poputki.online.attacker-controlled.example'
+            },
+            redirect: 'manual'
+        });
+
+        assert.strictEqual(res.status, 302);
+        const setCookie = res.headers.get('set-cookie');
+        assert.ok(!setCookie.includes('Domain=.poputki.online'), 'a host that only contains the substring "poputki.online" must not match the real domain');
     });
 });
