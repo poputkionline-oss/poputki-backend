@@ -38,6 +38,42 @@ function setNoCacheHeaders(res) {
     });
 }
 
+/**
+ * Safely parses cookie key-value pairs from request headers.
+ */
+function parseCookies(req) {
+    const list = {};
+    const cookieHeader = req.headers && req.headers.cookie;
+    if (!cookieHeader || typeof cookieHeader !== 'string') return list;
+    cookieHeader.split(';').forEach(cookie => {
+        let [name, ...rest] = cookie.split('=');
+        name = name?.trim();
+        if (!name) return;
+        const value = rest.join('=').trim();
+        try {
+            list[name] = decodeURIComponent(value);
+        } catch (_) {
+            list[name] = value;
+        }
+    });
+    return list;
+}
+
+/**
+ * Determines cookie domain: .poputki.online for production domain requests,
+ * or undefined for localhost/internal/test environments to ensure browser acceptance.
+ */
+function getCookieDomain(req) {
+    const fwdHost = req.get('x-forwarded-host') || '';
+    const host = req.get('host') || '';
+    if (fwdHost.includes('poputki.online') || host.includes('poputki.online')) {
+        return '.poputki.online';
+    }
+    return undefined;
+}
+
+const COOKIE_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
 const FRONTEND_BASE_URL = getCanonicalFrontendUrl();
 
 const BOT_UA_REGEX = /(bot|crawler|spider|telegrambot|facebookexternalhit|whatsapp|twitterbot|slackbot|applebot|linkedinbot|embedly|quora link preview|pinterest)/i;
@@ -58,6 +94,7 @@ function isSuspectedBot(ua) {
 // -----------------------------------------------------------------------------
 router.post('/session', async (req, res) => {
     try {
+        const cookies = parseCookies(req);
         const {
             anonymous_visitor_id,
             tracked_token,
@@ -68,6 +105,10 @@ router.post('/session', async (req, res) => {
             is_telegram_webapp
         } = req.body || {};
 
+        // Resilient attribution resolution: prefer explicit body, fallback to HttpOnly cookie
+        const resolvedTrackedToken = tracked_token || cookies['__poputki_acq_token'] || null;
+        const resolvedReferralCode = referral_code || cookies['__poputki_ref_code'] || null;
+
         const headerVisitorId = req.headers['x-visitor-id'];
         const visitorId = headerVisitorId || anonymous_visitor_id;
         const reqReferrer = req.headers['referer'] || referrer;
@@ -77,8 +118,8 @@ router.post('/session', async (req, res) => {
 
         const sessionResult = await getOrCreateSession({
             visitorId,
-            trackedToken: tracked_token,
-            referralCode: referral_code,
+            trackedToken: resolvedTrackedToken,
+            referralCode: resolvedReferralCode,
             referrer: reqReferrer,
             utm: utm || {},
             isTelegramWebApp: is_telegram_webapp === true,
@@ -267,6 +308,19 @@ router.get('/l/:rawToken', async (req, res) => {
         const redirectUrl = new URL(safePath, FRONTEND_BASE_URL);
         redirectUrl.searchParams.set('acq_token', rawToken);
 
+        const cookieDomain = getCookieDomain(req);
+        const cookieOptions = {
+            path: '/',
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production' || req.secure || (req.get('x-forwarded-proto') === 'https'),
+            sameSite: 'lax',
+            maxAge: COOKIE_MAX_AGE_MS
+        };
+        if (cookieDomain) {
+            cookieOptions.domain = cookieDomain;
+        }
+        res.cookie('__poputki_acq_token', rawToken, cookieOptions);
+
         setNoCacheHeaders(res);
         return res.redirect(302, redirectUrl.toString());
     } catch (err) {
@@ -310,6 +364,19 @@ router.get('/r/:rawCode', async (req, res) => {
 
         const redirectUrl = new URL('/', FRONTEND_BASE_URL);
         redirectUrl.searchParams.set('ref', rawCode);
+
+        const cookieDomain = getCookieDomain(req);
+        const cookieOptions = {
+            path: '/',
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production' || req.secure || (req.get('x-forwarded-proto') === 'https'),
+            sameSite: 'lax',
+            maxAge: COOKIE_MAX_AGE_MS
+        };
+        if (cookieDomain) {
+            cookieOptions.domain = cookieDomain;
+        }
+        res.cookie('__poputki_ref_code', rawCode, cookieOptions);
 
         setNoCacheHeaders(res);
         return res.redirect(302, redirectUrl.toString());
