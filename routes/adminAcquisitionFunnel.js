@@ -20,6 +20,7 @@ const { requireAdminToken } = require('../utils/adminTokenAuth');
 router.use(requireAdminToken);
 
 const reportingService = require('../services/acquisition/acquisitionReportingService');
+const campaignService = require('../services/acquisition/campaignManagementService');
 
 // -----------------------------------------------------------------------------
 // GET /summary (and GET /funnel)
@@ -71,15 +72,173 @@ router.get('/campaigns', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// POST /campaigns (Phase P.1G.5: Create Campaign)
+// -----------------------------------------------------------------------------
+router.post('/campaigns', async (req, res) => {
+    try {
+        const created = await campaignService.createCampaign(req.body);
+        return res.status(201).json({ success: true, campaign: created });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_CREATE_CAMPAIGN',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /campaigns/:id (Phase P.1G.5: Campaign Details + Links)
+// -----------------------------------------------------------------------------
+router.get('/campaigns/:id', async (req, res) => {
+    try {
+        const details = await campaignService.getCampaignDetails(req.params.id);
+        return res.status(200).json({ success: true, ...details });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_LOAD_CAMPAIGN',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// PATCH /campaigns/:id/status (Phase P.1G.5: Update Campaign Status)
+// -----------------------------------------------------------------------------
+router.patch('/campaigns/:id/status', async (req, res) => {
+    try {
+        const updated = await campaignService.updateCampaignStatus(req.params.id, req.body);
+        return res.status(200).json({ success: true, campaign: updated });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_UPDATE_CAMPAIGN_STATUS',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// PATCH /campaigns/:id (Phase P.1G.5: Safe Update Campaign)
+// -----------------------------------------------------------------------------
+router.patch('/campaigns/:id', async (req, res) => {
+    try {
+        const updated = await campaignService.updateCampaign(req.params.id, req.body);
+        return res.status(200).json({ success: true, campaign: updated });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_UPDATE_CAMPAIGN',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// POST /campaigns/:id/links (Phase P.1G.5: Issue Tracked Link)
+// -----------------------------------------------------------------------------
+router.post('/campaigns/:id/links', async (req, res) => {
+    try {
+        const result = await campaignService.createTrackedLink(req.params.id, req.body);
+        return res.status(201).json({ success: true, ...result });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_CREATE_LINK',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /campaigns/:id/links (Phase P.1G.5: List Campaign Links)
+// -----------------------------------------------------------------------------
+router.get('/campaigns/:id/links', async (req, res) => {
+    try {
+        const links = await campaignService.getCampaignLinks(req.params.id);
+        return res.status(200).json({ success: true, links });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_LOAD_LINKS',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// PATCH /links/:id/status (Phase P.1G.5: Toggle Link Active)
+// -----------------------------------------------------------------------------
+router.patch('/links/:id/status', async (req, res) => {
+    try {
+        const updated = await campaignService.updateLinkStatus(req.params.id, req.body);
+        return res.status(200).json({ success: true, link: updated });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_UPDATE_LINK_STATUS',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// Prohibit DELETE operations on campaigns, links, and partners
+// -----------------------------------------------------------------------------
+router.delete(['/campaigns', '/campaigns/:id', '/campaigns/:id/links', '/links/:id', '/partners', '/partners/:id'], (req, res) => {
+    return res.status(405).json({
+        error: 'METHOD_NOT_ALLOWED',
+        message: 'Physical deletion of acquisition entities is strictly prohibited. Use status deactivation instead.'
+    });
+});
+
+// -----------------------------------------------------------------------------
 // GET /partners
 // -----------------------------------------------------------------------------
 router.get('/partners', async (req, res) => {
     try {
+        if (req.query.view === 'raw' || req.query.view === 'dictionary') {
+            const partners = await campaignService.listPartners();
+            return res.status(200).json({ success: true, rows: partners });
+        }
         const result = await reportingService.getPartnersReport(req.query);
         return res.status(200).json(result);
     } catch (err) {
         console.error('[AdminAcquisition] partners exception:', err.message);
         return res.status(500).json({ error: 'FAILED_TO_LOAD_PARTNERS' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// POST /partners (Phase P.1G.5: Add Partner to Dictionary)
+// -----------------------------------------------------------------------------
+router.post('/partners', async (req, res) => {
+    try {
+        const created = await campaignService.createPartner(req.body);
+        return res.status(201).json({ success: true, partner: created });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_CREATE_PARTNER',
+            message: err.message
+        });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// PATCH /partners/:id/status (Phase P.1G.5: Toggle Partner Active)
+// -----------------------------------------------------------------------------
+router.patch('/partners/:id/status', async (req, res) => {
+    try {
+        const updated = await campaignService.updatePartnerStatus(req.params.id, req.body);
+        return res.status(200).json({ success: true, partner: updated });
+    } catch (err) {
+        const status = err.status || 500;
+        return res.status(status).json({
+            error: err.code || 'FAILED_TO_UPDATE_PARTNER_STATUS',
+            message: err.message
+        });
     }
 });
 
