@@ -38,6 +38,7 @@ function sanitizeVisitorId(candidate) {
  * @param {string} [params.referralCode] - Raw code from /r/:rawCode
  * @param {string} [params.referrer] - HTTP Referer header or document.referrer
  * @param {Object} [params.utm] - Client-submitted UTM parameters
+ * @param {boolean} [params.isTelegramWebApp] - Client-asserted Telegram Mini App runtime signal
  * @param {number} [params.userId] - Optional authenticated user ID
  * @param {string} [params.landingPath] - Relative landing path
  * @param {Object} [params.dbClient] - Optional DB client override
@@ -49,6 +50,7 @@ async function getOrCreateSession({
     referralCode = null,
     referrer = null,
     utm = {},
+    isTelegramWebApp = false,
     userId = null,
     landingPath = null,
     dbClient = null
@@ -63,6 +65,7 @@ async function getOrCreateSession({
         referralCode,
         referrer,
         utm,
+        isTelegramWebApp: isTelegramWebApp === true,
         dbClient: db
     });
 

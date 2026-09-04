@@ -56,6 +56,11 @@ function hashToken(raw) {
  * @param {string} [input.referralCode] - Raw code from passenger referral link
  * @param {string} [input.referrer] - HTTP Referer header or client referrer URL
  * @param {Object} [input.utm] - Client-submitted UTM query parameters
+ * @param {boolean} [input.isTelegramWebApp] - Client-asserted signal that this
+ *   session started inside the Telegram Mini App runtime (window.Telegram.WebApp
+ *   was present). Same trust tier as UTM - client-asserted, not cryptographically
+ *   verified - used only as a last-resort platform hint when no stronger signal
+ *   (referral link, tracked link, verified referrer, UTM) resolved one.
  * @param {Object} [input.dbClient] - Supabase DB client for token resolution
  * @returns {Promise<Object>} Normalized attribution object
  */
@@ -64,6 +69,7 @@ async function resolveAttribution({
     referralCode = null,
     referrer = null,
     utm = {},
+    isTelegramWebApp = false,
     dbClient = null
 } = {}) {
     const defaultDirect = {
@@ -247,7 +253,30 @@ async function resolveAttribution({
         };
     }
 
-    // 6. PRIORITY 7: Direct traffic
+    // 6. PRIORITY 6.5: Telegram Mini App runtime context (no stronger signal
+    // resolved above - no referral/tracked link, no verified referrer, no
+    // UTM). Recorded as a known platform rather than plain 'direct' so
+    // LANDING_VIEWED/session rows correctly reflect a Telegram-origin visit
+    // (e.g. opened via the bot's /start "Найти билет на автобус" button)
+    // without requiring a dedicated MINI_APP_OPENED event.
+    if (isTelegramWebApp === true) {
+        return {
+            source_platform: 'telegram',
+            source_medium: 'messenger',
+            attribution_type: 'direct_organic',
+            attribution_confidence: 'unverified_client_context',
+            campaign_id: null,
+            partner_id: null,
+            acquisition_link_id: null,
+            referral_link_id: null,
+            content_code: null,
+            placement_code: null,
+            referrer_host: null,
+            is_direct: false
+        };
+    }
+
+    // 7. PRIORITY 7: Direct traffic
     return defaultDirect;
 }
 

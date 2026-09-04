@@ -46,7 +46,8 @@ router.post('/session', async (req, res) => {
             referral_code,
             referrer,
             utm,
-            landing_path
+            landing_path,
+            is_telegram_webapp
         } = req.body || {};
 
         const headerVisitorId = req.headers['x-visitor-id'];
@@ -62,6 +63,7 @@ router.post('/session', async (req, res) => {
             referralCode: referral_code,
             referrer: reqReferrer,
             utm: utm || {},
+            isTelegramWebApp: is_telegram_webapp === true,
             userId,
             landingPath: landing_path
         });
