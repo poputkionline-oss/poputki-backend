@@ -146,26 +146,44 @@ describe('Phase P.1G.3A — internalServiceAuth: legacy bypass removed, fallback
 });
 
 describe('Phase P.1G.3A — reconciliation distributed lock', () => {
+    // The real Supabase-js query builder returned by db.rpc(...) is a bare
+    // thenable (implements only .then(), to satisfy `await`) — it has no
+    // .catch()/.finally() of its own. A mock whose rpc() is an `async`
+    // function returns a full native Promise instead, which DOES support
+    // .catch() directly — silently hiding a real production bug where
+    // reconciliationService.js once called `db.rpc(...).catch(...)`
+    // directly on the un-awaited builder (TypeError: ... .catch is not a
+    // function, which crashed every real reconciliation run in production
+    // and skipped the lock release). This thenable-only shape reproduces
+    // that constraint so this exact bug class fails a test, not a deploy.
+    function makeRpcThenable(result) {
+        return {
+            then(onFulfilled) {
+                return Promise.resolve(result).then(onFulfilled);
+            }
+        };
+    }
+
     function makeLockMockDb(initialLock = null) {
         let lockRow = initialLock;
         return {
-            rpc: async (fnName, params) => {
+            rpc: (fnName, params) => {
                 if (fnName === 'fn_try_acquire_maintenance_lock') {
                     const now = Date.now();
                     if (lockRow && lockRow.locked_until && new Date(lockRow.locked_until).getTime() > now) {
-                        return { data: false, error: null };
+                        return makeRpcThenable({ data: false, error: null });
                     }
                     lockRow = { holder: params.p_holder, locked_until: new Date(now + params.p_lease_seconds * 1000).toISOString() };
-                    return { data: true, error: null };
+                    return makeRpcThenable({ data: true, error: null });
                 }
                 if (fnName === 'fn_release_maintenance_lock') {
                     if (lockRow && lockRow.holder === params.p_holder) {
                         lockRow = { holder: null, locked_until: null };
-                        return { data: true, error: null };
+                        return makeRpcThenable({ data: true, error: null });
                     }
-                    return { data: false, error: null };
+                    return makeRpcThenable({ data: false, error: null });
                 }
-                return { data: null, error: null };
+                return makeRpcThenable({ data: null, error: null });
             },
             from(table) {
                 const builder = {
@@ -178,7 +196,8 @@ describe('Phase P.1G.3A — reconciliation distributed lock', () => {
                     then(resolve) { resolve({ data: [], error: null, count: 0 }); }
                 };
                 return builder;
-            }
+            },
+            _getLockRow: () => lockRow
         };
     }
 
@@ -189,6 +208,22 @@ describe('Phase P.1G.3A — reconciliation distributed lock', () => {
         const result = await runReconciliationPass({ overrideWatermark: '2026-09-04T00:00:00.000Z', dbClient: db });
         assert.equal(result.skipped, false);
         assert.equal(result.scanned_bookings, 0);
+    });
+
+    it('actually releases the lock after a successful run (regression: release must not throw against a bare-thenable RPC builder)', async () => {
+        delete require.cache[require.resolve('../services/acquisition/reconciliationService')];
+        const { runReconciliationPass } = require('../services/acquisition/reconciliationService');
+        const db = makeLockMockDb();
+        const result = await runReconciliationPass({ overrideWatermark: '2026-09-04T00:00:00.000Z', dbClient: db });
+        assert.equal(result.skipped, false, 'the pass itself must not be reported as failed/thrown');
+        const lockRow = db._getLockRow();
+        assert.equal(lockRow.holder, null, 'the lock must be actually released (holder cleared), not merely left to expire via lease');
+
+        // A second immediate run must be able to acquire the lock right
+        // away — proof the first run's release genuinely freed it rather
+        // than crashing before the release RPC was ever sent.
+        const second = await runReconciliationPass({ overrideWatermark: '2026-09-04T00:00:00.000Z', dbClient: db });
+        assert.equal(second.skipped, false, 'a released lock must be immediately re-acquirable by the next run');
     });
 
     it('gracefully skips reconciliation when the lock is already held', async () => {

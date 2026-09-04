@@ -107,12 +107,19 @@ async function runReconciliationPass({ overrideWatermark = null, dbClient = null
             const result = await runReconciliationPassUnlocked({ overrideWatermark, dbClient: db });
             return { skipped: false, ...result };
         } finally {
-            await db.rpc('fn_release_maintenance_lock', {
-                p_lock_key: RECONCILIATION_LOCK_KEY,
-                p_holder: holder
-            }).catch((releaseErr) => {
+            // The Supabase query builder returned by db.rpc(...) is a
+            // thenable (supports await), not a full Promise — it has no
+            // .catch()/.finally() of its own, so those must never be
+            // chained directly on it. await + try/catch is the correct,
+            // client-shape-agnostic way to swallow a release failure here.
+            try {
+                await db.rpc('fn_release_maintenance_lock', {
+                    p_lock_key: RECONCILIATION_LOCK_KEY,
+                    p_holder: holder
+                });
+            } catch (releaseErr) {
                 console.warn('[Reconciliation] Lock release warning (will expire via lease):', releaseErr.message);
-            });
+            }
         }
     }
 
