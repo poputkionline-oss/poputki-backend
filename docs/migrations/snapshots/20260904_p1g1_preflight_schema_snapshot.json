@@ -1,0 +1,44 @@
+{
+  "project_ref": "xzvtjcqwmuezxyeerkki",
+  "project_name": "poputki-online-prod",
+  "snapshot_timestamp": "2026-09-04T18:08:00+05:00",
+  "database_size": "21 MB",
+  "row_counts": {
+    "users": 249,
+    "bus_ticket_bookings": 157,
+    "bus_tickets": 29,
+    "rides": 569,
+    "user_identity_aliases": 0
+  },
+  "types_verified": {
+    "public.users.id": "integer",
+    "public.bus_ticket_bookings.id": "integer",
+    "public.bus_tickets.id": "integer"
+  },
+  "prior_objects_verified": {
+    "public.user_identity_aliases": "EXISTS",
+    "public.fn_safe_merge_users": "EXISTS_PROTECTED"
+  },
+  "p1g1_tables_prior_state": {
+    "public.acquisition_campaigns": "DOES_NOT_EXIST",
+    "public.acquisition_partners": "DOES_NOT_EXIST",
+    "public.acquisition_links": "DOES_NOT_EXIST",
+    "public.acquisition_link_clicks": "DOES_NOT_EXIST",
+    "public.acquisition_visitors": "DOES_NOT_EXIST",
+    "public.acquisition_sessions": "DOES_NOT_EXIST",
+    "public.acquisition_events": "DOES_NOT_EXIST",
+    "public.acquisition_identity_links": "DOES_NOT_EXIST",
+    "public.telegram_link_sessions": "DOES_NOT_EXIST",
+    "public.marketing_consent_events": "DOES_NOT_EXIST",
+    "public.marketing_consent_current": "DOES_NOT_EXIST",
+    "public.referral_links": "DOES_NOT_EXIST",
+    "public.referral_attributions": "DOES_NOT_EXIST",
+    "public.booking_acquisition_attributions": "DOES_NOT_EXIST",
+    "public.acquisition_daily_metrics": "DOES_NOT_EXIST"
+  },
+  "p1g1_rpcs_prior_state": {
+    "public.fn_record_marketing_consent": "DOES_NOT_EXIST",
+    "public.fn_consume_telegram_link_session": "DOES_NOT_EXIST",
+    "public.fn_create_booking_acquisition_attribution": "DOES_NOT_EXIST"
+  }
+}
