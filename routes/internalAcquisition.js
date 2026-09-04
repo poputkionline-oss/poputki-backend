@@ -1,15 +1,18 @@
 /**
  * routes/internalAcquisition.js
  *
- * Phase P.1G.2: Internal Bot & Server-to-Server Acquisition Endpoints
+ * Phase P.1G.3: Internal Bot & Server-to-Service Acquisition Endpoints
  *
- * Endpoints for future Phase P.1G.3 Bot Handshake:
+ * Endpoints:
+ * - POST /api/internal/acquisition/consume-telegram-session
  * - POST /api/internal/acquisition/bot-start
  * - POST /api/internal/acquisition/contact-shared
- * - POST /api/internal/acquisition/consume-telegram-session
+ * - POST /api/internal/acquisition/outbox/tick (Worker trigger)
+ * - POST /api/internal/acquisition/reconcile (Reconciliation trigger)
+ * - GET  /api/internal/acquisition/outbox/metrics (Monitoring)
  *
- * Security: Strictly guarded by internal service-to-service secret
- * with constant-time comparison. Fails closed.
+ * Security: Strictly guarded by HMAC-SHA256 signature verification with
+ * persistent PostgreSQL nonce replay protection and 5-min timestamp window. Fails closed.
  */
 
 'use strict';
@@ -20,33 +23,11 @@ const crypto = require('crypto');
 const { getServiceRoleClient } = require('../dbServiceRole');
 const { hashToken } = require('../services/acquisition/attributionResolver');
 const { resolveCanonicalUserId } = require('../utils/identityMergeHelper');
+const { internalServiceAuth } = require('../utils/internalServiceAuth');
+const { enqueueOutboxEvent, processOutboxBatch, getOutboxMetrics } = require('../services/acquisition/outboxService');
+const { runReconciliationPass } = require('../services/acquisition/reconciliationService');
 
-const INTERNAL_SECRET = process.env.INTERNAL_SERVICE_SECRET || process.env.TELEGRAM_BOT_TOKEN;
-
-/**
- * Constant-time string comparison middleware.
- */
-function internalServiceAuth(req, res, next) {
-    if (!INTERNAL_SECRET) {
-        console.error('[InternalAcquisition] INTERNAL_SERVICE_SECRET is not configured in environment!');
-        return res.status(500).json({ error: 'Internal server security configuration error' });
-    }
-
-    const providedSecret = req.headers['x-internal-service-secret'];
-    if (!providedSecret || typeof providedSecret !== 'string') {
-        return res.status(401).json({ error: 'Unauthorized: Internal service secret required' });
-    }
-
-    const expectedBuf = Buffer.from(INTERNAL_SECRET);
-    const providedBuf = Buffer.from(providedSecret);
-
-    if (expectedBuf.length !== providedBuf.length || !crypto.timingSafeEqual(expectedBuf, providedBuf)) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid service secret' });
-    }
-
-    next();
-}
-
+// Apply HMAC-SHA256 + persistent nonce replay authentication to all routes in this router
 router.use(internalServiceAuth);
 
 // -----------------------------------------------------------------------------
@@ -54,7 +35,7 @@ router.use(internalServiceAuth);
 // -----------------------------------------------------------------------------
 router.post('/consume-telegram-session', async (req, res) => {
     try {
-        const { raw_token, telegram_chat_id } = req.body || {};
+        const { raw_token, telegram_chat_id, telegram_user_id } = req.body || {};
 
         if (!raw_token || typeof raw_token !== 'string') {
             return res.status(400).json({ error: 'RAW_TOKEN_REQUIRED' });
@@ -69,18 +50,41 @@ router.post('/consume-telegram-session', async (req, res) => {
         });
 
         if (rpcErr || !rpcResult || !rpcResult.success) {
+            const errorCode = (rpcResult && rpcResult.error) || (rpcErr && rpcErr.message) || 'CONSUME_FAILED';
             return res.status(400).json({
                 success: false,
-                error: (rpcResult && rpcResult.error) || (rpcErr && rpcErr.message) || 'CONSUME_FAILED'
+                error: errorCode
             });
         }
 
+        const canonicalUserId = telegram_user_id ? await resolveCanonicalUserId(telegram_user_id) : null;
+        const sessionId = rpcResult.acquisition_session_id || rpcResult.session_id;
+        const visitorId = rpcResult.anonymous_visitor_id;
+
+        // Enqueue BOT_STARTED event into persistent outbox
+        const idempKey = `bot_start_w_${tokenHash.slice(0, 16)}_${Date.now()}`;
+        await enqueueOutboxEvent({
+            eventName: 'BOT_STARTED',
+            eventSource: 'bot',
+            idempotencyKey: idempKey,
+            visitorId,
+            sessionId,
+            userId: canonicalUserId,
+            properties: {
+                handshake_type: 'web_to_telegram',
+                has_telegram_chat_id: Boolean(telegram_chat_id)
+            },
+            dbClient: db
+        });
+
+        // Invariant: Consuming a handshake token NEVER grants marketing consent
         return res.status(200).json({
             success: true,
-            session_id: rpcResult.session_id,
-            anonymous_visitor_id: rpcResult.anonymous_visitor_id,
-            acquisition_session_id: rpcResult.acquisition_session_id,
-            acquisition_link_id: rpcResult.acquisition_link_id
+            session_id: sessionId,
+            anonymous_visitor_id: visitorId,
+            acquisition_session_id: sessionId,
+            acquisition_link_id: rpcResult.acquisition_link_id || null,
+            marketing_consent: false
         });
     } catch (err) {
         console.error('[InternalAcquisition] Consume exception:', err.message);
@@ -97,28 +101,37 @@ router.post('/bot-start', async (req, res) => {
             visitor_id,
             session_id,
             telegram_chat_id,
-            user_id
+            user_id,
+            source_platform = 'telegram',
+            source_medium = 'messenger',
+            attribution_type = 'direct_organic'
         } = req.body || {};
 
         const db = getServiceRoleClient();
-        const now = new Date().toISOString();
         const canonicalUserId = user_id ? await resolveCanonicalUserId(user_id) : null;
 
-        const idempKey = `bot_start_${telegram_chat_id || visitor_id || crypto.randomBytes(8).toString('hex')}_${Date.now()}`;
+        // Idempotency: One direct organic start per chat ID per day if no session
+        const dateTag = new Date().toISOString().slice(0, 10);
+        const idempKey = `bot_start_${telegram_chat_id || visitor_id || crypto.randomBytes(8).toString('hex')}_${dateTag}`;
 
-        await db.from('acquisition_events').insert({
-            event_name: 'BOT_STARTED',
-            anonymous_visitor_id: visitor_id || '00000000-0000-0000-0000-000000000000',
-            session_id: session_id || null,
-            user_id: canonicalUserId,
-            event_source: 'bot',
-            idempotency_key: idempKey,
+        await enqueueOutboxEvent({
+            eventName: 'BOT_STARTED',
+            eventSource: 'bot',
+            idempotencyKey: idempKey,
+            visitorId: visitor_id || null,
+            sessionId: session_id || null,
+            userId: canonicalUserId,
             properties: {
+                source_platform,
+                source_medium,
+                attribution_type,
                 telegram_chat_id_provided: Boolean(telegram_chat_id)
             },
-            occurred_at: now,
-            received_at: now
+            dbClient: db
         });
+
+        // Immediately trigger non-blocking outbox delivery tick
+        processOutboxBatch({ batchSize: 10, dbClient: db }).catch(() => {});
 
         return res.status(200).json({ success: true, event_name: 'BOT_STARTED' });
     } catch (err) {
@@ -135,34 +148,117 @@ router.post('/contact-shared', async (req, res) => {
         const {
             visitor_id,
             session_id,
-            user_id
+            user_id,
+            telegram_user_id
         } = req.body || {};
 
         const db = getServiceRoleClient();
-        const now = new Date().toISOString();
-        const canonicalUserId = user_id ? await resolveCanonicalUserId(user_id) : null;
+        const resolvedUserId = user_id || telegram_user_id;
+        const canonicalUserId = resolvedUserId ? await resolveCanonicalUserId(resolvedUserId) : null;
 
         const idempKey = `contact_shared_${canonicalUserId || visitor_id || crypto.randomBytes(8).toString('hex')}_${Date.now()}`;
 
-        // Invariant: zero PII (phone number) stored in properties
-        await db.from('acquisition_events').insert({
-            event_name: 'CONTACT_SHARED',
-            anonymous_visitor_id: visitor_id || '00000000-0000-0000-0000-000000000000',
-            session_id: session_id || null,
-            user_id: canonicalUserId,
-            event_source: 'bot',
-            idempotency_key: idempKey,
+        // Invariant: ZERO PII (phone number, name) stored in properties!
+        // Invariant: CONTACT_DOES_NOT_GRANT_CONSENT: YES (marketing consent remains strictly false)
+        await enqueueOutboxEvent({
+            eventName: 'CONTACT_SHARED',
+            eventSource: 'bot',
+            idempotencyKey: idempKey,
+            visitorId: visitor_id || null,
+            sessionId: session_id || null,
+            userId: canonicalUserId,
             properties: {
-                contact_received: true
+                contact_received: true,
+                marketing_consent_granted: false
             },
-            occurred_at: now,
-            received_at: now
+            dbClient: db
         });
 
-        return res.status(200).json({ success: true, event_name: 'CONTACT_SHARED' });
+        // If a canonical user was resolved, also enqueue USER_IDENTIFIED
+        if (canonicalUserId) {
+            const identifyKey = `user_identified_${canonicalUserId}_${visitor_id || 'bot'}`;
+            await enqueueOutboxEvent({
+                eventName: 'USER_IDENTIFIED',
+                eventSource: 'bot',
+                idempotencyKey: identifyKey,
+                visitorId: visitor_id || null,
+                sessionId: session_id || null,
+                userId: canonicalUserId,
+                properties: {
+                    identity_source: 'telegram_contact',
+                    marketing_consent_granted: false
+                },
+                dbClient: db
+            });
+
+            // If visitor ID exists, record acquisition identity link
+            if (visitor_id && visitor_id !== '00000000-0000-0000-0000-000000000000') {
+                try {
+                    await db.from('acquisition_identity_links').upsert({
+                        anonymous_visitor_id: visitor_id,
+                        canonical_user_id: canonicalUserId,
+                        link_source: 'telegram_contact',
+                        confidence_score: 1.0,
+                        created_at: new Date().toISOString()
+                    }, {
+                        onConflict: 'anonymous_visitor_id,canonical_user_id',
+                        ignoreDuplicates: true
+                    });
+                } catch (linkErr) {
+                    console.warn('[InternalAcquisition] Identity link warning:', linkErr.message);
+                }
+            }
+        }
+
+        // Immediately trigger non-blocking outbox processing
+        processOutboxBatch({ batchSize: 10, dbClient: db }).catch(() => {});
+
+        return res.status(200).json({
+            success: true,
+            event_name: 'CONTACT_SHARED',
+            user_identified: Boolean(canonicalUserId),
+            marketing_consent_granted: false
+        });
     } catch (err) {
         console.error('[InternalAcquisition] Contact shared error:', err.message);
         return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// POST /api/internal/acquisition/outbox/tick
+// -----------------------------------------------------------------------------
+router.post('/outbox/tick', async (req, res) => {
+    try {
+        const batchSize = Math.min(Math.max(parseInt(req.body?.batch_size || 50, 10), 1), 100);
+        const result = await processOutboxBatch({ batchSize });
+        return res.status(200).json({ success: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// POST /api/internal/acquisition/reconcile
+// -----------------------------------------------------------------------------
+router.post('/reconcile', async (req, res) => {
+    try {
+        const result = await runReconciliationPass();
+        return res.status(200).json({ success: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// GET /api/internal/acquisition/outbox/metrics
+// -----------------------------------------------------------------------------
+router.get('/outbox/metrics', async (req, res) => {
+    try {
+        const metrics = await getOutboxMetrics();
+        return res.status(200).json({ success: true, metrics });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
     }
 });
 

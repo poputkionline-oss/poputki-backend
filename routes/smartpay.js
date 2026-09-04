@@ -374,6 +374,22 @@ router.post('/create-invoice', optionalUserAuth, async (req, res) => {
             })
             .eq('id', booking.id);
 
+        // Phase P.1G.3: Server Event Ingestion for BOOKING_CREATED with Attribution Context
+        try {
+            const { recordBookingCreated } = require('../services/acquisition/serverEventService');
+            const visitorId = req.headers['x-visitor-id'] || req.body?.attribution?.anonymous_visitor_id || req.body?.anonymous_visitor_id || null;
+            const sessionId = req.body?.attribution?.session_id || req.body?.acquisition_session_id || null;
+            recordBookingCreated({
+                bookingId: booking.id,
+                passengerId: effectivePassengerId,
+                busTicketId: bus_ticket_id,
+                visitorId,
+                sessionId
+            }).catch(err => console.warn('[SmartPay] recordBookingCreated error:', err.message));
+        } catch (acqErr) {
+            console.warn('[SmartPay] recordBookingCreated dispatch error:', acqErr.message);
+        }
+
         res.json({
             booking_id: booking.id,
             payment_link: invoiceData.payment_link,
