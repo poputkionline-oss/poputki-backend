@@ -21,8 +21,26 @@ const { getOrCreateSession } = require('../services/acquisition/sessionService')
 const { ingestClientEvents } = require('../services/acquisition/eventIngestionService');
 const { hashToken } = require('../services/acquisition/attributionResolver');
 
+function getCanonicalFrontendUrl() {
+    let base = process.env.FRONTEND_URL || 'https://www.poputki.online';
+    base = base.trim().replace(/\/+$/, '');
+    if (base === 'https://poputki.online' || base === 'http://poputki.online') {
+        base = 'https://www.poputki.online';
+    }
+    return base;
+}
+
+function setNoCacheHeaders(res) {
+    res.set({
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+    });
+}
+
+const FRONTEND_BASE_URL = getCanonicalFrontendUrl();
+
 const BOT_UA_REGEX = /(bot|crawler|spider|telegrambot|facebookexternalhit|whatsapp|twitterbot|slackbot|applebot|linkedinbot|embedly|quora link preview|pinterest)/i;
-const FRONTEND_BASE_URL = process.env.FRONTEND_URL || 'https://www.poputki.online';
 
 /**
  * Heuristic bot preview detector based on User-Agent header.
@@ -203,6 +221,7 @@ router.get('/l/:rawToken', async (req, res) => {
     const fallbackUrl = `${FRONTEND_BASE_URL}/`;
 
     if (!rawToken || typeof rawToken !== 'string' || rawToken.length < 8) {
+        setNoCacheHeaders(res);
         return res.redirect(302, fallbackUrl);
     }
 
@@ -217,10 +236,12 @@ router.get('/l/:rawToken', async (req, res) => {
             .maybeSingle();
 
         if (linkErr || !link || !link.is_active) {
+            setNoCacheHeaders(res);
             return res.redirect(302, fallbackUrl);
         }
 
         if (link.expires_at && new Date(link.expires_at) <= new Date()) {
+            setNoCacheHeaders(res);
             return res.redirect(302, fallbackUrl);
         }
 
@@ -246,9 +267,11 @@ router.get('/l/:rawToken', async (req, res) => {
         const redirectUrl = new URL(safePath, FRONTEND_BASE_URL);
         redirectUrl.searchParams.set('acq_token', rawToken);
 
+        setNoCacheHeaders(res);
         return res.redirect(302, redirectUrl.toString());
     } catch (err) {
         console.error('[Acquisition Link] Redirect exception:', err.message);
+        setNoCacheHeaders(res);
         return res.redirect(302, fallbackUrl);
     }
 });
@@ -261,6 +284,7 @@ router.get('/r/:rawCode', async (req, res) => {
     const fallbackUrl = `${FRONTEND_BASE_URL}/`;
 
     if (!rawCode || typeof rawCode !== 'string' || rawCode.length < 4) {
+        setNoCacheHeaders(res);
         return res.redirect(302, fallbackUrl);
     }
 
@@ -275,19 +299,23 @@ router.get('/r/:rawCode', async (req, res) => {
             .maybeSingle();
 
         if (refErr || !refLink || !refLink.is_active || refLink.revoked_at) {
+            setNoCacheHeaders(res);
             return res.redirect(302, fallbackUrl);
         }
 
         if (refLink.expires_at && new Date(refLink.expires_at) <= new Date()) {
+            setNoCacheHeaders(res);
             return res.redirect(302, fallbackUrl);
         }
 
         const redirectUrl = new URL('/', FRONTEND_BASE_URL);
         redirectUrl.searchParams.set('ref', rawCode);
 
+        setNoCacheHeaders(res);
         return res.redirect(302, redirectUrl.toString());
     } catch (err) {
         console.error('[Referral Link] Redirect exception:', err.message);
+        setNoCacheHeaders(res);
         return res.redirect(302, fallbackUrl);
     }
 });

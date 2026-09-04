@@ -36,7 +36,16 @@ const ALLOWED_ATTRIBUTION_TYPES = new Set([
 
 const ALLOWED_CURRENCIES = new Set(['TJS', 'RUB', 'USD']);
 
-const FRONTEND_BASE_URL = process.env.FRONTEND_URL || 'https://www.poputki.online';
+function getCanonicalFrontendUrl() {
+    let base = process.env.FRONTEND_URL || 'https://www.poputki.online';
+    base = base.trim().replace(/\/+$/, '');
+    if (base === 'https://poputki.online' || base === 'http://poputki.online') {
+        base = 'https://www.poputki.online';
+    }
+    return base;
+}
+
+const FRONTEND_BASE_URL = getCanonicalFrontendUrl();
 
 /**
  * Validates target path for internal relative redirect safety.

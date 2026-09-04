@@ -487,6 +487,7 @@ async function getCampaignsReport(filters = {}, dbClient = null) {
         }
 
         rows.push({
+            id: c.id,
             campaign_id: c.id,
             code: c.code,
             name: c.name,

@@ -87,10 +87,18 @@ router.post('/campaigns', async (req, res) => {
     }
 });
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isValidUUID(id) {
+    return typeof id === 'string' && UUID_REGEX.test(id.trim());
+}
+
 // -----------------------------------------------------------------------------
 // GET /campaigns/:id (Phase P.1G.5: Campaign Details + Links)
 // -----------------------------------------------------------------------------
 router.get('/campaigns/:id', async (req, res) => {
+    if (!isValidUUID(req.params.id)) {
+        return res.status(400).json({ error: 'INVALID_ID', message: 'Campaign ID must be a valid UUID' });
+    }
     try {
         const details = await campaignService.getCampaignDetails(req.params.id);
         return res.status(200).json({ success: true, ...details });
@@ -107,6 +115,9 @@ router.get('/campaigns/:id', async (req, res) => {
 // PATCH /campaigns/:id/status (Phase P.1G.5: Update Campaign Status)
 // -----------------------------------------------------------------------------
 router.patch('/campaigns/:id/status', async (req, res) => {
+    if (!isValidUUID(req.params.id)) {
+        return res.status(400).json({ error: 'INVALID_ID', message: 'Campaign ID must be a valid UUID' });
+    }
     try {
         const updated = await campaignService.updateCampaignStatus(req.params.id, req.body);
         return res.status(200).json({ success: true, campaign: updated });
@@ -123,6 +134,9 @@ router.patch('/campaigns/:id/status', async (req, res) => {
 // PATCH /campaigns/:id (Phase P.1G.5: Safe Update Campaign)
 // -----------------------------------------------------------------------------
 router.patch('/campaigns/:id', async (req, res) => {
+    if (!isValidUUID(req.params.id)) {
+        return res.status(400).json({ error: 'INVALID_ID', message: 'Campaign ID must be a valid UUID' });
+    }
     try {
         const updated = await campaignService.updateCampaign(req.params.id, req.body);
         return res.status(200).json({ success: true, campaign: updated });
@@ -139,6 +153,9 @@ router.patch('/campaigns/:id', async (req, res) => {
 // POST /campaigns/:id/links (Phase P.1G.5: Issue Tracked Link)
 // -----------------------------------------------------------------------------
 router.post('/campaigns/:id/links', async (req, res) => {
+    if (!isValidUUID(req.params.id)) {
+        return res.status(400).json({ error: 'INVALID_ID', message: 'Campaign ID must be a valid UUID' });
+    }
     try {
         const result = await campaignService.createTrackedLink(req.params.id, req.body);
         return res.status(201).json({ success: true, ...result });
@@ -155,6 +172,9 @@ router.post('/campaigns/:id/links', async (req, res) => {
 // GET /campaigns/:id/links (Phase P.1G.5: List Campaign Links)
 // -----------------------------------------------------------------------------
 router.get('/campaigns/:id/links', async (req, res) => {
+    if (!isValidUUID(req.params.id)) {
+        return res.status(400).json({ error: 'INVALID_ID', message: 'Campaign ID must be a valid UUID' });
+    }
     try {
         const links = await campaignService.getCampaignLinks(req.params.id);
         return res.status(200).json({ success: true, links });
@@ -171,6 +191,9 @@ router.get('/campaigns/:id/links', async (req, res) => {
 // PATCH /links/:id/status (Phase P.1G.5: Toggle Link Active)
 // -----------------------------------------------------------------------------
 router.patch('/links/:id/status', async (req, res) => {
+    if (!isValidUUID(req.params.id)) {
+        return res.status(400).json({ error: 'INVALID_ID', message: 'Link ID must be a valid UUID' });
+    }
     try {
         const updated = await campaignService.updateLinkStatus(req.params.id, req.body);
         return res.status(200).json({ success: true, link: updated });
