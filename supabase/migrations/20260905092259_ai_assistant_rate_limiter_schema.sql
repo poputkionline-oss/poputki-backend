@@ -70,19 +70,19 @@ CREATE OR REPLACE FUNCTION public.check_and_record_ai_request(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 AS $$
 DECLARE
-    v_now TIMESTAMPTZ := clock_timestamp();
-    v_today DATE := (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Dushanbe')::date;
-    v_burst_count INT;
-    v_daily_count INT;
-    v_global_count INT;
+    v_now pg_catalog.timestamptz := pg_catalog.clock_timestamp();
+    v_today pg_catalog.date := (pg_catalog.timezone('Asia/Dushanbe', pg_catalog.now()))::pg_catalog.date;
+    v_burst_count pg_catalog.int4;
+    v_daily_count pg_catalog.int4;
+    v_global_count pg_catalog.int4;
     v_existing RECORD;
 BEGIN
-    -- 0. Acquire user-level transaction advisory lock to guarantee strict serializability & atomicity
-    -- against concurrent parallel requests from the same user (burst race condition protection)
-    PERFORM pg_advisory_xact_lock(hashtext('ai_rate_limiter'), hashtext(p_telegram_id::text));
+    -- 0. Acquire user-level transaction advisory lock on p_telegram_id (bigint)
+    -- to guarantee strict serializability & atomicity against concurrent parallel requests
+    PERFORM pg_catalog.pg_advisory_xact_lock(p_telegram_id);
 
     -- Check for idempotency: if request_id already exists, return previous state
     SELECT id, status INTO v_existing 
@@ -90,7 +90,7 @@ BEGIN
     WHERE request_id = p_request_id;
 
     IF FOUND THEN
-        RETURN jsonb_build_object(
+        RETURN pg_catalog.jsonb_build_object(
             'allowed', false,
             'reason', 'DUPLICATE_REQUEST',
             'status', 'DUPLICATE'
@@ -98,14 +98,14 @@ BEGIN
     END IF;
 
     -- 1. Check burst limit (last 60 seconds)
-    SELECT COUNT(*) INTO v_burst_count
+    SELECT pg_catalog.count(*) INTO v_burst_count
     FROM public.ai_assistant_request_logs
     WHERE telegram_id = p_telegram_id
-      AND created_at >= (v_now - INTERVAL '60 seconds')
+      AND created_at >= (v_now - pg_catalog.interval '60 seconds')
       AND status IN ('ACCEPTED', 'SUCCESS');
 
     IF v_burst_count >= p_burst_limit THEN
-        RETURN jsonb_build_object(
+        RETURN pg_catalog.jsonb_build_object(
             'allowed', false,
             'reason', 'RATE_LIMITED_BURST',
             'status', 'RATE_LIMITED',
@@ -115,14 +115,14 @@ BEGIN
     END IF;
 
     -- 2. Check user daily limit (current date in Asia/Dushanbe)
-    SELECT COUNT(*) INTO v_daily_count
+    SELECT pg_catalog.count(*) INTO v_daily_count
     FROM public.ai_assistant_request_logs
     WHERE telegram_id = p_telegram_id
       AND day_date = v_today
       AND status IN ('ACCEPTED', 'SUCCESS');
 
     IF v_daily_count >= p_daily_limit THEN
-        RETURN jsonb_build_object(
+        RETURN pg_catalog.jsonb_build_object(
             'allowed', false,
             'reason', 'RATE_LIMITED_DAILY',
             'status', 'RATE_LIMITED',
@@ -132,13 +132,13 @@ BEGIN
     END IF;
 
     -- 3. Check global daily stop-loss limit
-    SELECT COUNT(*) INTO v_global_count
+    SELECT pg_catalog.count(*) INTO v_global_count
     FROM public.ai_assistant_request_logs
     WHERE day_date = v_today
       AND status IN ('ACCEPTED', 'SUCCESS');
 
     IF v_global_count >= p_global_daily_limit THEN
-        RETURN jsonb_build_object(
+        RETURN pg_catalog.jsonb_build_object(
             'allowed', false,
             'reason', 'RATE_LIMITED_GLOBAL_STOP_LOSS',
             'status', 'GLOBAL_LIMIT_EXCEEDED',
@@ -161,7 +161,7 @@ BEGIN
         'ACCEPTED'
     );
 
-    RETURN jsonb_build_object(
+    RETURN pg_catalog.jsonb_build_object(
         'allowed', true,
         'status', 'ACCEPTED',
         'burst_count', v_burst_count + 1,

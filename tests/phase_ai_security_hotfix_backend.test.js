@@ -99,13 +99,20 @@ describe('PHASE AI SECURITY HOTFIX — Backend Migrations & Search Contracts', (
     assert.ok(sql.includes('p_daily_limit INT DEFAULT 5'), 'Must have daily limit default 5');
     assert.ok(sql.includes('p_global_daily_limit INT DEFAULT 500'), 'Must have global stop-loss default 500');
 
-    // SECURITY DEFINER and search_path hardening
+    // SECURITY DEFINER and empty search_path hardening
     assert.ok(sql.includes('SECURITY DEFINER'), 'Must be SECURITY DEFINER');
-    assert.ok(sql.includes('SET search_path = public'), 'Must lock search_path to public');
-    assert.ok(!sql.includes('SET search_path = public, pg_temp'), 'Must NOT include pg_temp in search_path');
+    assert.ok(sql.includes("SET search_path = ''"), "Must strictly require empty search_path: SET search_path = ''");
+    assert.ok(!sql.includes('SET search_path = public'), 'Must strictly forbid search_path = public');
+    assert.ok(!sql.includes('pg_temp'), 'Must strictly forbid pg_temp');
 
-    // Concurrency advisory lock
-    assert.ok(sql.includes('pg_advisory_xact_lock'), 'Must acquire transaction advisory lock to eliminate race conditions');
+    // Fully qualified functions and objects check
+    assert.ok(sql.includes('pg_catalog.pg_advisory_xact_lock(p_telegram_id)'), 'Must acquire transaction advisory lock directly on bigint p_telegram_id');
+    assert.ok(sql.includes('pg_catalog.clock_timestamp()'), 'Must qualify clock_timestamp with pg_catalog');
+    assert.ok(sql.includes('pg_catalog.timezone('), 'Must qualify timezone with pg_catalog');
+    assert.ok(sql.includes('pg_catalog.now()'), 'Must qualify now with pg_catalog');
+    assert.ok(sql.includes('pg_catalog.count(*)'), 'Must qualify count with pg_catalog');
+    assert.ok(sql.includes('pg_catalog.jsonb_build_object('), 'Must qualify jsonb_build_object with pg_catalog');
+    assert.ok(sql.includes('public.ai_assistant_request_logs'), 'Must qualify tables with public');
 
     // EXECUTE grants strictly service_role
     assert.ok(sql.includes('REVOKE EXECUTE ON FUNCTION public.check_and_record_ai_request(BIGINT, TEXT, INT, INT, INT) FROM PUBLIC'), 'Must revoke from PUBLIC');
