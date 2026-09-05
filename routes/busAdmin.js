@@ -31,7 +31,12 @@ const {
     extractBookingIdFromToken
 } = require('../utils/ticketHelper');
 const { isValidPhone, cleanPhoneForStorage } = require('../utils/phoneHelper');
-const { completeTrip } = require('../utils/tripCompletionHelper');
+const { completeTrip, zonedTimeToUtcDate } = require('../utils/tripCompletionHelper');
+const {
+    renderTripChangeMessage,
+    processTripChangeOutbox
+} = require('../utils/tripChangeNotificationService');
+const { getServiceRoleClient } = require('../dbServiceRole');
 
 
 
@@ -381,67 +386,216 @@ router.put('/tickets/:id', async (req, res) => {
     }
 
     const { id } = req.params;
-    const updateData = { ...req.body };
-    const allowBusConflict = Boolean(updateData.allow_bus_conflict);
-    delete updateData.allow_bus_conflict;
-    
+    const body = { ...req.body };
+    const allowBusConflict = Boolean(body.allow_bus_conflict);
+    const seatRemap = Array.isArray(body.seat_remap) ? body.seat_remap : null;
+    const idempotencyKey = body.idempotency_key ? String(body.idempotency_key).trim() : null;
+
     // Strict ownership verification
     const hasAccess = await verifyTicketAccess(req.carrier, id);
     if (!hasAccess) {
         return res.status(403).json({ error: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
     }
 
-    // Remove metadata and ownership fields from updateData
-    delete updateData.id;
-    delete updateData.created_at;
-    delete updateData.operator_id; // prevent changing owner
+    // Explicit Allowlist of updateable fields
+    const ALLOWED_FIELDS = [
+        'transport_company', 'from_city', 'from_address', 'to_city', 'to_address',
+        'departure_date', 'departure_time', 'arrival_date', 'arrival_time',
+        'duration_minutes', 'price', 'premium_price', 'bus_id', 'bus_type',
+        'total_seats', 'floor1_seats', 'floor2_seats', 'passenger_comments',
+        'intermediate_stops', 'photos', 'group_leader_name', 'group_leader_phone',
+        'group_leader_whatsapp'
+    ];
+
+    const updateData = {};
+    for (const key of ALLOWED_FIELDS) {
+        if (body[key] !== undefined) {
+            updateData[key] = body[key];
+        }
+    }
 
     try {
-        // Fetch existing ticket to compare photos and audit diff
+        // 1. Fetch existing ticket
         const { data: oldTicket, error: otErr } = await supabase.from('bus_tickets').select('*').eq('id', id).single();
         if (otErr || !oldTicket) {
             return res.status(404).json({ error: 'Рейс не найден' });
         }
-        const oldPhotos = oldTicket?.photos || [];
 
-        // Check if bus replacement / assignment is requested
-        // Check if bus replacement / assignment is requested
-        let busReplaced = false;
-        let newBusMaster = null;
-        if (updateData.bus_id !== undefined) {
-            const replacement = await validateBusReplacement(
-                supabase,
-                req.carrier,
-                id,
-                updateData.bus_id,
-                { allowConflict: allowBusConflict }
-            );
+        // 2. Status check: Completed / Cancelled / Departed cannot be edited
+        if (oldTicket.status === 'completed' || oldTicket.status === 'cancelled') {
+            return res.status(400).json({ error: `Рейс со статусом "${oldTicket.status}" не подлежит редактированию` });
+        }
 
-            if (!replacement.valid) {
-                return res.status(replacement.status || 400).json({
-                    error: replacement.error,
-                    message: replacement.message,
-                    conflicts: replacement.conflicts,
-                    activeBookingCount: replacement.activeBookingCount
-                });
-            }
+        // Check if old trip has already departed
+        const now = new Date();
+        const oldDepartureInstant = zonedTimeToUtcDate(oldTicket.departure_date, oldTicket.departure_time);
+        if (oldDepartureInstant && oldDepartureInstant <= now) {
+            return res.status(400).json({ error: 'Нельзя редактировать рейс, время отправления которого уже наступило' });
+        }
 
-            if (!replacement.noOp && replacement.snapshot) {
-                busReplaced = true;
-                newBusMaster = replacement.newBus;
-                // Apply authoritative vehicle snapshot from carrier_buses master
-                updateData.bus_id = replacement.snapshot.bus_id;
-                updateData.bus_type = replacement.snapshot.bus_type;
-                updateData.total_seats = replacement.snapshot.total_seats;
-                updateData.floor1_seats = replacement.snapshot.floor1_seats;
-                updateData.floor2_seats = replacement.snapshot.floor2_seats;
-                updateData.photos = replacement.snapshot.photos;
+        // Check new departure date/time if provided
+        const newDepDate = updateData.departure_date || oldTicket.departure_date;
+        const newDepTime = updateData.departure_time || oldTicket.departure_time;
+        const newDepartureInstant = zonedTimeToUtcDate(newDepDate, newDepTime);
+        if (newDepartureInstant && newDepartureInstant <= now) {
+            return res.status(400).json({ error: 'Дата и время отправления должны быть в будущем' });
+        }
+
+        // Check new arrival date/time if provided
+        const newArrDate = updateData.arrival_date || oldTicket.arrival_date;
+        const newArrTime = updateData.arrival_time || oldTicket.arrival_time;
+        if (newArrDate && newArrTime) {
+            const newArrivalInstant = zonedTimeToUtcDate(newArrDate, newArrTime);
+            if (newArrivalInstant && newDepartureInstant && newArrivalInstant < newDepartureInstant) {
+                return res.status(400).json({ error: 'Дата и время прибытия не могут быть раньше отправления' });
             }
         }
 
+        // 3. Query active bookings (confirmed + non-expired pending_payment)
+        const { data: allBookings, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, passenger_id, claimed_by_user_id, seat_numbers, status, created_at, hold_expires_at, passengers_data')
+            .eq('bus_ticket_id', id)
+            .in('status', ['confirmed', 'pending_payment']);
+
+        if (bErr) throw bErr;
+
+        const activeBookings = (allBookings || []).filter(b => {
+            if (b.status === 'confirmed') return true;
+            if (b.status === 'pending_payment') {
+                const expiresAt = b.hold_expires_at ? new Date(b.hold_expires_at) : new Date(new Date(b.created_at).getTime() + 30 * 60 * 1000);
+                return expiresAt > now;
+            }
+            return false;
+        });
+
+        // 4. City change protection: if active bookings exist, from_city and to_city CANNOT be changed
+        if (activeBookings.length > 0) {
+            if ((updateData.from_city && updateData.from_city !== oldTicket.from_city) ||
+                (updateData.to_city && updateData.to_city !== oldTicket.to_city)) {
+                return res.status(409).json({
+                    error: 'ROUTE_CHANGE_REQUIRES_SEPARATE_TRIP',
+                    message: 'Нельзя изменить основные города маршрута при наличии активных бронирований. Создайте новый рейс или отмените текущий.'
+                });
+            }
+        }
+
+        // 5. Bus replacement validation
+        let busReplaced = false;
+        let newBusMaster = null;
+        const requestedBusId = updateData.bus_id;
+
+        if (requestedBusId !== undefined && (oldTicket.bus_id ? String(requestedBusId) !== String(oldTicket.bus_id) : Boolean(requestedBusId))) {
+            // Bus unassign policy
+            if (oldTicket.bus_id && (!requestedBusId || requestedBusId === '')) {
+                return res.status(400).json({ error: 'BUS_UNASSIGN_FORBIDDEN', message: 'Отвязка назначенного автобуса от рейса запрещена' });
+            }
+
+            // Verify new bus
+            newBusMaster = await verifyBusAccess(req.carrier, requestedBusId, { client: supabase });
+            if (!newBusMaster) {
+                return res.status(403).json({ error: 'BUS_NOT_FOUND', message: 'Выбранный автобус не найден или не принадлежит вашей компании' });
+            }
+            if (newBusMaster.status !== 'active') {
+                return res.status(409).json({ error: 'BUS_NOT_AVAILABLE', message: `Автобус недоступен (статус: ${newBusMaster.status})` });
+            }
+            if (!newBusMaster.total_seats || Number(newBusMaster.total_seats) <= 0) {
+                return res.status(400).json({ error: 'INVALID_BUS_CAPACITY', message: 'У выбранного автобуса некорректная вместимость' });
+            }
+
+            // Schedule conflict check
+            const conflicts = await checkBusScheduleConflict(
+                supabase,
+                req.carrier.carrier_id,
+                newBusMaster.id,
+                newDepDate,
+                newDepTime,
+                newArrDate,
+                newArrTime,
+                id
+            );
+            if (conflicts.length > 0 && !allowBusConflict) {
+                return res.status(409).json({
+                    error: 'BUS_SCHEDULE_CONFLICT',
+                    message: 'Обнаружен конфликт расписания для выбранного автобуса',
+                    conflicts
+                });
+            }
+
+            // Active bookings seat compatibility check
+            if (activeBookings.length > 0) {
+                const newTotalSeats = Number(newBusMaster.total_seats);
+                const occupiedSeatEntries = []; // { bookingId, seatNum }
+                for (const b of activeBookings) {
+                    const rawSeats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                    const seatsArr = Array.isArray(rawSeats) ? rawSeats : [rawSeats];
+                    seatsArr.forEach(s => occupiedSeatEntries.push({ bookingId: b.id, seatNum: Number(s) }));
+                }
+
+                const incompatibleEntries = occupiedSeatEntries.filter(e => isNaN(e.seatNum) || e.seatNum <= 0 || e.seatNum > newTotalSeats);
+
+                if (incompatibleEntries.length > 0) {
+                    // Requires seat remapping
+                    if (!seatRemap || seatRemap.length === 0) {
+                        return res.status(409).json({
+                            error: 'BUS_SEAT_REMAP_REQUIRED',
+                            message: 'В новом автобусе отсутствуют некоторые занятые места. Требуется переназначение мест.',
+                            newBus: {
+                                id: newBusMaster.id,
+                                total_seats: newTotalSeats,
+                                bus_type: newBusMaster.bus_type
+                            },
+                            affectedBookings: activeBookings.map(b => ({
+                                id: b.id,
+                                seat_numbers: typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : b.seat_numbers
+                            }))
+                        });
+                    }
+
+                    // Validate seatRemap payload
+                    const remapBookingIds = new Set(seatRemap.map(r => r.booking_id));
+                    for (const b of activeBookings) {
+                        if (!remapBookingIds.has(b.id)) {
+                            return res.status(400).json({ error: 'INCOMPLETE_SEAT_REMAP', message: 'Необходимо переназначить места для всех активных бронирований' });
+                        }
+                    }
+
+                    const assignedNewSeats = new Set();
+                    for (const remapItem of seatRemap) {
+                        const newSeats = Array.isArray(remapItem.new_seat_numbers) ? remapItem.new_seat_numbers : [remapItem.new_seat_numbers];
+                        if (newSeats.length === 0) {
+                            return res.status(400).json({ error: 'INVALID_SEAT_REMAP', message: 'Место не может быть пустым' });
+                        }
+                        for (const s of newSeats) {
+                            const num = Number(s);
+                            if (isNaN(num) || num <= 0 || num > newTotalSeats) {
+                                return res.status(400).json({ error: 'INVALID_SEAT_NUMBER', message: `Место ${s} не существует в новом автобусе` });
+                            }
+                            if (assignedNewSeats.has(num)) {
+                                return res.status(400).json({ error: 'DUPLICATE_SEAT_ASSIGNMENT', message: `Место ${num} назначено более одного раза` });
+                            }
+                            assignedNewSeats.add(num);
+                        }
+                    }
+                }
+            }
+
+            busReplaced = true;
+            updateData.bus_id = newBusMaster.id;
+            updateData.bus_type = newBusMaster.bus_type;
+            updateData.total_seats = Number(newBusMaster.total_seats);
+            updateData.floor1_seats = newBusMaster.bus_type === 'double' ? Number(newBusMaster.floor1_seats) : null;
+            updateData.floor2_seats = newBusMaster.bus_type === 'double' ? Number(newBusMaster.floor2_seats) : null;
+            if (newBusMaster.photos && newBusMaster.photos.length > 0) {
+                updateData.photos = newBusMaster.photos;
+            }
+        }
+
+        // Handle photos upload if not replaced by master bus
+        const oldPhotos = oldTicket?.photos || [];
         const incomingPhotos = updateData.photos;
         if (incomingPhotos !== undefined && !busReplaced) {
-            delete updateData.photos; // process and attach safely
+            delete updateData.photos;
             let newPhotoResults = [];
             if (incomingPhotos && Array.isArray(incomingPhotos)) {
                 for (const photo of incomingPhotos) {
@@ -451,7 +605,6 @@ router.put('/tickets/:id', async (req, res) => {
                             newPhotoResults.push({ url: r.url, public_id: r.public_id });
                         } catch(e) { console.error('Cloudinary upload error in PUT:', e); }
                     } else if (typeof photo === 'object' && photo.url && photo.public_id) {
-                        // Keep existing photo
                         newPhotoResults.push(photo);
                     }
                 }
@@ -459,25 +612,75 @@ router.put('/tickets/:id', async (req, res) => {
 
             const oldPublicIds = oldPhotos.map(p => p.public_id).filter(id => id);
             const newPublicIds = newPhotoResults.map(p => p.public_id).filter(id => id);
-
-            const idsToDelete = oldPublicIds.filter(id => !newPublicIds.includes(id));
+            const idsToDelete = oldPublicIds.filter(pid => !newPublicIds.includes(pid));
             for (const pid of idsToDelete) {
                 await deleteFromCloudinary(pid);
             }
-
             updateData.photos = newPhotoResults;
         }
 
-        // If bus was replaced via RPC, snapshot was already written atomically by RPC.
-        // Update any remaining ticket fields (route, dates, price, etc.)
-        const { error } = await supabase
+        // Detect changed fields and old/new diff
+        const oldValues = {};
+        const newValues = {};
+        const changedFields = [];
+
+        for (const [key, val] of Object.entries(updateData)) {
+            const oldVal = oldTicket[key];
+            const isDifferent = JSON.stringify(oldVal) !== JSON.stringify(val);
+            if (isDifferent) {
+                changedFields.push(key);
+                oldValues[key] = oldVal;
+                newValues[key] = val;
+            }
+        }
+
+        // 6. Idempotency Check
+        let existingEvent = null;
+        if (idempotencyKey) {
+            try {
+                const { data: ev } = await supabase
+                    .from('bus_ticket_change_events')
+                    .select('id, bus_ticket_id')
+                    .eq('idempotency_key', idempotencyKey)
+                    .maybeSingle();
+                existingEvent = ev;
+            } catch (ignoreErr) {}
+
+            if (existingEvent) {
+                return res.json({
+                    success: true,
+                    idempotent_replay: true,
+                    event_id: existingEvent.id,
+                    notificationsQueued: 0,
+                    unreachableCount: 0,
+                    seatsRemapped: 0
+                });
+            }
+        }
+
+        // 7. Update Ticket Record
+        const { error: updErr } = await supabase
             .from('bus_tickets')
             .update(updateData)
             .eq('id', id);
 
-        if (error) throw error;
+        if (updErr) throw updErr;
 
-        // Audit log ticket update
+        // Apply seat remappings if applicable
+        let seatsRemappedCount = 0;
+        if (seatRemap && seatRemap.length > 0) {
+            for (const remapItem of seatRemap) {
+                const newSeats = Array.isArray(remapItem.new_seat_numbers) ? remapItem.new_seat_numbers : [remapItem.new_seat_numbers];
+                await supabase
+                    .from('bus_ticket_bookings')
+                    .update({ seat_numbers: newSeats })
+                    .eq('id', remapItem.booking_id)
+                    .eq('bus_ticket_id', id);
+                seatsRemappedCount++;
+            }
+        }
+
+        // 8. Log Carrier Audit Activity
         await logCarrierActivity({
             supabase,
             carrierContext: req.carrier,
@@ -487,20 +690,156 @@ router.put('/tickets/:id', async (req, res) => {
             entityLabel: `Рейс ${oldTicket?.from_city || ''} → ${oldTicket?.to_city || ''} #${id}`,
             oldData: oldTicket,
             newData: { ...oldTicket, ...updateData },
-            metadata: busReplaced ? {
-                old_bus_id: oldTicket.bus_id,
-                new_bus_id: updateData.bus_id,
-                old_capacity: oldTicket.total_seats,
-                new_capacity: updateData.total_seats,
-                conflict_override: allowBusConflict
-            } : undefined
+            metadata: {
+                changed_fields: changedFields,
+                bus_replaced: busReplaced,
+                conflict_override: allowBusConflict,
+                seats_remapped: seatsRemappedCount
+            }
         });
 
-        res.json({ success: true, bus_replaced: busReplaced });
+        // 9. If active bookings exist and substantial fields changed, generate Change Event & Notification Outbox
+        let notificationsQueued = 0;
+        let unreachableCount = 0;
+
+        const SUBSTANTIAL_FIELDS = [
+            'departure_date', 'departure_time', 'arrival_date', 'arrival_time',
+            'from_address', 'to_address', 'intermediate_stops', 'bus_id',
+            'group_leader_name', 'group_leader_phone'
+        ];
+        const hasSubstantialChanges = changedFields.some(f => SUBSTANTIAL_FIELDS.includes(f)) || seatsRemappedCount > 0;
+
+        if (activeBookings.length > 0 && hasSubstantialChanges) {
+            const finalIdempotencyKey = idempotencyKey || `trip-edit-${id}-${Date.now()}`;
+            
+            // Try to write to bus_ticket_change_events via service role or fallback gracefully
+            let eventId = null;
+            let serviceClient = null;
+            try {
+                serviceClient = getServiceRoleClient();
+            } catch (e) {
+                serviceClient = supabase;
+            }
+
+            try {
+                const { data: changeEvent, error: evErr } = await serviceClient
+                    .from('bus_ticket_change_events')
+                    .insert({
+                        bus_ticket_id: id,
+                        operator_id: req.carrier.carrier_id,
+                        changed_by: req.carrier.user_id,
+                        change_type: busReplaced ? 'bus_replacement' : 'schedule_update',
+                        old_values: oldValues,
+                        new_values: newValues,
+                        changed_fields: changedFields,
+                        idempotency_key: finalIdempotencyKey
+                    })
+                    .select('id')
+                    .maybeSingle();
+
+                if (!evErr && changeEvent) {
+                    eventId = changeEvent.id;
+                }
+            } catch (e) {
+                console.warn('[BusAdmin] Notice: change event table write error (migration may be unapplied):', e.message);
+            }
+
+            // Gather passenger Telegram IDs
+            const userIds = [...new Set(activeBookings.map(b => b.claimed_by_user_id || b.passenger_id).filter(Boolean))];
+            let userTelegramMap = {};
+            let userLangMap = {};
+            if (userIds.length > 0) {
+                try {
+                    const { data: usersData } = await supabase
+                        .from('users')
+                        .select('id, telegram_id, language')
+                        .in('id', userIds);
+                    (usersData || []).forEach(u => {
+                        userTelegramMap[u.id] = u.telegram_id || null;
+                        userLangMap[u.id] = u.language || 'ru';
+                    });
+                } catch (e) {
+                    console.warn('[BusAdmin] Error fetching passenger user profiles:', e);
+                }
+            }
+
+            // Queue notification outbox per passenger booking
+            for (const b of activeBookings) {
+                const effectiveUserId = b.claimed_by_user_id || b.passenger_id;
+                const tgId = effectiveUserId ? userTelegramMap[effectiveUserId] : null;
+                const userLang = (effectiveUserId && userLangMap[effectiveUserId]) || 'ru';
+
+                // Seat change detection for this booking
+                let seatChange = null;
+                if (seatRemap) {
+                    const remap = seatRemap.find(r => r.booking_id === b.id);
+                    if (remap) {
+                        const oldSeats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : b.seat_numbers;
+                        seatChange = {
+                            oldSeat: Array.isArray(oldSeats) ? oldSeats.join(', ') : oldSeats,
+                            newSeat: Array.isArray(remap.new_seat_numbers) ? remap.new_seat_numbers.join(', ') : remap.new_seat_numbers
+                        };
+                    }
+                }
+
+                const msgPayload = renderTripChangeMessage({
+                    language: userLang,
+                    trip: { ...oldTicket, ...updateData },
+                    booking: b,
+                    changes: { oldValues, newValues, changedFields, seatChange }
+                });
+
+                const outboxStatus = tgId ? 'pending' : 'unreachable';
+                if (!tgId) {
+                    unreachableCount++;
+                } else {
+                    notificationsQueued++;
+                }
+
+                if (eventId) {
+                    try {
+                        await serviceClient
+                            .from('bus_ticket_notification_outbox')
+                            .insert({
+                                event_id: eventId,
+                                booking_id: b.id,
+                                recipient_user_id: effectiveUserId || null,
+                                recipient_telegram_id: tgId || null,
+                                channel: 'telegram',
+                                language: userLang,
+                                payload: msgPayload,
+                                status: outboxStatus,
+                                last_error_code: tgId ? null : 'NO_TELEGRAM_ID'
+                            });
+                    } catch (obErr) {
+                        console.warn('[BusAdmin] Outbox record error:', obErr.message);
+                    }
+                }
+            }
+
+            // Trigger outbox sender in background (mocked / safe dry-run)
+            if (eventId && notificationsQueued > 0) {
+                processTripChangeOutbox({
+                    supabaseClient: serviceClient,
+                    eventId,
+                    dryRun: process.env.NOTIFICATION_DELIVERY_ENABLED !== 'true'
+                }).catch(err => console.error('[BusAdmin] Outbox background dispatch error:', err));
+            }
+        }
+
+        res.json({
+            success: true,
+            bus_replaced: busReplaced,
+            notificationsQueued,
+            unreachableCount,
+            seatsRemapped: seatsRemappedCount
+        });
     } catch (err) {
+        console.error('[BusAdmin] Error in PUT /tickets/:id:', err);
         res.status(500).json({ error: err.message });
     }
 });
+
 
 /**
  * @swagger
