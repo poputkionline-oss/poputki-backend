@@ -19,8 +19,9 @@ CREATE TABLE IF NOT EXISTS public.bus_ticket_change_events (
     old_values JSONB NOT NULL DEFAULT '{}'::jsonb,
     new_values JSONB NOT NULL DEFAULT '{}'::jsonb,
     changed_fields TEXT[] NOT NULL DEFAULT '{}',
-    idempotency_key TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    idempotency_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_bus_ticket_change_events_operator_ticket_key UNIQUE (operator_id, bus_ticket_id, idempotency_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bus_ticket_change_events_ticket_id 
@@ -64,6 +65,10 @@ CREATE TABLE IF NOT EXISTS public.bus_ticket_notification_outbox (
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     sent_at TIMESTAMPTZ NULL,
     last_error_code TEXT NULL,
+    processing_token TEXT NULL,
+    processing_started_at TIMESTAMPTZ NULL,
+    lease_expires_at TIMESTAMPTZ NULL,
+    telegram_message_id BIGINT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_bus_ticket_notif_outbox_event_booking_channel UNIQUE (event_id, booking_id, channel)
 );
@@ -83,12 +88,12 @@ REVOKE ALL ON TABLE public.bus_ticket_notification_outbox FROM PUBLIC, anon, aut
 GRANT ALL ON TABLE public.bus_ticket_notification_outbox TO service_role;
 
 
--- 3. Atomic RPC for Seat Remapping & Bus Update (If DB-level atomic execution is invoked)
+-- 3. Atomic RPC for Seat Remapping & Bus Update
 CREATE OR REPLACE FUNCTION public.fn_atomic_bus_trip_update(
     p_ticket_id INTEGER,
     p_operator_id INTEGER,
     p_update_data JSONB,
-    p_seat_remap JSONB, -- e.g. [{"booking_id": 10, "new_seat_numbers": [14]}]
+    p_seat_remap JSONB, -- [{"booking_id": 10, "seat_mappings": [{"old_seat": 5, "new_seat": 15}]}]
     p_event_data JSONB,
     p_outbox_entries JSONB
 )
@@ -101,31 +106,47 @@ DECLARE
     v_ticket RECORD;
     v_remap_item JSONB;
     v_b_id INTEGER;
-    v_new_seats JSONB;
+    v_seat_mappings JSONB;
+    v_mapping_item JSONB;
+    v_new_seats INTEGER[];
+    v_current_seats INTEGER[];
+    v_old_seat INTEGER;
+    v_new_seat INTEGER;
     v_event_id UUID;
     v_outbox_item JSONB;
     v_existing_event RECORD;
     v_idempotency_key TEXT;
+    v_active_bookings_count INTEGER;
+    v_all_assigned_seats INTEGER[] := '{}';
+    v_total_seats INTEGER;
+    v_sync_reserved_seats INTEGER[];
+    v_now_instant TIMESTAMPTZ := NOW();
+    v_departure_date DATE;
+    v_departure_time TEXT;
+    v_departure_instant TIMESTAMPTZ;
 BEGIN
     v_idempotency_key := p_event_data->>'idempotency_key';
 
-    -- Check idempotency
+    -- 1. Check idempotency in scope (operator_id, bus_ticket_id, idempotency_key)
     IF v_idempotency_key IS NOT NULL THEN
-        SELECT id INTO v_existing_event 
+        SELECT id, bus_ticket_id INTO v_existing_event 
         FROM public.bus_ticket_change_events 
-        WHERE idempotency_key = v_idempotency_key;
+        WHERE operator_id = p_operator_id 
+          AND bus_ticket_id = p_ticket_id 
+          AND idempotency_key = v_idempotency_key;
 
         IF v_existing_event.id IS NOT NULL THEN
             RETURN jsonb_build_object(
                 'success', true,
                 'idempotent_replay', true,
-                'event_id', v_existing_event.id
+                'event_id', v_existing_event.id,
+                'ticket_id', p_ticket_id
             );
         END IF;
     END IF;
 
-    -- Lock ticket
-    SELECT id, operator_id, status, departure_date, departure_time
+    -- 2. Lock ticket row FOR UPDATE
+    SELECT id, operator_id, status, from_city, to_city, departure_date, departure_time, total_seats, bus_id
     INTO v_ticket
     FROM public.bus_tickets
     WHERE id = p_ticket_id
@@ -143,11 +164,98 @@ BEGIN
         RETURN jsonb_build_object('success', false, 'error', 'TICKET_NOT_ACTIVE');
     END IF;
 
-    -- Update bus_tickets fields
+    -- 3. Check departure not in the past
+    v_departure_date := COALESCE((p_update_data->>'departure_date')::date, v_ticket.departure_date);
+    v_departure_time := COALESCE(p_update_data->>'departure_time', v_ticket.departure_time, '00:00:00');
+    v_departure_instant := (v_departure_date || ' ' || substring(v_departure_time from 1 for 8) || '+05:00')::timestamptz;
+
+    IF v_departure_instant <= v_now_instant THEN
+        RETURN jsonb_build_object('success', false, 'error', 'DEPARTURE_CANNOT_BE_IN_PAST');
+    END IF;
+
+    -- 4. Check active bookings with lock
+    SELECT COUNT(*) INTO v_active_bookings_count
+    FROM public.bus_ticket_bookings
+    WHERE bus_ticket_id = p_ticket_id
+      AND (
+          status = 'confirmed' 
+          OR (status = 'pending_payment' AND (hold_expires_at IS NULL OR hold_expires_at > v_now_instant))
+      );
+
+    -- 5. Primary route protection if active bookings exist
+    IF v_active_bookings_count > 0 THEN
+        IF p_update_data ? 'from_city' AND (p_update_data->>'from_city') != v_ticket.from_city THEN
+            RETURN jsonb_build_object('success', false, 'error', 'ROUTE_CHANGE_REQUIRES_SEPARATE_TRIP');
+        END IF;
+        IF p_update_data ? 'to_city' AND (p_update_data->>'to_city') != v_ticket.to_city THEN
+            RETURN jsonb_build_object('success', false, 'error', 'ROUTE_CHANGE_REQUIRES_SEPARATE_TRIP');
+        END IF;
+    END IF;
+
+    v_total_seats := COALESCE((p_update_data->>'total_seats')::integer, v_ticket.total_seats);
+
+    -- 6. Apply group seat remapping if provided
+    IF p_seat_remap IS NOT NULL AND jsonb_array_length(p_seat_remap) > 0 THEN
+        FOR v_remap_item IN SELECT * FROM jsonb_array_elements(p_seat_remap)
+        LOOP
+            v_b_id := (v_remap_item->>'booking_id')::integer;
+            v_seat_mappings := v_remap_item->'seat_mappings';
+            v_new_seats := '{}';
+
+            -- Lock booking
+            SELECT seat_numbers INTO v_current_seats
+            FROM public.bus_ticket_bookings
+            WHERE id = v_b_id AND bus_ticket_id = p_ticket_id
+            FOR UPDATE;
+
+            IF v_current_seats IS NULL THEN
+                RETURN jsonb_build_object('success', false, 'error', 'BOOKING_NOT_FOUND', 'booking_id', v_b_id);
+            END IF;
+
+            IF jsonb_array_length(v_seat_mappings) != cardinality(v_current_seats) THEN
+                RETURN jsonb_build_object('success', false, 'error', 'SEAT_COUNT_MISMATCH', 'booking_id', v_b_id);
+            END IF;
+
+            FOR v_mapping_item IN SELECT * FROM jsonb_array_elements(v_seat_mappings)
+            LOOP
+                v_old_seat := (v_mapping_item->>'old_seat')::integer;
+                v_new_seat := (v_mapping_item->>'new_seat')::integer;
+
+                IF v_new_seat <= 0 OR v_new_seat > v_total_seats THEN
+                    RETURN jsonb_build_object('success', false, 'error', 'INVALID_SEAT_NUMBER', 'seat', v_new_seat);
+                END IF;
+
+                IF v_new_seat = ANY(v_all_assigned_seats) THEN
+                    RETURN jsonb_build_object('success', false, 'error', 'DUPLICATE_SEAT_ASSIGNMENT', 'seat', v_new_seat);
+                END IF;
+
+                v_all_assigned_seats := array_append(v_all_assigned_seats, v_new_seat);
+                v_new_seats := array_append(v_new_seats, v_new_seat);
+            END LOOP;
+
+            UPDATE public.bus_ticket_bookings
+            SET seat_numbers = v_new_seats
+            WHERE id = v_b_id AND bus_ticket_id = p_ticket_id;
+        END LOOP;
+
+        -- Synchronize reserved_seats from all active bookings after remap
+        SELECT COALESCE(ARRAY(
+            SELECT DISTINCT unnest(seat_numbers)
+            FROM public.bus_ticket_bookings
+            WHERE bus_ticket_id = p_ticket_id
+              AND (
+                  status = 'confirmed' 
+                  OR (status = 'pending_payment' AND (hold_expires_at IS NULL OR hold_expires_at > v_now_instant))
+              )
+            ORDER BY 1
+        ), '{}') INTO v_sync_reserved_seats;
+    END IF;
+
+    -- 7. Update bus_tickets fields
     UPDATE public.bus_tickets
     SET
-        departure_date = COALESCE((p_update_data->>'departure_date')::date, departure_date),
-        departure_time = COALESCE(p_update_data->>'departure_time', departure_time),
+        departure_date = v_departure_date,
+        departure_time = v_departure_time,
         arrival_date = COALESCE((p_update_data->>'arrival_date')::date, arrival_date),
         arrival_time = COALESCE(p_update_data->>'arrival_time', arrival_time),
         duration_minutes = COALESCE((p_update_data->>'duration_minutes')::integer, duration_minutes),
@@ -156,7 +264,7 @@ BEGIN
         intermediate_stops = CASE WHEN p_update_data ? 'intermediate_stops' THEN p_update_data->'intermediate_stops' ELSE intermediate_stops END,
         bus_id = CASE WHEN p_update_data ? 'bus_id' THEN (p_update_data->>'bus_id')::integer ELSE bus_id END,
         bus_type = COALESCE(p_update_data->>'bus_type', bus_type),
-        total_seats = COALESCE((p_update_data->>'total_seats')::integer, total_seats),
+        total_seats = v_total_seats,
         floor1_seats = CASE WHEN p_update_data ? 'floor1_seats' THEN (p_update_data->>'floor1_seats')::integer ELSE floor1_seats END,
         floor2_seats = CASE WHEN p_update_data ? 'floor2_seats' THEN (p_update_data->>'floor2_seats')::integer ELSE floor2_seats END,
         price = COALESCE((p_update_data->>'price')::numeric, price),
@@ -165,23 +273,15 @@ BEGIN
         photos = CASE WHEN p_update_data ? 'photos' THEN p_update_data->'photos' ELSE photos END,
         group_leader_name = CASE WHEN p_update_data ? 'group_leader_name' THEN p_update_data->>'group_leader_name' ELSE group_leader_name END,
         group_leader_phone = CASE WHEN p_update_data ? 'group_leader_phone' THEN p_update_data->>'group_leader_phone' ELSE group_leader_phone END,
-        group_leader_whatsapp = CASE WHEN p_update_data ? 'group_leader_whatsapp' THEN p_update_data->>'group_leader_whatsapp' ELSE group_leader_whatsapp END
+        group_leader_whatsapp = CASE WHEN p_update_data ? 'group_leader_whatsapp' THEN p_update_data->>'group_leader_whatsapp' ELSE group_leader_whatsapp END,
+        reserved_seats = CASE 
+            WHEN p_seat_remap IS NOT NULL AND jsonb_array_length(p_seat_remap) > 0 
+            THEN v_sync_reserved_seats 
+            ELSE reserved_seats 
+        END
     WHERE id = p_ticket_id;
 
-    -- Apply seat remapping if provided
-    IF p_seat_remap IS NOT NULL AND jsonb_array_length(p_seat_remap) > 0 THEN
-        FOR v_remap_item IN SELECT * FROM jsonb_array_elements(p_seat_remap)
-        LOOP
-            v_b_id := (v_remap_item->>'booking_id')::integer;
-            v_new_seats := v_remap_item->'new_seat_numbers';
-            
-            UPDATE public.bus_ticket_bookings
-            SET seat_numbers = v_new_seats
-            WHERE id = v_b_id AND bus_ticket_id = p_ticket_id;
-        END LOOP;
-    END IF;
-
-    -- Record change event
+    -- 8. Record immutable change event
     INSERT INTO public.bus_ticket_change_events (
         bus_ticket_id,
         operator_id,
@@ -202,7 +302,41 @@ BEGIN
         v_idempotency_key
     ) RETURNING id INTO v_event_id;
 
-    -- Insert notification outbox records
+    -- Atomic Carrier Activity Audit Log (dual-write within same transaction)
+    BEGIN
+        INSERT INTO public.carrier_activity_logs (
+            carrier_id,
+            actor_user_id,
+            actor_role,
+            actor_name,
+            action,
+            entity_type,
+            entity_id,
+            entity_label,
+            old_data,
+            new_data,
+            metadata,
+            created_at
+        ) VALUES (
+            p_operator_id,
+            COALESCE((p_event_data->>'changed_by')::integer, 0),
+            COALESCE(p_event_data->>'actor_role', 'owner'),
+            COALESCE(p_event_data->>'actor_name', 'Сотрудник'),
+            'ticket_updated',
+            'ticket',
+            p_ticket_id::text,
+            'Рейс #' || p_ticket_id,
+            COALESCE(p_event_data->'old_values', '{}'::jsonb),
+            COALESCE(p_event_data->'new_values', '{}'::jsonb),
+            jsonb_build_object('source', 'atomic_trip_update', 'idempotency_key', v_idempotency_key),
+            v_now_instant
+        );
+    EXCEPTION WHEN undefined_table THEN
+        -- carrier_activity_logs does not exist in minimal environments, non-fatal
+        NULL;
+    END;
+
+    -- 9. Insert notification outbox records
     IF p_outbox_entries IS NOT NULL AND jsonb_array_length(p_outbox_entries) > 0 THEN
         FOR v_outbox_item IN SELECT * FROM jsonb_array_elements(p_outbox_entries)
         LOOP
@@ -238,5 +372,85 @@ $$;
 
 REVOKE ALL ON FUNCTION public.fn_atomic_bus_trip_update FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.fn_atomic_bus_trip_update TO service_role;
+
+
+-- 4. Atomic Outbox Claim Function with FOR UPDATE SKIP LOCKED
+CREATE OR REPLACE FUNCTION public.fn_claim_bus_trip_notification_batch(
+    p_batch_size INTEGER DEFAULT 10,
+    p_worker_token TEXT DEFAULT gen_random_uuid()::text,
+    p_lease_seconds INTEGER DEFAULT 60
+)
+RETURNS TABLE (
+    outbox_id UUID,
+    event_id UUID,
+    booking_id INTEGER,
+    recipient_user_id INTEGER,
+    recipient_telegram_id BIGINT,
+    channel TEXT,
+    language TEXT,
+    payload JSONB,
+    attempt_count INTEGER,
+    processing_token TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_now TIMESTAMPTZ := NOW();
+    v_lease_expiry TIMESTAMPTZ := v_now + (p_lease_seconds || ' seconds')::interval;
+BEGIN
+    RETURN QUERY
+    WITH candidate_records AS (
+        SELECT id
+        FROM public.bus_ticket_notification_outbox
+        WHERE channel = 'telegram'
+          AND (
+              (status = 'pending' AND next_attempt_at <= v_now)
+              OR (status = 'processing' AND lease_expires_at < v_now)
+          )
+        ORDER BY created_at ASC
+        LIMIT p_batch_size
+        FOR UPDATE SKIP LOCKED
+    ),
+    claimed_records AS (
+        UPDATE public.bus_ticket_notification_outbox o
+        SET
+            status = 'processing',
+            processing_token = p_worker_token,
+            processing_started_at = v_now,
+            lease_expires_at = v_lease_expiry,
+            attempt_count = o.attempt_count + 1
+        FROM candidate_records c
+        WHERE o.id = c.id
+        RETURNING
+            o.id,
+            o.event_id,
+            o.booking_id,
+            o.recipient_user_id,
+            o.recipient_telegram_id,
+            o.channel,
+            o.language,
+            o.payload,
+            o.attempt_count,
+            o.processing_token
+    )
+    SELECT
+        cr.id AS outbox_id,
+        cr.event_id,
+        cr.booking_id,
+        cr.recipient_user_id,
+        cr.recipient_telegram_id,
+        cr.channel,
+        cr.language,
+        cr.payload,
+        cr.attempt_count,
+        cr.processing_token
+    FROM claimed_records cr;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.fn_claim_bus_trip_notification_batch FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.fn_claim_bus_trip_notification_batch TO service_role;
 
 COMMIT;

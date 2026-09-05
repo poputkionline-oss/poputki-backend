@@ -20,6 +20,7 @@
 
 const { expirePendingPaymentBookings } = require('./paymentExpirationHelper');
 const { sweepAutoCompleteTrips } = require('./tripCompletionHelper');
+const { processTripChangeOutbox } = require('./tripChangeNotificationService');
 const defaultSupabase = require('../db');
 
 /**
@@ -55,8 +56,20 @@ async function runMaintenanceTick(options = {}) {
         tasks.auto_complete = { success: false, error: err.message || 'AUTO_COMPLETE_FAILED' };
     }
 
+    try {
+        const outboxResult = await processTripChangeOutbox({
+            supabaseClient: dbClient,
+            batchSize: 20,
+            dryRun
+        });
+        tasks.trip_change_outbox = { success: true, ...outboxResult };
+    } catch (err) {
+        console.error('[MaintenanceTick] trip_change_outbox task failed:', err.message);
+        tasks.trip_change_outbox = { success: false, error: err.message || 'OUTBOX_PROCESSING_FAILED' };
+    }
+
     return {
-        success: Boolean(tasks.expire_pending.success && tasks.auto_complete.success),
+        success: Boolean(tasks.expire_pending.success && tasks.auto_complete.success && tasks.trip_change_outbox.success),
         timestamp,
         tasks
     };
