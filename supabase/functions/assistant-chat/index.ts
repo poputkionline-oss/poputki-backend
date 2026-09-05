@@ -354,7 +354,7 @@ Deno.serve(async (req: Request) => {
   const anthropicApiKey = Deno.env.get('ANTHROPIC_API_KEY');
   const supabaseUrl = Deno.env.get('SUPABASE_URL');
   const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-  const model = Deno.env.get('ANTHROPIC_MODEL') || 'claude-3-5-sonnet-latest';
+  const model = Deno.env.get('ANTHROPIC_MODEL') || 'claude-sonnet-5';
 
   if (!anthropicApiKey || !supabaseUrl || !supabaseServiceKey) {
     return new Response(JSON.stringify({ error: 'SERVICE_UNCONFIGURED' }), {
