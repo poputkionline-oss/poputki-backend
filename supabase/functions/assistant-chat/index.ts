@@ -95,9 +95,16 @@ const SYSTEM_PROMPT = `Ты — официальный AI-ассистент POP
 6. БАГАЖ И ВРЕМЯ:
    - В автобусный билет обычно входит 1 место багажа (до 25-30 кг). За крупный багаж и посылки условия согласовываются с диспетчером рейса.
    - Время в пути является ориентировочным, так как зависит от времени прохождения пограничных пунктов.
-7. СТИЛЬ:
-   - Отвечай вежливо, кратко, на языке вопроса пользователя (русский / таджикский / узбекский).
-   - Не упоминай названия инструментов и внутреннее устройство системы.`;
+7. ЯЗЫК ОТВЕТА:
+   - Определяй язык ответа (русский, таджикский или узбекский) СТРОГО по ПОСЛЕДНЕМУ входящему сообщению пользователя.
+   - Игнорируй язык предыдущих сообщений в истории чата: если последнее сообщение на русском — отвечай строго на русском, если на таджикском — на таджикском, если на узбекском — на узбекском.
+8. ФОРМАТ ВЫВОДА РЕЙСОВ:
+   - Когда инструмент search_trips вернул рейсы, сформируй ТОЛЬКО ОДНО короткое вводное предложение (например: «Вот найденные варианты по вашему запросу:»).
+   - НЕ создавай Markdown-заголовки (###), НЕ дублируй карточки поездок вручную, НЕ используй жирные маркеры (**), так как структурированные карточки и кнопки бронирования выводятся клиентом автоматически из данных инструмента.
+   - НИКОГДА не переопределяй и не изменяй значения полей, возвращенных инструментом.
+9. СТИЛЬ:
+   - Отвечай вежливо, кратко.
+   - Не упоминай названия внутренних инструментов и технические детали.`;
 
 async function searchTrips(
   supabase: ReturnType<typeof createClient>,
@@ -115,7 +122,7 @@ async function searchTrips(
   if (tripType === 'all' || tripType === 'rides') {
     let q = supabase
       .from('rides')
-      .select('id,from_city,to_city,date,time,price,total_seats,seats,reserved_seats,allows_delivery,users:driver_id(name,rating,role)')
+      .select('id,from_city,to_city,date,time,price,total_seats,seats,reserved_seats,allows_delivery,scraper_metadata,users:driver_id(name,rating,role),bookings:bookings(id,seat_number)')
       .eq('status', 'active')
       .eq('is_passenger_entry', false)
       .or(`date.gt.${currentDate},and(date.eq.${currentDate},time.gte.${currentTime})`)
@@ -130,14 +137,75 @@ async function searchTrips(
     const { data: ridesData, error: ridesErr } = await q;
     if (!ridesErr && Array.isArray(ridesData)) {
       for (const r of ridesData) {
-        const reservedCount = Array.isArray(r.reserved_seats) ? r.reserved_seats.length : 0;
-        const totalCapacity = Number(r.total_seats || ((r.seats || 4) + 1));
-        const availableSeats = Math.max(0, totalCapacity - reservedCount);
+        // Deduplicate occupied seat numbers between reserved_seats and bookings
+        const occupiedSeats = new Set<string | number>();
+        if (Array.isArray(r.reserved_seats)) {
+          for (const s of r.reserved_seats) {
+            if (s !== null && s !== undefined && s !== '') {
+              occupiedSeats.add(Number(s) || s);
+            }
+          }
+        } else if (typeof r.reserved_seats === 'string') {
+          try {
+            const parsed = JSON.parse(r.reserved_seats);
+            if (Array.isArray(parsed)) {
+              for (const s of parsed) {
+                if (s !== null && s !== undefined && s !== '') {
+                  occupiedSeats.add(Number(s) || s);
+                }
+              }
+            }
+          } catch {
+            // Ignore JSON parse error
+          }
+        }
+
+        let nonNumberedBookings = 0;
+        if (Array.isArray(r.bookings)) {
+          for (const b of r.bookings) {
+            if (b && b.seat_number !== null && b.seat_number !== undefined && b.seat_number !== '') {
+              occupiedSeats.add(Number(b.seat_number) || b.seat_number);
+            } else if (b && b.id !== undefined) {
+              nonNumberedBookings++;
+            }
+          }
+        }
+
+        const totalOccupied = occupiedSeats.size + nonNumberedBookings;
+        // seats represents passenger booking capacity (e.g. 3). Fallback to total_seats - 1 if seats is missing.
+        const passengerCapacity = Number(r.seats !== undefined && r.seats !== null ? r.seats : Math.max(1, (r.total_seats || 4) - 1));
+        // Strict boundary: 0 <= availableSeats <= passengerCapacity
+        const availableSeats = Math.max(0, Math.min(passengerCapacity, passengerCapacity - totalOccupied));
 
         // Strict filter: only offer rides with seats available
         if (availableSeats <= 0) continue;
 
+        // Carrier name priority:
+        // 1. scraper_metadata.first_name (+ last_name)
+        // 2. users.name
+        // 3. Fallback neutral: 'Водитель'
         const driver = Array.isArray(r.users) ? r.users[0] : (r.users || {});
+        let driverName = '';
+
+        if (r.scraper_metadata) {
+          try {
+            const meta = typeof r.scraper_metadata === 'string' ? JSON.parse(r.scraper_metadata) : r.scraper_metadata;
+            if (meta && typeof meta.first_name === 'string' && meta.first_name.trim()) {
+              driverName = meta.first_name.trim() + (meta.last_name && typeof meta.last_name === 'string' && meta.last_name.trim() ? ' ' + meta.last_name.trim() : '');
+            }
+          } catch {
+            // Ignore JSON parse error
+          }
+        }
+
+        if (!driverName && driver && typeof driver.name === 'string' && driver.name.trim()) {
+          driverName = driver.name.trim();
+        }
+
+        if (!driverName) {
+          driverName = 'Водитель';
+        }
+
         results.push({
           type: 'carpool',
           id: r.id,
@@ -148,7 +216,7 @@ async function searchTrips(
           price_somoni: r.price,
           seats_available: availableSeats,
           allows_delivery: !!r.allows_delivery,
-          driver_name: driver.name || 'Водитель POPUTKI',
+          driver_name: driverName,
           driver_rating: driver.rating || 5.0,
           verified: driver.role === 'driver',
           booking_path: `/ride/${r.id}`
@@ -202,6 +270,8 @@ async function searchTrips(
           transport_company: b.transport_company || 'POPUTKI.ONLINE',
           from_city: b.from_city,
           to_city: b.to_city,
+          date: b.departure_date,
+          time: b.departure_time ? String(b.departure_time).slice(0, 5) : '08:00',
           departure_date: b.departure_date,
           departure_time: b.departure_time ? String(b.departure_time).slice(0, 5) : '08:00',
           price_somoni: b.price,
