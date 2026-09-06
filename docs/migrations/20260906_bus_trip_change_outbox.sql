@@ -40,7 +40,7 @@ CREATE POLICY p_bus_ticket_change_events_carrier_select
     TO authenticated
     USING (
         operator_id IN (
-            SELECT carrier_id FROM public.carrier_users WHERE user_id = auth.uid()
+            SELECT carrier_id FROM public.carrier_members WHERE user_id::text = auth.uid()::text
         )
     );
 
