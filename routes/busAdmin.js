@@ -38,6 +38,16 @@ const {
 } = require('../utils/tripChangeNotificationService');
 const { getServiceRoleClient } = require('../dbServiceRole');
 
+function getRequiredServiceClient() {
+    try {
+        const client = getServiceRoleClient();
+        if (!client) return null;
+        return client;
+    } catch (_) {
+        return null;
+    }
+}
+
 
 
 /**
@@ -492,7 +502,11 @@ router.put('/tickets/:id', async (req, res) => {
             }
 
             // Verify new bus
-            newBusMaster = await verifyBusAccess(req.carrier, requestedBusId, { client: supabase });
+            const serviceClient = getRequiredServiceClient();
+            if (!serviceClient) {
+                return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+            }
+            newBusMaster = await verifyBusAccess(req.carrier, requestedBusId, { client: serviceClient });
             if (!newBusMaster) {
                 return res.status(403).json({ error: 'BUS_NOT_FOUND', message: 'Выбранный автобус не найден или не принадлежит вашей компании' });
             }
@@ -2340,12 +2354,16 @@ router.get('/tickets/:ticketId/print-manifest', async (req, res) => {
         // Fetch master bus vehicle if bus_id is present
         let busMaster = null;
         if (ticket.bus_id) {
-            const { data: bData } = await supabase
-                .from('carrier_buses')
-                .select('*')
-                .eq('id', ticket.bus_id)
-                .maybeSingle();
-            busMaster = bData || null;
+            const serviceClient = getRequiredServiceClient();
+            if (serviceClient) {
+                const { data: bData } = await serviceClient
+                    .from('carrier_buses')
+                    .select('*')
+                    .eq('id', ticket.bus_id)
+                    .eq('carrier_id', req.carrier.carrier_id)
+                    .maybeSingle();
+                busMaster = bData || null;
+            }
         }
 
         // Fetch all bookings for this ticket
@@ -2433,20 +2451,24 @@ router.get('/bookings/:bookingId/ticket', async (req, res) => {
 
         let busMaster = null;
         if (ticket.bus_id) {
-            const { data: bData } = await supabase
-                .from('carrier_buses')
-                .select('*')
-                .eq('id', ticket.bus_id)
-                .maybeSingle();
-            busMaster = bData || null;
+            const serviceClient = getRequiredServiceClient();
+            if (serviceClient) {
+                const { data: bData } = await serviceClient
+                    .from('carrier_buses')
+                    .select('*')
+                    .eq('id', ticket.bus_id)
+                    .eq('carrier_id', req.carrier.carrier_id)
+                    .maybeSingle();
+                busMaster = bData || null;
+            }
         }
 
         const ticketProjection = buildPassengerTicketProjection(booking, ticket, busMaster, { includeCarrierPhone: true });
 
         res.json(ticketProjection);
     } catch (err) {
-        console.error('[BusAdmin Single Ticket] Error:', err);
-        res.status(500).json({ error: err.message || 'Ошибка формирования билета' });
+        console.error('[BusAdmin Single Ticket] Error:', err.message);
+        res.status(500).json({ error: 'Ошибка формирования билета' });
     }
 });
 
@@ -3477,10 +3499,15 @@ router.get('/buses', async (req, res) => {
         return res.status(403).json({ error: 'Водители не имеют доступа к автопарку' });
     }
 
+    const serviceClient = getRequiredServiceClient();
+    if (!serviceClient) {
+        return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+    }
+
     const carrierId = req.carrier.carrier_id;
 
     try {
-        let query = supabase
+        let query = serviceClient
             .from('carrier_buses')
             .select('*')
             .eq('carrier_id', carrierId);
@@ -3495,7 +3522,7 @@ router.get('/buses', async (req, res) => {
 
         res.json(buses || []);
     } catch (err) {
-        console.error('[BusAdmin Fleet] Error fetching buses:', err);
+        console.error('[BusAdmin Fleet] Error fetching buses:', err.message);
         res.status(500).json({ error: 'Ошибка загрузки списка автобусов' });
     }
 });
@@ -3512,16 +3539,21 @@ router.get('/buses/:id', async (req, res) => {
         return res.status(403).json({ error: 'Водители не имеют доступа к автопарку' });
     }
 
+    const serviceClient = getRequiredServiceClient();
+    if (!serviceClient) {
+        return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+    }
+
     const busId = req.params.id;
 
     try {
-        const bus = await verifyBusAccess(req.carrier, busId, { allowArchived: true });
+        const bus = await verifyBusAccess(req.carrier, busId, { allowArchived: true, client: serviceClient });
         if (!bus) {
             return res.status(404).json({ error: 'Автобус не найден или доступ запрещен' });
         }
 
         // Fetch active tickets count for operational awareness
-        const activeTickets = await getBusActiveTickets(supabase, req.carrier.carrier_id, bus.id);
+        const activeTickets = await getBusActiveTickets(serviceClient, req.carrier.carrier_id, bus.id);
 
         res.json({
             ...bus,
@@ -3529,7 +3561,7 @@ router.get('/buses/:id', async (req, res) => {
             active_tickets_count: activeTickets.length
         });
     } catch (err) {
-        console.error('[BusAdmin Fleet] Error fetching bus details:', err);
+        console.error('[BusAdmin Fleet] Error fetching bus details:', err.message);
         res.status(500).json({ error: 'Ошибка получения данных автобуса' });
     }
 });
@@ -3550,18 +3582,23 @@ router.post('/buses', async (req, res) => {
         return res.status(403).json({ error: 'Бухгалтеры имеют доступ только для чтения' });
     }
 
+    const serviceClient = getRequiredServiceClient();
+    if (!serviceClient) {
+        return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+    }
+
     // Input Validation
     const validation = validateBusPayload(req.body, { isUpdate: false });
     if (!validation.valid) {
         return res.status(400).json({ error: validation.error });
     }
 
-    // Tenant Isolation: carrier_id taken exclusively from verified JWT
+    // Tenant Isolation: carrier_id taken exclusively from verified JWT, body carrier_id strictly ignored
     const carrierId = req.carrier.carrier_id;
 
     try {
         // Uniqueness check for active plate
-        const isDuplicate = await checkDuplicatePlate(supabase, carrierId, validation.sanitizedData.license_plate);
+        const isDuplicate = await checkDuplicatePlate(serviceClient, carrierId, validation.sanitizedData.license_plate);
         if (isDuplicate) {
             return res.status(400).json({ error: 'Автобус с таким госномером уже зарегистрирован в вашем автопарке' });
         }
@@ -3571,8 +3608,9 @@ router.post('/buses', async (req, res) => {
             carrier_id: carrierId,
             status: validation.sanitizedData.status || 'active'
         };
+        delete newBusData.id;
 
-        const { data: newBus, error } = await supabase
+        const { data: newBus, error } = await serviceClient
             .from('carrier_buses')
             .insert([newBusData])
             .select()
@@ -3582,7 +3620,7 @@ router.post('/buses', async (req, res) => {
 
         // Activity Audit Logging (safe diff with zero secrets / PII)
         await logCarrierActivity({
-            supabase,
+            supabase: serviceClient,
             carrierContext: req.carrier,
             action: AUDIT_ACTIONS.BUS_CREATED,
             entityType: AUDIT_ENTITY_TYPES.BUS,
@@ -3596,19 +3634,15 @@ router.post('/buses', async (req, res) => {
             bus: newBus
         });
     } catch (err) {
-        console.error('[BusAdmin Fleet] Error creating bus:', err);
-        res.status(500).json({ error: err.message || 'Ошибка добавления автобуса' });
+        console.error('[BusAdmin Fleet] Error creating bus:', err.message);
+        res.status(500).json({ error: 'Ошибка добавления автобуса' });
     }
 });
 
 /**
- * @swagger
- * /api/bus-admin/buses/{id}:
- *   patch:
- *     summary: Update bus attributes with ownership verification
- *     tags: [Bus Admin Fleet]
+ * Shared handler for PATCH and PUT bus updates with strict tenant isolation
  */
-router.patch('/buses/:id', async (req, res) => {
+const updateBusHandler = async (req, res) => {
     // Security Gate: Drivers and Accountants cannot edit buses
     if (req.carrier.role === 'driver') {
         return res.status(403).json({ error: 'Водители не имеют доступа к автопарку' });
@@ -3617,10 +3651,16 @@ router.patch('/buses/:id', async (req, res) => {
         return res.status(403).json({ error: 'Бухгалтеры имеют доступ только для чтения' });
     }
 
+    const serviceClient = getRequiredServiceClient();
+    if (!serviceClient) {
+        return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+    }
+
     const busId = req.params.id;
+    const carrierId = req.carrier.carrier_id;
 
     try {
-        const oldBus = await verifyBusAccess(req.carrier, busId, { allowArchived: false });
+        const oldBus = await verifyBusAccess(req.carrier, busId, { allowArchived: false, client: serviceClient });
         if (!oldBus) {
             return res.status(404).json({ error: 'Автобус не найден, заархивирован или доступ запрещен' });
         }
@@ -3632,7 +3672,7 @@ router.patch('/buses/:id', async (req, res) => {
 
         // Check duplicate plate if license_plate was modified
         if (validation.sanitizedData.license_plate && validation.sanitizedData.license_plate !== oldBus.license_plate) {
-            const isDuplicate = await checkDuplicatePlate(supabase, req.carrier.carrier_id, validation.sanitizedData.license_plate, oldBus.id);
+            const isDuplicate = await checkDuplicatePlate(serviceClient, carrierId, validation.sanitizedData.license_plate, oldBus.id);
             if (isDuplicate) {
                 return res.status(400).json({ error: 'Автобус с таким госномером уже зарегистрирован в вашем автопарке' });
             }
@@ -3642,11 +3682,15 @@ router.patch('/buses/:id', async (req, res) => {
             ...validation.sanitizedData,
             updated_at: new Date().toISOString()
         };
+        // Strict Tenant Isolation: Never allow overriding carrier_id or id via body
+        delete updatePayload.carrier_id;
+        delete updatePayload.id;
 
-        const { data: updatedBus, error } = await supabase
+        const { data: updatedBus, error } = await serviceClient
             .from('carrier_buses')
             .update(updatePayload)
             .eq('id', busId)
+            .eq('carrier_id', carrierId) // Strict tenant isolation directly in query
             .select()
             .single();
 
@@ -3654,7 +3698,7 @@ router.patch('/buses/:id', async (req, res) => {
 
         // Activity Audit Logging
         await logCarrierActivity({
-            supabase,
+            supabase: serviceClient,
             carrierContext: req.carrier,
             action: AUDIT_ACTIONS.BUS_UPDATED,
             entityType: AUDIT_ENTITY_TYPES.BUS,
@@ -3669,10 +3713,20 @@ router.patch('/buses/:id', async (req, res) => {
             bus: updatedBus
         });
     } catch (err) {
-        console.error('[BusAdmin Fleet] Error updating bus:', err);
-        res.status(500).json({ error: err.message || 'Ошибка обновления данных автобуса' });
+        console.error('[BusAdmin Fleet] Error updating bus:', err.message);
+        res.status(500).json({ error: 'Ошибка обновления данных автобуса' });
     }
-});
+};
+
+/**
+ * @swagger
+ * /api/bus-admin/buses/{id}:
+ *   patch:
+ *     summary: Update bus attributes with ownership verification
+ *     tags: [Bus Admin Fleet]
+ */
+router.patch('/buses/:id', updateBusHandler);
+router.put('/buses/:id', updateBusHandler);
 
 /**
  * @swagger
@@ -3687,10 +3741,16 @@ router.post('/buses/:id/archive', async (req, res) => {
         return res.status(403).json({ error: 'Только владелец компании может архивировать автобус' });
     }
 
+    const serviceClient = getRequiredServiceClient();
+    if (!serviceClient) {
+        return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+    }
+
     const busId = req.params.id;
+    const carrierId = req.carrier.carrier_id;
 
     try {
-        const oldBus = await verifyBusAccess(req.carrier, busId, { allowArchived: true });
+        const oldBus = await verifyBusAccess(req.carrier, busId, { allowArchived: true, client: serviceClient });
         if (!oldBus) {
             return res.status(404).json({ error: 'Автобус не найден или доступ запрещен' });
         }
@@ -3700,7 +3760,7 @@ router.post('/buses/:id/archive', async (req, res) => {
         }
 
         // Check active / future tickets (Strict Policy: Cannot archive bus with active future trips)
-        const activeTickets = await getBusActiveTickets(supabase, req.carrier.carrier_id, busId);
+        const activeTickets = await getBusActiveTickets(serviceClient, carrierId, busId);
         if (activeTickets.length > 0) {
             return res.status(409).json({
                 error: 'BUS_HAS_ACTIVE_TRIPS',
@@ -3709,13 +3769,14 @@ router.post('/buses/:id/archive', async (req, res) => {
             });
         }
 
-        const { data: archivedBus, error } = await supabase
+        const { data: archivedBus, error } = await serviceClient
             .from('carrier_buses')
             .update({
                 status: 'archived',
                 updated_at: new Date().toISOString()
             })
             .eq('id', busId)
+            .eq('carrier_id', carrierId) // Strict tenant isolation directly in query
             .select()
             .single();
 
@@ -3723,7 +3784,7 @@ router.post('/buses/:id/archive', async (req, res) => {
 
         // Activity Audit Logging (only emitted if archive succeeded)
         await logCarrierActivity({
-            supabase,
+            supabase: serviceClient,
             carrierContext: req.carrier,
             action: AUDIT_ACTIONS.BUS_ARCHIVED,
             entityType: AUDIT_ENTITY_TYPES.BUS,
@@ -3740,8 +3801,8 @@ router.post('/buses/:id/archive', async (req, res) => {
             bus: archivedBus
         });
     } catch (err) {
-        console.error('[BusAdmin Fleet] Error archiving bus:', err);
-        res.status(500).json({ error: err.message || 'Ошибка архивации автобуса' });
+        console.error('[BusAdmin Fleet] Error archiving bus:', err.message);
+        res.status(500).json({ error: 'Ошибка архивации автобуса' });
     }
 });
 

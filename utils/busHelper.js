@@ -207,6 +207,23 @@ function validateBusPayload(data, { isUpdate = false } = {}) {
     return { valid: true, sanitizedData };
 }
 
+let anonDb = null;
+try {
+    anonDb = require('../db');
+} catch (_) {}
+
+function resolveServiceClient(injectedClient) {
+    if (injectedClient && injectedClient !== anonDb) {
+        return injectedClient;
+    }
+    try {
+        const { getServiceRoleClient } = require('../dbServiceRole');
+        const client = getServiceRoleClient();
+        if (client) return client;
+    } catch (_) {}
+    return null;
+}
+
 /**
  * Checks if a non-archived bus with the same normalized license plate already exists for this carrier
  */
@@ -215,7 +232,10 @@ async function checkDuplicatePlate(supabaseClient, carrierId, licensePlate, excl
     const normalized = normalizePlate(licensePlate);
     if (!normalized) return false;
 
-    let query = supabaseClient
+    const db = resolveServiceClient(supabaseClient);
+    if (!db) return false;
+
+    let query = db
         .from('carrier_buses')
         .select('id, license_plate, status')
         .eq('carrier_id', carrierId)
@@ -232,12 +252,6 @@ async function checkDuplicatePlate(supabaseClient, carrierId, licensePlate, excl
 }
 
 /**
- * Verify carrier ownership and availability of a bus
- * @param {Object} carrier - req.carrier
- * @param {number|string} busId - Bus ID
- * @param {Object} options
- * @param {boolean} [options.allowArchived=false]
-/**
  * Verifies carrier ownership and active status of a bus
  * @param {Object|number|string} carrier
  * @param {number|string} busId
@@ -253,11 +267,14 @@ async function verifyBusAccess(carrier, busId, { allowArchived = false, client =
         : (carrier.carrier_id || carrier.id);
     if (!carrierId) return null;
 
-    const db = client || supabase;
+    const db = resolveServiceClient(client);
+    if (!db) return null;
+
     const { data: bus, error } = await db
         .from('carrier_buses')
         .select('*')
         .eq('id', busId)
+        .eq('carrier_id', carrierId)
         .maybeSingle();
 
     if (error || !bus) return null;

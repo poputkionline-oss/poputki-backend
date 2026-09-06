@@ -246,15 +246,32 @@ async function verifyTicketAccess(carrier, ticketId) {
 /**
  * Check if the carrier has access to a specific bus in the fleet
  */
-async function verifyBusAccess(carrier, busId, { allowArchived = false } = {}) {
+async function verifyBusAccess(carrier, busId, { allowArchived = false, client = null } = {}) {
     if (!busId || !carrier) return null;
     const carrierId = carrier.carrier_id || carrier.id;
     if (!carrierId) return null;
 
-    const { data: bus, error } = await supabase
+    let anonDb = null;
+    try {
+        anonDb = require('../db');
+    } catch (_) {}
+
+    let db = (client && client !== anonDb) ? client : null;
+    if (!db) {
+        try {
+            const { getServiceRoleClient } = require('../dbServiceRole');
+            db = getServiceRoleClient();
+        } catch (_) {
+            return null; // fail closed
+        }
+    }
+    if (!db) return null;
+
+    const { data: bus, error } = await db
         .from('carrier_buses')
         .select('*')
         .eq('id', busId)
+        .eq('carrier_id', carrierId)
         .maybeSingle();
 
     if (error || !bus) return null;

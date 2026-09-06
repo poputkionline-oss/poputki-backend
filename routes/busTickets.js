@@ -12,6 +12,15 @@ const {
     verifyTicketToken,
     buildPassengerTicketProjection
 } = require('../utils/ticketHelper');
+const { getServiceRoleClient } = require('../dbServiceRole');
+
+function getSafeServiceRoleClient() {
+    try {
+        return getServiceRoleClient();
+    } catch (_) {
+        return null;
+    }
+}
 
 /**
  * @swagger
@@ -351,12 +360,15 @@ router.get('/', async (req, res) => {
         const busIds = Array.from(new Set((tickets || []).map(t => t.bus_id).filter(Boolean)));
         const busMap = new Map();
         if (busIds.length > 0) {
-            const { data: buses, error: bErr } = await supabase
-                .from('carrier_buses')
-                .select('id, brand, model, license_plate, year_built, color, amenities')
-                .in('id', busIds);
-            if (!bErr && Array.isArray(buses)) {
-                buses.forEach(b => busMap.set(b.id, b));
+            const serviceClient = getSafeServiceRoleClient();
+            if (serviceClient) {
+                const { data: buses, error: bErr } = await serviceClient
+                    .from('carrier_buses')
+                    .select('id, brand, model, license_plate, year_built, color, amenities')
+                    .in('id', busIds);
+                if (!bErr && Array.isArray(buses)) {
+                    buses.forEach(b => busMap.set(b.id, b));
+                }
             }
         }
 
@@ -439,11 +451,16 @@ router.get('/:id', async (req, res) => {
         // Fetch passenger-safe bus projection if bus_id is present
         let busDetails = null;
         if (ticket.bus_id) {
-            const { data: busMaster } = await supabase
-                .from('carrier_buses')
-                .select('id, brand, model, license_plate, year_built, color, amenities')
-                .eq('id', ticket.bus_id)
-                .maybeSingle();
+            const serviceClient = getSafeServiceRoleClient();
+            let busMaster = null;
+            if (serviceClient) {
+                const { data } = await serviceClient
+                    .from('carrier_buses')
+                    .select('id, brand, model, license_plate, year_built, color, amenities')
+                    .eq('id', ticket.bus_id)
+                    .maybeSingle();
+                busMaster = data || null;
+            }
             busDetails = buildPublicBusDetails(ticket, busMaster);
         }
 
@@ -541,12 +558,15 @@ router.get('/verify/:token', async (req, res) => {
 
         let busMaster = null;
         if (ticket.bus_id) {
-            const { data: bData } = await supabase
-                .from('carrier_buses')
-                .select('*')
-                .eq('id', ticket.bus_id)
-                .maybeSingle();
-            busMaster = bData || null;
+            const serviceClient = getSafeServiceRoleClient();
+            if (serviceClient) {
+                const { data: bData } = await serviceClient
+                    .from('carrier_buses')
+                    .select('*')
+                    .eq('id', ticket.bus_id)
+                    .maybeSingle();
+                busMaster = bData || null;
+            }
         }
 
         const projection = buildPassengerTicketProjection(booking, ticket, busMaster, { isPublic: true });
