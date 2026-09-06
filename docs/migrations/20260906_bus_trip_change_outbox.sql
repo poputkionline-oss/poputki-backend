@@ -156,6 +156,24 @@ BEGIN
         RETURN jsonb_build_object('success', false, 'error', 'TICKET_NOT_FOUND');
     END IF;
 
+    -- 2.1 Re-check idempotency under ticket lock (prevents concurrent race between transactions serialized on FOR UPDATE)
+    IF v_idempotency_key IS NOT NULL THEN
+        SELECT id, bus_ticket_id INTO v_existing_event 
+        FROM public.bus_ticket_change_events 
+        WHERE operator_id = p_operator_id 
+          AND bus_ticket_id = p_ticket_id 
+          AND idempotency_key = v_idempotency_key;
+
+        IF v_existing_event.id IS NOT NULL THEN
+            RETURN jsonb_build_object(
+                'success', true,
+                'idempotent_replay', true,
+                'event_id', v_existing_event.id,
+                'ticket_id', p_ticket_id
+            );
+        END IF;
+    END IF;
+
     IF v_ticket.operator_id != p_operator_id THEN
         RETURN jsonb_build_object('success', false, 'error', 'FORBIDDEN_OPERATOR');
     END IF;
@@ -300,7 +318,24 @@ BEGIN
         p_event_data->'new_values',
         ARRAY(SELECT jsonb_array_elements_text(p_event_data->'changed_fields')),
         v_idempotency_key
-    ) RETURNING id INTO v_event_id;
+    )
+    ON CONFLICT (operator_id, bus_ticket_id, idempotency_key) DO NOTHING
+    RETURNING id INTO v_event_id;
+
+    IF v_event_id IS NULL AND v_idempotency_key IS NOT NULL THEN
+        SELECT id INTO v_event_id
+        FROM public.bus_ticket_change_events
+        WHERE operator_id = p_operator_id 
+          AND bus_ticket_id = p_ticket_id 
+          AND idempotency_key = v_idempotency_key;
+
+        RETURN jsonb_build_object(
+            'success', true,
+            'idempotent_replay', true,
+            'event_id', v_event_id,
+            'ticket_id', p_ticket_id
+        );
+    END IF;
 
     -- Atomic Carrier Activity Audit Log (dual-write within same transaction)
     BEGIN
@@ -402,14 +437,14 @@ DECLARE
 BEGIN
     RETURN QUERY
     WITH candidate_records AS (
-        SELECT id
-        FROM public.bus_ticket_notification_outbox
-        WHERE channel = 'telegram'
+        SELECT bno.id
+        FROM public.bus_ticket_notification_outbox bno
+        WHERE bno.channel = 'telegram'
           AND (
-              (status = 'pending' AND next_attempt_at <= v_now)
-              OR (status = 'processing' AND lease_expires_at < v_now)
+              (bno.status = 'pending' AND bno.next_attempt_at <= v_now)
+              OR (bno.status = 'processing' AND bno.lease_expires_at < v_now)
           )
-        ORDER BY created_at ASC
+        ORDER BY bno.created_at ASC
         LIMIT p_batch_size
         FOR UPDATE SKIP LOCKED
     ),
