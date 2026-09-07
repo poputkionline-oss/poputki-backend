@@ -93,7 +93,7 @@ router.get('/summary', async (req, res) => {
             .from('bus_ticket_bookings')
             .select(`
                 id, channel, source_type, created_at, status, claim_status,
-                bus_tickets (id, carrier_id, operator_id, transport_company)
+                bus_tickets (id, operator_id, transport_company)
             `)
             .gte('created_at', range.start)
             .lte('created_at', range.end);
@@ -109,7 +109,7 @@ router.get('/summary', async (req, res) => {
         if (carrier_id) {
             bookings = bookings.filter(b => {
                 const t = b.bus_tickets;
-                return t && (String(t.carrier_id) === String(carrier_id) || String(t.operator_id) === String(carrier_id));
+                return t && String(t.operator_id) === String(carrier_id);
             });
         }
 
@@ -256,7 +256,7 @@ router.get('/stages', async (req, res) => {
             .from('bus_ticket_bookings')
             .select(`
                 id, channel, source_type, created_at,
-                bus_tickets (id, carrier_id, operator_id)
+                bus_tickets (id, operator_id)
             `)
             .gte('created_at', range.start)
             .lte('created_at', range.end);
@@ -268,7 +268,7 @@ router.get('/stages', async (req, res) => {
         if (carrier_id) {
             bookings = bookings.filter(b => {
                 const t = b.bus_tickets;
-                return t && (String(t.carrier_id) === String(carrier_id) || String(t.operator_id) === String(carrier_id));
+                return t && String(t.operator_id) === String(carrier_id);
             });
         }
 
@@ -375,7 +375,7 @@ router.get('/passengers', async (req, res) => {
             .select(`
                 id, passenger_name, phone, seat_numbers, contact_role, status, claim_status, created_at,
                 bus_ticket_id, pickup_city, drop_off_city,
-                bus_tickets (id, from_city, to_city, departure_date, departure_time, transport_company, carrier_id, operator_id)
+                bus_tickets (id, from_city, to_city, departure_date, departure_time, transport_company, operator_id)
             `, { count: 'exact' });
 
         // Filter manual bookings
@@ -398,7 +398,7 @@ router.get('/passengers', async (req, res) => {
         if (carrier_id) {
             allBookings = allBookings.filter(b => {
                 const t = b.bus_tickets;
-                return t && (String(t.carrier_id) === String(carrier_id) || String(t.operator_id) === String(carrier_id));
+                return t && String(t.operator_id) === String(carrier_id);
             });
         }
 
@@ -470,7 +470,7 @@ router.get('/passengers', async (req, res) => {
                 passengerName: b.passenger_name || 'Пассажир',
                 maskedPhone: maskPhoneNumber(b.phone) || '—',
                 carrierName: trip.transport_company || 'Перевозчик',
-                carrierId: trip.carrier_id || trip.operator_id || null,
+                carrierId: trip.operator_id || null,
                 busTicketId: b.bus_ticket_id,
                 route: `${trip.from_city || '—'} → ${trip.to_city || '—'}`,
                 departureDate: trip.departure_date || '—',
@@ -485,6 +485,8 @@ router.get('/passengers', async (req, res) => {
                 lastEventAt: lastEvent ? lastEvent.created_at : b.created_at,
                 nextAction: statusObj.nextAction || NEXT_ACTIONS.SEND_TICKET,
                 isLegacy,
+                isBotAbandoned: Boolean(statusObj.isBotAbandoned),
+                isExpired: Boolean(statusObj.isExpired),
                 hasClaimRequest: claimRequestsMap.has(b.id),
                 claimRequestId: claimRequestsMap.get(b.id) || null
             });
@@ -501,17 +503,25 @@ router.get('/passengers', async (req, res) => {
             filtered = filtered.filter(p => p.status === status);
         }
 
-        // Attention only filter
+        // Attention only filter (synchronized with /attention work queue criteria)
         if (attentionOnly === 'true' || attentionOnly === true) {
-            const attentionStatuses = new Set([
-                JOURNEY_STATUSES.NOT_SHARED,
-                JOURNEY_STATUSES.BOT_STARTED,
-                JOURNEY_STATUSES.PHONE_PENDING,
-                JOURNEY_STATUSES.PHONE_MISMATCH,
-                JOURNEY_STATUSES.UNDER_REVIEW,
-                JOURNEY_STATUSES.EXPIRED
-            ]);
-            filtered = filtered.filter(p => attentionStatuses.has(p.status) || p.hasClaimRequest);
+            filtered = filtered.filter(p => {
+                if (p.hasClaimRequest) return true;
+                if (p.status === JOURNEY_STATUSES.NOT_SHARED) {
+                    const elapsedMin = (nowMs - new Date(p.createdAt).getTime()) / 60000;
+                    return elapsedMin > 120;
+                }
+                if (p.status === JOURNEY_STATUSES.BOT_STARTED) {
+                    return p.isBotAbandoned;
+                }
+                const otherAttentionStatuses = new Set([
+                    JOURNEY_STATUSES.PHONE_PENDING,
+                    JOURNEY_STATUSES.PHONE_MISMATCH,
+                    JOURNEY_STATUSES.UNDER_REVIEW,
+                    JOURNEY_STATUSES.EXPIRED
+                ]);
+                return otherAttentionStatuses.has(p.status);
+            });
         }
 
         // Search filter (passenger name or masked phone digits)
@@ -759,7 +769,7 @@ router.get('/carriers', async (req, res) => {
             .from('bus_ticket_bookings')
             .select(`
                 id, channel, source_type, created_at,
-                bus_tickets (id, carrier_id, operator_id, transport_company)
+                bus_tickets (id, operator_id, transport_company)
             `)
             .gte('created_at', range.start)
             .lte('created_at', range.end);
@@ -786,7 +796,7 @@ router.get('/carriers', async (req, res) => {
         const carriersMap = new Map();
         for (const b of bookings) {
             const t = b.bus_tickets || {};
-            const carrierId = t.carrier_id || t.operator_id || 'unknown';
+            const carrierId = t.operator_id || 'unknown';
             const carrierName = t.transport_company || `Перевозчик #${carrierId}`;
 
             if (!carriersMap.has(carrierId)) {
@@ -878,6 +888,8 @@ router.get('/attention', async (req, res) => {
     try {
         const dbClient = getDbClient();
         const nowMs = Date.now();
+        const { period, startDate, endDate, carrier_id, bus_ticket_id, channel, status } = req.query;
+        const range = resolvePeriodRange(period, startDate, endDate);
 
         // 1. Fetch pending claim requests (PHONE_MISMATCH / UNDER_REVIEW)
         const { data: pendingRequests } = await dbClient
@@ -885,8 +897,8 @@ router.get('/attention', async (req, res) => {
             .select(`
                 id, booking_id, requesting_user_id, failure_reason_code, created_at,
                 bus_ticket_bookings (
-                    id, passenger_name, phone, created_at,
-                    bus_tickets (from_city, to_city, transport_company)
+                    id, passenger_name, phone, created_at, bus_ticket_id, channel, source_type,
+                    bus_tickets (id, from_city, to_city, transport_company, operator_id)
                 )
             `)
             .eq('status', 'pending')
@@ -897,35 +909,80 @@ router.get('/attention', async (req, res) => {
         for (const reqRow of (pendingRequests || [])) {
             const b = reqRow.bus_ticket_bookings;
             if (!b) continue;
+
+            // Apply period filter
+            if (period && period !== 'all') {
+                const bTime = new Date(b.created_at).getTime();
+                if (bTime < new Date(range.start).getTime() || bTime > new Date(range.end).getTime()) {
+                    continue;
+                }
+            }
+
+            // Bus ticket ID filter
+            if (bus_ticket_id && Number(b.bus_ticket_id) !== Number(bus_ticket_id)) {
+                continue;
+            }
+
             const trip = b.bus_tickets || {};
+
+            // Carrier filter
+            if (carrier_id && String(trip.operator_id) !== String(carrier_id)) {
+                continue;
+            }
+
+            // Status filter (claim review requests represent PHONE_MISMATCH / UNDER_REVIEW)
+            if (status && status !== 'ALL' && status !== 'PHONE_MISMATCH' && status !== 'UNDER_REVIEW') {
+                continue;
+            }
+
             queue.push({
                 bookingId: b.id,
                 claimRequestId: reqRow.id,
                 issueType: 'PHONE_MISMATCH',
+                status: 'PHONE_MISMATCH',
                 priority: 'HIGH',
                 issueTitle: 'Несовпадение номера / Ожидает подтверждения',
                 passengerName: b.passenger_name || 'Пассажир',
                 maskedPhone: maskPhoneNumber(b.phone),
                 route: `${trip.from_city || '—'} → ${trip.to_city || '—'}`,
                 carrierName: trip.transport_company || '—',
+                carrierId: trip.operator_id || null,
                 createdAt: reqRow.created_at,
                 recommendedAction: 'Проверить заявку подтверждения',
                 actionType: 'REVIEW_REQUEST'
             });
         }
 
-        // 2. Fetch recent non-activated bookings from TRACKING_STARTED_AT
-        const { data: recentBookings } = await dbClient
+        // 2. Fetch recent non-activated bookings from period / TRACKING_STARTED_AT
+        let recentQuery = dbClient
             .from('bus_ticket_bookings')
             .select(`
-                id, passenger_name, phone, created_at, status, claim_status,
-                bus_tickets (from_city, to_city, transport_company)
+                id, passenger_name, phone, created_at, status, claim_status, bus_ticket_id, channel, source_type,
+                bus_tickets (id, from_city, to_city, transport_company, operator_id)
             `)
             .or('channel.eq.manual,source_type.eq.manual')
             .neq('claim_status', 'claimed')
-            .gte('created_at', TRACKING_STARTED_AT)
-            .order('created_at', { ascending: false })
-            .limit(100);
+            .order('created_at', { ascending: false });
+
+        if (period && period !== 'all') {
+            recentQuery = recentQuery.gte('created_at', range.start).lte('created_at', range.end);
+        } else {
+            recentQuery = recentQuery.gte('created_at', TRACKING_STARTED_AT);
+        }
+
+        if (bus_ticket_id) {
+            recentQuery = recentQuery.eq('bus_ticket_id', Number(bus_ticket_id));
+        }
+
+        const { data: rawRecentBookings } = await recentQuery;
+        let recentBookings = rawRecentBookings || [];
+
+        if (carrier_id) {
+            recentBookings = recentBookings.filter(b => {
+                const t = b.bus_tickets;
+                return t && String(t.operator_id) === String(carrier_id);
+            });
+        }
 
         if (recentBookings && recentBookings.length > 0) {
             const bIds = recentBookings.map(b => b.id);
@@ -941,17 +998,42 @@ router.get('/attention', async (req, res) => {
                 eventsByBooking.get(ev.booking_id).push(ev);
             });
 
+            const { data: handoffData } = await dbClient
+                .from('booking_handoffs')
+                .select('*')
+                .in('booking_id', bIds)
+                .order('created_at', { ascending: false });
+
+            const handoffsByBooking = new Map();
+            (handoffData || []).forEach(h => {
+                if (!handoffsByBooking.has(h.booking_id)) handoffsByBooking.set(h.booking_id, []);
+                handoffsByBooking.get(h.booking_id).push(h);
+            });
+
             for (const b of recentBookings) {
                 // Skip if already in queue from claim requests
                 if (queue.some(q => q.bookingId === b.id)) continue;
 
                 const bEvents = eventsByBooking.get(b.id) || [];
+                const bHandoffs = handoffsByBooking.get(b.id) || [];
+                const lastChannel = (bHandoffs[0]?.channel) || (bEvents[bEvents.length - 1]?.channel) || '—';
+
+                // Channel filter
+                if (channel && lastChannel !== channel) {
+                    continue;
+                }
+
                 const statusObj = computeJourneyStatusAndNextAction(bEvents, {
                     booking: b,
                     nowMs
                 });
 
                 if (statusObj.status === JOURNEY_STATUSES.ACTIVATED) continue;
+
+                // Status filter
+                if (status && status !== 'ALL' && statusObj.status !== status) {
+                    continue;
+                }
 
                 const trip = b.bus_tickets || {};
 
@@ -960,12 +1042,15 @@ router.get('/attention', async (req, res) => {
                         bookingId: b.id,
                         claimRequestId: null,
                         issueType: 'BOT_ABANDONED',
+                        status: statusObj.status,
                         priority: 'MEDIUM',
                         issueTitle: 'Бот запущен, но номер не передан (> 2 ч)',
                         passengerName: b.passenger_name || 'Пассажир',
                         maskedPhone: maskPhoneNumber(b.phone),
                         route: `${trip.from_city || '—'} → ${trip.to_city || '—'}`,
                         carrierName: trip.transport_company || '—',
+                        carrierId: trip.operator_id || null,
+                        channel: lastChannel,
                         createdAt: b.created_at,
                         recommendedAction: 'Связаться с пассажиром',
                         actionType: 'CONTACT_PASSENGER'
@@ -977,12 +1062,15 @@ router.get('/attention', async (req, res) => {
                             bookingId: b.id,
                             claimRequestId: null,
                             issueType: 'NOT_SHARED',
+                            status: statusObj.status,
                             priority: 'LOW',
                             issueTitle: 'Билет ещё не передан пассажиру',
                             passengerName: b.passenger_name || 'Пассажир',
                             maskedPhone: maskPhoneNumber(b.phone),
                             route: `${trip.from_city || '—'} → ${trip.to_city || '—'}`,
                             carrierName: trip.transport_company || '—',
+                            carrierId: trip.operator_id || null,
+                            channel: lastChannel,
                             createdAt: b.created_at,
                             recommendedAction: 'Напомнить перевозчику передать билет',
                             actionType: 'NOTIFY_CARRIER'
@@ -993,12 +1081,15 @@ router.get('/attention', async (req, res) => {
                         bookingId: b.id,
                         claimRequestId: null,
                         issueType: 'EXPIRED',
+                        status: statusObj.status,
                         priority: 'LOW',
                         issueTitle: 'Срок действия claim-сессии истек',
                         passengerName: b.passenger_name || 'Пассажир',
                         maskedPhone: maskPhoneNumber(b.phone),
                         route: `${trip.from_city || '—'} → ${trip.to_city || '—'}`,
                         carrierName: trip.transport_company || '—',
+                        carrierId: trip.operator_id || null,
+                        channel: lastChannel,
                         createdAt: b.created_at,
                         recommendedAction: 'Сгенерировать новую ссылку',
                         actionType: 'RENEW_LINK'
