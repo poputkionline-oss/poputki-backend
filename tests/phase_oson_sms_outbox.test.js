@@ -242,7 +242,8 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
     });
 
     it('[14] login masking hides all but the last 4 characters', () => {
-        assert.equal(maskLogin('blablacartj'), '*******artj');
+        // Synthetic example login only — never a real account credential.
+        assert.equal(maskLogin('examplelogin'), '********ogin');
         assert.equal(maskLogin('ab'), '**');
     });
 
