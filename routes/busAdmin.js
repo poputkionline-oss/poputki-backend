@@ -1338,6 +1338,54 @@ router.post('/bookings/manual', async (req, res) => {
             };
         }
 
+        // OSON SMS Outbox Enqueue (Stage 4/6 — additive, independent of
+        // NOTIFICATION_ROUTING_ENABLED/Telegram routing above). Runs only for
+        // bookings that were NOT auto-claimed to an already-linked Telegram
+        // passenger (routing rule #2: Telegram takes priority over SMS), only
+        // with a valid phone (rule #3), only past the rollout cutoff, and
+        // only for allowlisted pilot carriers (Stage 8). Never sends
+        // anything itself — only enqueues a pending outbox row; the actual
+        // OSON call happens exclusively in the background worker
+        // (manualBookingSmsOutboxService.js via maintenance tick).
+        if (!isAutoClaimed && process.env.OSON_SMS_ENABLED === 'true' && cleanPhone) {
+            try {
+                const { isCarrierAllowlisted } = require('../utils/osonSmsCaps');
+                const carrierId = req.carrier.user_id;
+                const rolloutStartedAt = process.env.OSON_SMS_ROLLOUT_STARTED_AT
+                    ? new Date(process.env.OSON_SMS_ROLLOUT_STARTED_AT)
+                    : null;
+                // This request IS the booking's creation moment — comparing
+                // "now" against the cutoff is equivalent to comparing the
+                // booking's created_at, and avoids a second DB read.
+                const pastRolloutCutoff = Boolean(rolloutStartedAt) && new Date() >= rolloutStartedAt;
+
+                if (pastRolloutCutoff && isCarrierAllowlisted(carrierId)) {
+                    const idempotencyKey = `sms:manual_booking_ticket_link_v1:${booking.id}`;
+                    const normalizedRole = ['passenger', 'family_or_group', 'coordinator'].includes(effectiveContactRole)
+                        ? effectiveContactRole
+                        : 'passenger';
+                    const outboxClient = getServiceRoleClient();
+                    if (outboxClient) {
+                        outboxClient
+                            .from('manual_booking_sms_outbox')
+                            .upsert({
+                                booking_id: booking.id,
+                                recipient_role: normalizedRole,
+                                carrier_id: carrierId,
+                                template_code: 'manual_booking_ticket_link_v1',
+                                locale: 'ru',
+                                idempotency_key: idempotencyKey,
+                                status: 'pending'
+                            }, { onConflict: 'idempotency_key', ignoreDuplicates: true })
+                            .then(() => {})
+                            .catch(err => console.error('[OsonSmsOutbox] Enqueue failed:', err.message));
+                    }
+                }
+            } catch (outboxErr) {
+                console.error('[OsonSmsOutbox] Enqueue error:', outboxErr.message);
+            }
+        }
+
         res.json({
             success: true,
             id: booking.id,

@@ -21,6 +21,7 @@
 const { expirePendingPaymentBookings } = require('./paymentExpirationHelper');
 const { sweepAutoCompleteTrips } = require('./tripCompletionHelper');
 const { processTripChangeOutbox } = require('./tripChangeNotificationService');
+const { processManualBookingSmsOutbox } = require('./manualBookingSmsOutboxService');
 const defaultSupabase = require('../db');
 
 /**
@@ -68,8 +69,28 @@ async function runMaintenanceTick(options = {}) {
         tasks.trip_change_outbox = { success: false, error: err.message || 'OUTBOX_PROCESSING_FAILED' };
     }
 
+    try {
+        // Own kill switch (OSON_SMS_ENABLED), checked inside the worker itself —
+        // task always "succeeds" as a no-op when the feature is off, so a
+        // disabled pilot never fails the overall tick.
+        const smsOutboxResult = await processManualBookingSmsOutbox({
+            supabaseClient: dbClient,
+            batchSize: 20,
+            dryRun
+        });
+        tasks.manual_booking_sms_outbox = { success: true, ...smsOutboxResult };
+    } catch (err) {
+        console.error('[MaintenanceTick] manual_booking_sms_outbox task failed:', err.message);
+        tasks.manual_booking_sms_outbox = { success: false, error: err.message || 'SMS_OUTBOX_PROCESSING_FAILED' };
+    }
+
     return {
-        success: Boolean(tasks.expire_pending.success && tasks.auto_complete.success && tasks.trip_change_outbox.success),
+        success: Boolean(
+            tasks.expire_pending.success &&
+            tasks.auto_complete.success &&
+            tasks.trip_change_outbox.success &&
+            tasks.manual_booking_sms_outbox.success
+        ),
         timestamp,
         tasks
     };
