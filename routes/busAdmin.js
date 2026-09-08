@@ -1347,19 +1347,16 @@ router.post('/bookings/manual', async (req, res) => {
         // anything itself — only enqueues a pending outbox row; the actual
         // OSON call happens exclusively in the background worker
         // (manualBookingSmsOutboxService.js via maintenance tick).
-        if (!isAutoClaimed && process.env.OSON_SMS_ENABLED === 'true' && cleanPhone) {
-            try {
-                const { isCarrierAllowlisted } = require('../utils/osonSmsCaps');
-                const carrierId = req.carrier.user_id;
-                const rolloutStartedAt = process.env.OSON_SMS_ROLLOUT_STARTED_AT
-                    ? new Date(process.env.OSON_SMS_ROLLOUT_STARTED_AT)
-                    : null;
-                // This request IS the booking's creation moment — comparing
-                // "now" against the cutoff is equivalent to comparing the
-                // booking's created_at, and avoids a second DB read.
-                const pastRolloutCutoff = Boolean(rolloutStartedAt) && new Date() >= rolloutStartedAt;
+        {
+            const { shouldEnqueueOsonSms } = require('../utils/osonSmsRouting');
+            const carrierId = req.carrier.user_id;
+            // This request IS the booking's creation moment — comparing "now"
+            // against the cutoff is equivalent to comparing the booking's
+            // created_at, and avoids a second DB read.
+            const enqueueDecision = shouldEnqueueOsonSms({ isAutoClaimed, phone: cleanPhone, carrierId, now: new Date() });
 
-                if (pastRolloutCutoff && isCarrierAllowlisted(carrierId)) {
+            if (enqueueDecision.enqueue) {
+                try {
                     const idempotencyKey = `sms:manual_booking_ticket_link_v1:${booking.id}`;
                     const normalizedRole = ['passenger', 'family_or_group', 'coordinator'].includes(effectiveContactRole)
                         ? effectiveContactRole
@@ -1380,9 +1377,9 @@ router.post('/bookings/manual', async (req, res) => {
                             .then(() => {})
                             .catch(err => console.error('[OsonSmsOutbox] Enqueue failed:', err.message));
                     }
+                } catch (outboxErr) {
+                    console.error('[OsonSmsOutbox] Enqueue error:', outboxErr.message);
                 }
-            } catch (outboxErr) {
-                console.error('[OsonSmsOutbox] Enqueue error:', outboxErr.message);
             }
         }
 

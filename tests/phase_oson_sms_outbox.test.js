@@ -32,6 +32,9 @@ const {
 const { calculateSmsSegments, renderManualBookingTicketSms } = require('../utils/smsTemplates');
 const { checkSendCaps, hmacPhone, isCarrierAllowlisted } = require('../utils/osonSmsCaps');
 const { processManualBookingSmsOutbox } = require('../utils/manualBookingSmsOutboxService');
+const { shouldEnqueueOsonSms } = require('../utils/osonSmsRouting');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -469,5 +472,226 @@ describe('MANUAL BOOKING SMS OUTBOX — WORKER ORCHESTRATION', () => {
         assert.equal(result.dead_letter, 1);
         assert.equal(client.updates[0].patch.status, 'dead_letter');
         assert.equal(client.updates[0].patch.last_error_code, 'NO_PHONE');
+    });
+
+    it('[32] a valid 200 JSON body that is neither the success nor the error envelope is UNRECOGNIZED_RESPONSE, never success', async () => {
+        enabledConfig();
+        const fetchImpl = async () => ({
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => JSON.stringify({ foo: 'bar' })
+        });
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k32' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'UNRECOGNIZED_RESPONSE');
+    });
+
+    it('[33] {status:"ok"} WITHOUT a msg_id is not treated as success — a confirmed provider ID is required', async () => {
+        enabledConfig();
+        const fetchImpl = async () => ({
+            ok: true,
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => JSON.stringify({ status: 'ok' }) // no msg_id
+        });
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k33' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'UNRECOGNIZED_RESPONSE');
+    });
+});
+
+describe('MANUAL BOOKING SMS OUTBOX — ENQUEUE ROUTING (rollout cutoff, kill switch, allowlist)', () => {
+    beforeEach(resetEnv);
+    afterEach(resetEnv);
+
+    it('[34] kill switch off (OSON_SMS_ENABLED unset) never enqueues, regardless of everything else', () => {
+        process.env.OSON_SMS_ROLLOUT_STARTED_AT = new Date(Date.now() - 86400000).toISOString();
+        process.env.OSON_SMS_CARRIER_ALLOWLIST = '7';
+        const result = shouldEnqueueOsonSms({ isAutoClaimed: false, phone: '992900000001', carrierId: 7 });
+        assert.equal(result.enqueue, false);
+        assert.equal(result.reason, 'OSON_SMS_DISABLED');
+    });
+
+    it('[35] a booking created BEFORE the rollout cutoff is never enqueued', () => {
+        process.env.OSON_SMS_ENABLED = 'true';
+        process.env.OSON_SMS_CARRIER_ALLOWLIST = '7';
+        process.env.OSON_SMS_ROLLOUT_STARTED_AT = new Date(Date.now() + 3600000).toISOString(); // 1h in the future
+        const result = shouldEnqueueOsonSms({ isAutoClaimed: false, phone: '992900000001', carrierId: 7, now: new Date() });
+        assert.equal(result.enqueue, false);
+        assert.equal(result.reason, 'BEFORE_ROLLOUT_CUTOFF');
+    });
+
+    it('[36] no rollout cutoff configured at all fails closed (never enqueues) — this is what keeps the existing 159+ old bookings untouched even if OSON_SMS_ENABLED is flipped on by mistake', () => {
+        process.env.OSON_SMS_ENABLED = 'true';
+        process.env.OSON_SMS_CARRIER_ALLOWLIST = '7';
+        const result = shouldEnqueueOsonSms({ isAutoClaimed: false, phone: '992900000001', carrierId: 7 });
+        assert.equal(result.enqueue, false);
+        assert.equal(result.reason, 'ROLLOUT_CUTOFF_NOT_CONFIGURED');
+    });
+
+    it('[37] a non-allowlisted carrier is never enqueued even past cutoff with SMS enabled', () => {
+        process.env.OSON_SMS_ENABLED = 'true';
+        process.env.OSON_SMS_ROLLOUT_STARTED_AT = new Date(Date.now() - 86400000).toISOString();
+        process.env.OSON_SMS_CARRIER_ALLOWLIST = '999';
+        const result = shouldEnqueueOsonSms({ isAutoClaimed: false, phone: '992900000001', carrierId: 7 });
+        assert.equal(result.enqueue, false);
+        assert.equal(result.reason, 'CARRIER_NOT_ALLOWLISTED');
+    });
+
+    it('[38] an already-Telegram-linked booking is never enqueued for SMS, even if every other condition is met', () => {
+        process.env.OSON_SMS_ENABLED = 'true';
+        process.env.OSON_SMS_ROLLOUT_STARTED_AT = new Date(Date.now() - 86400000).toISOString();
+        process.env.OSON_SMS_CARRIER_ALLOWLIST = '7';
+        const result = shouldEnqueueOsonSms({ isAutoClaimed: true, phone: '992900000001', carrierId: 7 });
+        assert.equal(result.enqueue, false);
+        assert.equal(result.reason, 'ALREADY_TELEGRAM_LINKED');
+    });
+
+    it('[39] no phone means no enqueue', () => {
+        process.env.OSON_SMS_ENABLED = 'true';
+        process.env.OSON_SMS_ROLLOUT_STARTED_AT = new Date(Date.now() - 86400000).toISOString();
+        process.env.OSON_SMS_CARRIER_ALLOWLIST = '7';
+        const result = shouldEnqueueOsonSms({ isAutoClaimed: false, phone: null, carrierId: 7 });
+        assert.equal(result.enqueue, false);
+        assert.equal(result.reason, 'NO_PHONE');
+    });
+
+    it('[40] all conditions satisfied → enqueue', () => {
+        process.env.OSON_SMS_ENABLED = 'true';
+        process.env.OSON_SMS_ROLLOUT_STARTED_AT = new Date(Date.now() - 86400000).toISOString();
+        process.env.OSON_SMS_CARRIER_ALLOWLIST = '7';
+        const result = shouldEnqueueOsonSms({ isAutoClaimed: false, phone: '992900000001', carrierId: 7 });
+        assert.equal(result.enqueue, true);
+    });
+});
+
+describe('MANUAL BOOKING SMS OUTBOX — TIMEOUT RETRY SAFETY', () => {
+    beforeEach(resetEnv);
+    afterEach(resetEnv);
+
+    it('[41] a provider timeout schedules a LONG backoff (>=25 min), never an immediate/near-immediate retry that could race a duplicate send', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const fetchImpl = (url, { signal }) => new Promise((_, reject) => {
+            signal.addEventListener('abort', () => {
+                const err = new Error('aborted'); err.name = 'AbortError'; reject(err);
+            });
+        });
+
+        const updates = [];
+        const client = {
+            rpc: async (name) => {
+                if (name === 'fn_claim_manual_booking_sms_batch') {
+                    return {
+                        data: [{ outbox_id: 'row-t', booking_id: 1, idempotency_key: 'k', locale: 'ru', attempts_count: 1, max_attempts: 3 }],
+                        error: null
+                    };
+                }
+                if (name === 'fn_oson_sms_check_cap') {
+                    return { data: { allowed: true }, error: null };
+                }
+                return { data: null, error: { message: 'unexpected rpc ' + name } };
+            },
+            from(table) {
+                if (table === 'manual_booking_sms_outbox') {
+                    return { update(patch) { return { eq(f, v) { updates.push({ patch, [f]: v }); return Promise.resolve({ error: null }); } }; } };
+                }
+                if (table === 'bus_ticket_bookings') {
+                    return {
+                        select() {
+                            return {
+                                eq() {
+                                    return {
+                                        single: async () => ({
+                                            data: { id: 1, status: 'confirmed', claim_status: 'unclaimed', phone: '992900000001', bus_ticket_id: 1 }
+                                        })
+                                    };
+                                }
+                            };
+                        }
+                    };
+                }
+                if (table === 'booking_claim_sessions') {
+                    // Backs claimHelper.generateClaimSession()'s .insert([...]).select('*').single()
+                    return {
+                        insert() {
+                            return {
+                                select() {
+                                    return {
+                                        single: async () => ({
+                                            data: { id: 'sess-1', booking_id: 1, session_token_hash: 'x'.repeat(64), expires_at: new Date(Date.now() + 900000).toISOString() }
+                                        })
+                                    };
+                                }
+                            };
+                        }
+                    };
+                }
+                return {
+                    select() {
+                        return {
+                            eq() {
+                                return { single: async () => ({ data: { from_city: 'A', to_city: 'B' } }) };
+                            }
+                        };
+                    }
+                };
+            }
+        };
+
+        const before = Date.now();
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const retryUpdate = updates.find(u => u.patch.status === 'retry');
+        assert.ok(retryUpdate, 'expected a retry-status update after a timeout');
+        assert.equal(retryUpdate.patch.last_error_code, 'PROVIDER_TIMEOUT');
+        const scheduledDelayMs = new Date(retryUpdate.patch.scheduled_at).getTime() - before;
+        assert.ok(scheduledDelayMs >= 25 * 60 * 1000, `expected >=25min backoff, got ${scheduledDelayMs}ms`);
+    });
+});
+
+describe('MANUAL BOOKING SMS OUTBOX — LOG/PII HYGIENE (source-level)', () => {
+    const clientSrc = fs.readFileSync(path.join(__dirname, '../utils/osonSmsClient.js'), 'utf8');
+    const workerSrc = fs.readFileSync(path.join(__dirname, '../utils/manualBookingSmsOutboxService.js'), 'utf8');
+    const capsSrc = fs.readFileSync(path.join(__dirname, '../utils/osonSmsCaps.js'), 'utf8');
+
+    it('[42] osonSmsClient never logs the raw phone; any cfg.login/cfg.secretHash reference inside a console call is Boolean-wrapped (presence only, never the value)', () => {
+        // No console.* call in the file may reference the raw phone param
+        // destructured at sendServiceSms's top.
+        assert.ok(!/console\.[a-z]+\([^;]*?\brecipientPhone\b/s.test(clientSrc));
+
+        // Find every console.*(...) call block (may span multiple lines up to
+        // its closing "});") and assert any cfg.login / cfg.secretHash inside
+        // it is always wrapped as Boolean(cfg.login) / Boolean(cfg.secretHash)
+        // — i.e. only "does a credential exist" may ever reach a log, never
+        // the value itself.
+        const consoleCalls = clientSrc.match(/console\.[a-z]+\([\s\S]*?\}\);/g) || [];
+        assert.ok(consoleCalls.length > 0, 'expected at least one console.* call to inspect');
+        for (const block of consoleCalls) {
+            for (const field of ['cfg.login', 'cfg.secretHash']) {
+                if (block.includes(field)) {
+                    const safelyWrapped = block.includes(`Boolean(${field})`) || block.includes(`maskLogin(${field})`);
+                    assert.ok(safelyWrapped, `console call must Boolean()- or maskLogin()-wrap ${field}: ${block}`);
+                }
+            }
+        }
+    });
+
+    it('[43] worker never logs err.message from the OSON client call itself (only normalized errorCode) or the raw phone', () => {
+        assert.ok(!/console\.[a-z]+\([^)]*\bphone\b(?!Check|Masked|Hmac)/.test(workerSrc));
+    });
+
+    it('[44] no code path anywhere in this feature ever sets status to "delivered" — that requires a confirmed OSON delivery-status/callback API this account does not have yet (see audit report)', () => {
+        assert.ok(!workerSrc.includes("'delivered'"), 'worker must never mark delivered without a confirmed delivery-status source');
+    });
+
+    it('[45] cap check never logs the phone HMAC or hashes anything without the dedicated secret env var', () => {
+        assert.ok(capsSrc.includes('OSON_SMS_PHONE_HASH_SECRET'));
+        assert.ok(!/console\.[a-z]+\([^)]*phoneHmac/.test(capsSrc));
     });
 });

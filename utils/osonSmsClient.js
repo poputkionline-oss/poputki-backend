@@ -240,10 +240,15 @@ async function sendServiceSms({ recipientPhone, message, idempotencyKey }, deps 
 
         // Success envelope (per historical integration):
         // { status: 'ok', txn_id, msg_id, smsc_msg_id, smsc_msg_status, smsc_msg_parts }
-        if (parsed && (parsed.status === 'ok' || parsed.msg_id)) {
+        // A confirmed provider message ID is REQUIRED for success — a bare
+        // {status:'ok'} with no msg_id cannot be traced/reconciled later
+        // (no delivery-status/callback endpoint is confirmed to exist for
+        // this account, see docs/oson-sms-audit-report.md §3/§4), so it is
+        // treated as an unrecognized response rather than assumed success.
+        if (parsed && parsed.msg_id != null && String(parsed.msg_id).length > 0) {
             return {
                 success: true,
-                providerMessageId: parsed.msg_id != null ? String(parsed.msg_id) : null
+                providerMessageId: String(parsed.msg_id)
             };
         }
 

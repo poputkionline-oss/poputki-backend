@@ -172,7 +172,7 @@ async function processManualBookingSmsOutbox(options = {}) {
             recipientPhone: phone,
             message: rendered.text,
             idempotencyKey: entry.idempotency_key
-        });
+        }, options.fetchImpl ? { fetchImpl: options.fetchImpl } : {});
 
         if (result.success) {
             await markOutboxRow(client, entryId, {

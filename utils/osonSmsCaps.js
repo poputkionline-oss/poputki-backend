@@ -49,6 +49,30 @@ async function checkSendCaps({ dbClient, phone, carrierId, now = new Date() }) {
         return { allowed: false, reason: 'DAILY_CAP_NOT_CONFIGURED' };
     }
 
+    // Atomic path: fn_oson_sms_check_cap serializes the whole check across
+    // ALL concurrent worker processes via pg_advisory_xact_lock, closing the
+    // check-then-act race a plain COUNT query cannot prevent under multiple
+    // workers. Falls back to the non-atomic per-query path only for mock
+    // test clients that don't implement .rpc() (unit tests inject those on
+    // purpose — the real concurrency guarantee is proven separately against
+    // a real Postgres instance, see docs/oson-sms-audit-report.md).
+    if (typeof dbClient.rpc === 'function') {
+        const phoneHmac = phone ? hmacPhone(phone) : null;
+        const { data, error } = await dbClient.rpc('fn_oson_sms_check_cap', {
+            p_phone_hmac: phoneHmac,
+            p_carrier_id: carrierId || null,
+            p_daily_cap: dailyCap,
+            p_per_phone_cap: perPhoneCap,
+            p_per_carrier_cap: perCarrierCap
+        });
+        if (error) {
+            return { allowed: false, reason: 'CAP_CHECK_FAILED' };
+        }
+        return data && data.allowed
+            ? { allowed: true }
+            : { allowed: false, reason: (data && data.reason) || 'CAP_CHECK_FAILED' };
+    }
+
     const sinceIso = startOfTodayUtcIso(now);
 
     const { count: globalCount, error: globalErr } = await dbClient
