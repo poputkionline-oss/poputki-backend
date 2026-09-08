@@ -111,7 +111,7 @@ async function processManualBookingSmsOutbox(options = {}) {
             deadLetter++; continue;
         }
 
-        const capResult = await checkSendCaps({ dbClient: client, phone, carrierId: entry.carrier_id || booking.created_by_user_id });
+        const capResult = await checkSendCaps({ dbClient: client, phone, carrierId: entry.carrier_id || booking.created_by_user_id, outboxId: entryId });
         if (!capResult.allowed) {
             // Cap failures are temporary (reset daily) — retry later, don't burn the attempt budget hard.
             await markOutboxRow(client, entryId, {

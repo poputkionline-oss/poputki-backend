@@ -37,10 +37,16 @@ function readCap(envName, fallback) {
  * @param {Object} params.dbClient - service-role Supabase client
  * @param {string} params.phone - normalized recipient phone (not masked)
  * @param {number|null} params.carrierId
+ * @param {string|null} [params.outboxId] - the specific outbox row being
+ *   evaluated. REQUIRED for the atomic RPC path to actually close the
+ *   concurrency race (see fn_oson_sms_check_cap's reservation step,
+ *   20260910_manual_booking_sms_cap_reservation.sql) — without it the check
+ *   only serializes the count, not the decision, which two DIFFERENT
+ *   concurrent rows can both pass before either has sent anything.
  * @param {Date} [params.now]
  * @returns {Promise<{allowed: boolean, reason?: string}>}
  */
-async function checkSendCaps({ dbClient, phone, carrierId, now = new Date() }) {
+async function checkSendCaps({ dbClient, phone, carrierId, outboxId = null, now = new Date() }) {
     const dailyCap = readCap('OSON_SMS_DAILY_CAP', 0); // fail-closed default: 0 = nothing allowed until explicitly set
     const perPhoneCap = readCap('OSON_SMS_PER_PHONE_DAILY_CAP', 1);
     const perCarrierCap = readCap('OSON_SMS_PER_CARRIER_DAILY_CAP', 0);
@@ -49,16 +55,19 @@ async function checkSendCaps({ dbClient, phone, carrierId, now = new Date() }) {
         return { allowed: false, reason: 'DAILY_CAP_NOT_CONFIGURED' };
     }
 
-    // Atomic path: fn_oson_sms_check_cap serializes the whole check across
-    // ALL concurrent worker processes via pg_advisory_xact_lock, closing the
-    // check-then-act race a plain COUNT query cannot prevent under multiple
-    // workers. Falls back to the non-atomic per-query path only for mock
-    // test clients that don't implement .rpc() (unit tests inject those on
-    // purpose — the real concurrency guarantee is proven separately against
-    // a real Postgres instance, see docs/oson-sms-audit-report.md).
+    // Atomic path: fn_oson_sms_check_cap serializes the whole check-AND-
+    // reserve across ALL concurrent worker processes via
+    // pg_advisory_xact_lock, closing the check-then-act race a plain COUNT
+    // query (or a count-only lock with no reservation) cannot prevent under
+    // multiple workers evaluating DIFFERENT rows at once. Falls back to the
+    // non-atomic per-query path only for mock test clients that don't
+    // implement .rpc() (unit tests inject those on purpose — the real
+    // concurrency guarantee is proven separately against a real Postgres
+    // instance, see docs/oson-sms-audit-report.md).
     if (typeof dbClient.rpc === 'function') {
         const phoneHmac = phone ? hmacPhone(phone) : null;
         const { data, error } = await dbClient.rpc('fn_oson_sms_check_cap', {
+            p_outbox_id: outboxId,
             p_phone_hmac: phoneHmac,
             p_carrier_id: carrierId || null,
             p_daily_cap: dailyCap,

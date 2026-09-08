@@ -361,6 +361,20 @@ describe('MANUAL BOOKING SMS OUTBOX — CAPS & ALLOWLIST', () => {
         assert.equal(result.allowed, true);
     });
 
+    it('[24b] the atomic RPC path is passed p_outbox_id — required for fn_oson_sms_check_cap to actually reserve the slot (regression guard for the concurrency fix proven in the PostgreSQL gate)', async () => {
+        process.env.OSON_SMS_DAILY_CAP = '100';
+        process.env.OSON_SMS_PHONE_HASH_SECRET = 'test-secret';
+        let capturedParams = null;
+        const rpcClient = {
+            rpc: async (name, params) => {
+                capturedParams = params;
+                return { data: { allowed: true }, error: null };
+            }
+        };
+        await checkSendCaps({ dbClient: rpcClient, phone: '992900000001', outboxId: 'row-abc-123' });
+        assert.equal(capturedParams.p_outbox_id, 'row-abc-123');
+    });
+
     it('[25] carrier allowlist fails closed when unset (pilot must be explicit)', () => {
         assert.equal(isCarrierAllowlisted(42), false);
     });
