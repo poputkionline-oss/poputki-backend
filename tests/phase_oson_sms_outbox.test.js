@@ -399,6 +399,51 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT (API 2.0.2, Bearer contr
     it('[28] txn_id stays identical across repeated calls with the same idempotencyKey (retry safety)', () => {
         assert.equal(deriveTxnId('same-key'), deriveTxnId('same-key'));
     });
+
+    it('[29] OSON_SMS_TEST_PHONE_ALLOWLIST unset is a no-op — a send to any valid TJ number proceeds normally', async () => {
+        const txnId = deriveTxnId('allowlist-noop');
+        enabledConfig();
+        let capturedUrl = null;
+        const fetchImpl = async (url) => {
+            capturedUrl = url;
+            return jsonResponse(201, { status: 'ok', txn_id: txnId, msg_id: 'm-1' });
+        };
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000099', message: 'test', idempotencyKey: 'allowlist-noop' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, true);
+        assert.ok(capturedUrl, 'fetch must have been called — unset allowlist must not restrict anything');
+    });
+
+    it('[30] OSON_SMS_TEST_PHONE_ALLOWLIST set, recipient IS in the list — send proceeds', async () => {
+        const txnId = deriveTxnId('allowlist-match');
+        enabledConfig({ OSON_SMS_TEST_PHONE_ALLOWLIST: '992927797576, +992900000001' });
+        let called = false;
+        const fetchImpl = async () => {
+            called = true;
+            return jsonResponse(201, { status: 'ok', txn_id: txnId, msg_id: 'm-2' });
+        };
+        const result = await sendServiceSms(
+            { recipientPhone: '+992927797576', message: 'test', idempotencyKey: 'allowlist-match' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, true);
+        assert.equal(called, true, 'a listed number must be allowed through to fetch');
+    });
+
+    it('[31] OSON_SMS_TEST_PHONE_ALLOWLIST set, recipient is NOT in the list — refused, never calls fetch', async () => {
+        enabledConfig({ OSON_SMS_TEST_PHONE_ALLOWLIST: '992927797576' });
+        let called = false;
+        const fetchImpl = async () => { called = true; };
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000002', message: 'test', idempotencyKey: 'allowlist-block' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'OSON_SMS_PHONE_NOT_IN_TEST_ALLOWLIST');
+        assert.equal(called, false, 'a non-listed number must never reach fetch, regardless of any other flag');
+    });
 });
 
 describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)', () => {

@@ -189,6 +189,23 @@ async function sendServiceSms({ recipientPhone, message, idempotencyKey }, deps 
         return { success: false, errorCode: phoneCheck.reason };
     }
 
+    // 5.5. Pilot safety net: when OSON_SMS_TEST_PHONE_ALLOWLIST is set, this
+    // client physically refuses to send to any phone number not explicitly
+    // listed — independent of booking data, carrier allowlist, rollout
+    // cutoff, or any other upstream logic. A bug or bad data anywhere else
+    // in the pipeline cannot make this reach a real passenger while a pilot
+    // allowlist is configured. No-op (does not restrict anything) when the
+    // var is unset/empty, so this has zero effect once the pilot ends and
+    // the var is removed. Entries are digits-only in the same normalized
+    // form classifyPhone() produces (e.g. "992927797576"), comma-separated;
+    // a leading '+' or stray whitespace per entry is tolerated.
+    const testAllowlistRaw = process.env.OSON_SMS_TEST_PHONE_ALLOWLIST || '';
+    const testAllowlist = testAllowlistRaw.split(',').map(s => s.trim().replace(/^\+/, '')).filter(Boolean);
+    if (testAllowlist.length > 0 && !testAllowlist.includes(phoneCheck.normalized)) {
+        console.error('[OsonSmsClient] Refusing send: recipient not in OSON_SMS_TEST_PHONE_ALLOWLIST', { phone: maskedPhone });
+        return { success: false, errorCode: 'OSON_SMS_PHONE_NOT_IN_TEST_ALLOWLIST' };
+    }
+
     // 6. Message shape validation
     if (!message || typeof message !== 'string' || message.length === 0 || message.length > 640) {
         return { success: false, errorCode: 'INVALID_MESSAGE' };
