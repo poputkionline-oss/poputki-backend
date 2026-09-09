@@ -46,7 +46,7 @@ than it had earned.
      `reconciliation_required` status instead, tagged
      `DUPLICATE_WITHOUT_PROVIDER_ID`, and is structurally excluded from
      ever being auto-claimed again (see migration below).
-3. **`docs/migrations/20260911_manual_booking_sms_reconciliation_required.sql`**
+3. **`docs/migrations/20260909174859_manual_booking_sms_reconciliation_required.sql`**
    (new, additive): extends the `manual_booking_sms_outbox.status` CHECK
    constraint with `'reconciliation_required'`. Nothing else changes —
    `fn_claim_manual_booking_sms_batch`'s claim query already only matches
@@ -62,7 +62,7 @@ than it had earned.
 
 - `utils/osonSmsStatusClient.js` — `msgId` required, fails closed
 - `utils/manualBookingSmsOutboxService.js` — Variant A/B duplicate handling, `reconciliation` counter added to the return value
-- `docs/migrations/20260911_manual_booking_sms_reconciliation_required.sql` — new, additive
+- `docs/migrations/20260909174859_manual_booking_sms_reconciliation_required.sql` — new, additive
 - `docs/oson-contract-reconciliation-form.md` — new "URGENT — Duplicate-Reconciliation Open Questions" section (Q1–Q4) and updated sign-off item
 - `tests/phase_oson_sms_outbox.test.js` — status-client tests updated to supply `msgId` (mapping logic unaffected) plus two new fail-closed tests (`[S10]`, `[S11]`); the duplicate-resolution suite fully rewritten, 11 tests (`[D1]`–`[D10]`, was 5), covering all 8 required categories
 
@@ -95,7 +95,7 @@ outbox row's `idempotency_key` always produces — and asserted
 ### PostgreSQL 16 Gate — reconciliation-specific proof (real database, not mocked)
 
 Applied the full 5-migration chain (staging baseline →
-`20260908`→`20260909`→`20260910`→`20260911`) to a fresh disposable
+`20260908`→`20260909`→`20260910`→`20260909174859`) to a fresh disposable
 database, clean, twice in a row (idempotent). Then, with real fixture
 rows:
 
@@ -123,7 +123,7 @@ Migration checksums:
 
 | File | SHA-256 |
 |---|---|
-| `docs/migrations/20260911_manual_booking_sms_reconciliation_required.sql` | `8e9d70f80edea996f8d7fd55ee8f852c55ca41edeb13094a1aec5b42244ef04e` |
+| `docs/migrations/20260909174859_manual_booking_sms_reconciliation_required.sql` | `b44f9f2ac935b4cc1f8bac4fb89e7cdc7315bc05875ccd70bb2ee8e112cefd2b` |
 
 ### Reconciliation questions added for OSON
 
@@ -153,6 +153,138 @@ auth, Sender ID, +992-only, the send/success contract; this addendum
 narrows scope specifically to the duplicate-with-unknown-msg_id
 reconciliation path, which is now honestly `BLOCKED` rather than resting
 on an unproven assumption).
+
+---
+
+## MIGRATION CHRONOLOGY CORRECTION
+
+**Root cause**: the addendum above's new migration was originally named
+`20260911_manual_booking_sms_reconciliation_required.sql`. The real date
+on the day it was authored was **2026-09-09** — the `20260911` prefix was
+invented by incrementing the previous migration's date by one instead of
+using the actual date, producing a **future-dated** filename two days
+ahead of when the file was actually created.
+
+**Repository convention, determined by inspecting `docs/migrations/`, not
+assumed**: two conventions coexist —
+1. Plain `YYYYMMDD_description.sql` (the majority of files, and every
+   other migration in this same SMS feature: `20260908`, `20260909`,
+   `20260910`).
+2. Full `YYYYMMDDHHMMSS_description.sql`, used specifically for a cluster
+   of four migrations all authored on `2026-09-04`
+   (`20260904130756_...`, `20260904144755_...`, `20260904180601_...`,
+   `20260904183500_...`) — i.e. this repository's own established fix for
+   exactly the situation being hit here: more than one migration authored
+   on the same calendar day, where a bare date prefix would collide or
+   misorder against an existing file.
+
+A bare `20260909_` prefix was not available without colliding with the
+already-committed `20260909_manual_booking_sms_atomic_cap_rpc.sql`, so
+this migration was renamed following convention 2, using the real system
+clock at rename time (`date -u +"%Y%m%d%H%M%S"` → `20260909174859`, UTC):
+
+```
+git mv docs/migrations/20260911_manual_booking_sms_reconciliation_required.sql \
+       docs/migrations/20260909174859_manual_booking_sms_reconciliation_required.sql
+```
+
+The file's own header comment (which named itself) was updated to match,
+which changes its SHA-256 — see the corrected checksum in the addendum's
+table above. Content/logic is otherwise byte-identical; this was a rename
+plus a self-referential comment fix, not a behavioral change. The
+migration had never been applied anywhere (not production, not staging,
+not even the disposable local gate databases under its old name — those
+were all dropped after use) and had never been pushed, so this is a clean
+rename with no history to reconcile.
+
+Scope note: this correction, per the task that requested it, is limited to
+the one migration that is still local-only and unpushed. `20260910`
+(`manual_booking_sms_cap_reservation`) was, on inspection, likely also
+authored on the real date 2026-09-09 rather than 2026-09-10 — but it was
+not in scope for this rename and was left untouched.
+
+### Migration order verification (re-run after the rename)
+
+**A real ordering quirk was found and is disclosed here rather than
+glossed over.** A plain lexicographic sort of `docs/migrations/*.sql`
+(e.g. `ls | sort`, or any tool that globs the directory rather than
+reading an explicit list) puts the renamed file **before**
+`20260909_manual_booking_sms_atomic_cap_rpc.sql`, not after it:
+
+```
+20260908_manual_booking_sms_outbox.sql
+20260909174859_manual_booking_sms_reconciliation_required.sql   <- sorts here
+20260909_manual_booking_sms_atomic_cap_rpc.sql
+20260910_manual_booking_sms_cap_reservation.sql
+```
+
+Cause: comparing `"20260909174859_..."` against `"20260909_manual..."`
+character by character, the two strings agree through `"20260909"`, then
+diverge at the very next character — `'1'` (from the timestamp's `17`)
+versus `'_'` (the plain file's separator). `'1'` (0x31) sorts before `'_'`
+(0x5F), so the 14-digit timestamped file always sorts before a same-day
+8-digit file, regardless of the actual time either was authored. **This is
+not a new issue introduced by this rename** — it already exists,
+identically, for the pre-existing `20260904` cluster: all four
+`20260904HHMMSS_...` files sort before the plain `20260904_manual_booking_journey_handoffs_and_events.sql`,
+for the same reason. This rename followed the repository's own
+already-established (if imperfect) convention rather than inventing a new
+one.
+
+**Whether this quirk is consequential was tested, not assumed.** The
+renamed migration only drops and re-adds one `CHECK` constraint on
+`manual_booking_sms_outbox.status` (a table created by `20260908`); it
+reads and writes nothing that `20260909` or `20260910` add. To confirm
+this holds in practice and not just by inspection, the full chain was
+applied twice on disposable local PostgreSQL 16 databases, in both orders:
+
+- **Chronological order** (`20260908` → `20260909` → `20260910` →
+  `20260909174859`, i.e. the order the files were actually authored in):
+  all 5 files (baseline + 4) applied cleanly, no errors.
+- **Strict lexicographic order** (`20260908` → `20260909174859` →
+  `20260909` → `20260910`, i.e. what a naive directory-glob-and-sort
+  runner would produce): all 5 files also applied cleanly, no errors.
+- `pg_dump --schema-only` of both resulting databases was diffed; the only
+  difference was pg_dump's own random per-run `\restrict`/`\unrestrict`
+  session token — **the resulting schemas are byte-identical**. Order is
+  provably inconsequential for this migration.
+- The renamed migration was also re-applied a second time on top of the
+  chronological-order database (idempotency check): `DROP CONSTRAINT IF
+  EXISTS` / `ADD CONSTRAINT` ran cleanly with no error, confirming the
+  migration is safely re-runnable.
+
+**Live proof that `reconciliation_required` is unreachable by the claim
+RPC** (not just inferred from reading the `WHERE` clause): on the
+chronological-order database, a real booking/carrier fixture was created,
+then two `manual_booking_sms_outbox` rows were inserted — one `pending`,
+one `reconciliation_required` (mirroring the worker's own Variant B
+write). Calling `fn_claim_manual_booking_sms_batch(10, 'test-worker-1',
+60)` returned **exactly one row — the `pending` one**; after the call, that
+row's status was `processing` and the `reconciliation_required` row was
+completely untouched (same status, same `last_error_code`, unclaimed).
+
+No code changes came out of this check. This repository has no
+glob-based migration runner today — a repository-wide `grep` for a
+migrations-directory reader/runner in `.js` files found none, and every
+gate run in this session (including this one) has applied files
+individually/explicitly by name, never via a directory scan — so the
+sort-order quirk has no live apply-order consequence right now. It is
+recorded here for transparency and so a future same-day migration, or any
+future tooling that does start globbing this directory, accounts for it.
+
+### Full re-verification results (this pass)
+
+| Check | Result |
+|---|---|
+| Clean-slate apply, chronological order, 5 files (baseline + 20260908 + 20260909 + 20260910 + 20260909174859) | ✅ 0 errors |
+| Clean-slate apply, strict lexicographic order (same 5 files, reordered) | ✅ 0 errors |
+| Schema diff between the two orders | ✅ identical (only pg_dump's own random session token differed) |
+| Idempotent re-apply of `20260909174859` on the already-migrated DB | ✅ 0 errors |
+| Live claim-RPC exclusion proof (`pending` claimed, `reconciliation_required` never claimed) | ✅ confirmed |
+| Backend test suite (`node --test "tests/**/*.test.js"`) | ✅ 1322 pass, 0 fail, 0 skipped |
+| Secret scan (compromised login/hash, `OSON_SMS_HASH`, generic secret-shaped literals) across full diff | ✅ clean |
+| `git diff --check` (whitespace / conflict markers) | ✅ clean |
+| Temporary gate databases (`oson_rename_gate`, `oson_rename_gate_altorder`) | ✅ dropped after use |
 
 ---
 

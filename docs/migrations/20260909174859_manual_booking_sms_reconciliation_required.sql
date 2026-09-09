@@ -1,5 +1,5 @@
 -- ==============================================================================
--- Migration: 20260911_manual_booking_sms_reconciliation_required.sql
+-- Migration: 20260909174859_manual_booking_sms_reconciliation_required.sql
 -- Description: Adds a dedicated 'reconciliation_required' outbox status for
 --              the HTTP 409/DUPLICATE_TXN_ID case where no provider msg_id
 --              is durably known — see the Critical Addendum in
