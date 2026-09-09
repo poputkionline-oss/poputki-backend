@@ -405,10 +405,16 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)',
     beforeEach(resetEnv);
     afterEach(resetEnv);
 
+    // CRITICAL ADDENDUM: the confirmed contract's documented parameters for
+    // query_sms.php are login + txn_id + msg_id, not txn_id alone. Every
+    // status-mapping test below supplies a msgId so it exercises the
+    // mapping logic itself; the msg_id-REQUIREMENT is proven separately by
+    // [S10]/[S11].
+
     it('[S1] ENROUTE maps to sent, never delivered', async () => {
         enabledConfig();
         const fetchImpl = async () => jsonResponse(200, { status: 'ENROUTE' });
-        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        const result = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl });
         assert.equal(result.success, true);
         assert.equal(result.internalStatus, 'sent');
     });
@@ -416,7 +422,7 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)',
     it('[S2] ACCEPTED maps to sent, never delivered', async () => {
         enabledConfig();
         const fetchImpl = async () => jsonResponse(200, { status: 'ACCEPTED' });
-        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        const result = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl });
         assert.equal(result.internalStatus, 'sent');
         assert.notEqual(result.internalStatus, 'delivered');
     });
@@ -424,7 +430,7 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)',
     it('[S3] DELIVERED maps to delivered, and only DELIVERED does', async () => {
         enabledConfig();
         const fetchImpl = async () => jsonResponse(200, { status: 'DELIVERED' });
-        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        const result = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl });
         assert.equal(result.internalStatus, 'delivered');
         assert.equal(result.terminal, true);
     });
@@ -432,21 +438,21 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)',
     it('[S4] EXPIRED maps to failed', async () => {
         enabledConfig();
         const fetchImpl = async () => jsonResponse(200, { status: 'EXPIRED' });
-        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        const result = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl });
         assert.equal(result.internalStatus, 'failed');
     });
 
     it('[S5] DELETED maps to cancelled', async () => {
         enabledConfig();
         const fetchImpl = async () => jsonResponse(200, { status: 'DELETED' });
-        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        const result = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl });
         assert.equal(result.internalStatus, 'cancelled');
     });
 
     it('[S6] UNDELIVERABLE and REJECTED both map to failed with a distinct error code', async () => {
         enabledConfig();
-        const r1 = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl: async () => jsonResponse(200, { status: 'UNDELIVERABLE' }) });
-        const r2 = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl: async () => jsonResponse(200, { status: 'REJECTED' }) });
+        const r1 = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl: async () => jsonResponse(200, { status: 'UNDELIVERABLE' }) });
+        const r2 = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl: async () => jsonResponse(200, { status: 'REJECTED' }) });
         assert.equal(r1.internalStatus, 'failed');
         assert.equal(r1.errorCode, 'UNDELIVERABLE');
         assert.equal(r2.internalStatus, 'failed');
@@ -456,7 +462,7 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)',
     it('[S7] UNKNOWN never resolves to delivered — flagged for retry/manual attention instead', async () => {
         enabledConfig();
         const fetchImpl = async () => jsonResponse(200, { status: 'UNKNOWN' });
-        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        const result = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl });
         assert.notEqual(result.internalStatus, 'delivered');
         assert.equal(result.needsManualAttention, true);
     });
@@ -464,17 +470,35 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)',
     it('[S8] a redirect on the status endpoint is refused', async () => {
         enabledConfig();
         const fetchImpl = async () => ({ ok: false, status: 0, type: 'opaqueredirect', headers: { get: () => '' }, text: async () => '' });
-        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        const result = await queryOsonSmsStatus({ txnId: 'x', msgId: 'm1' }, { fetchImpl });
         assert.equal(result.success, false);
         assert.equal(result.errorCode, 'ERR_REDIRECT_BLOCKED');
     });
 
     it('[S9] the query URL never appears in an error result if the request throws', async () => {
         enabledConfig();
-        const fetchImpl = async () => { throw new Error('https://api.osonsms.com/query_sms.php?login=real&txn_id=abc123 boom'); };
-        const result = await queryOsonSmsStatus({ txnId: 'abc123' }, { fetchImpl });
+        const fetchImpl = async () => { throw new Error('https://api.osonsms.com/query_sms.php?login=real&txn_id=abc123&msg_id=m1 boom'); };
+        const result = await queryOsonSmsStatus({ txnId: 'abc123', msgId: 'm1' }, { fetchImpl });
         assert.equal(result.success, false);
         assert.ok(!JSON.stringify(result).includes('query_sms.php'));
+    });
+
+    it('[S10] REQUIRED TEST CATEGORY 3 — msg_id missing: fails closed with MISSING_PROVIDER_MESSAGE_ID, BEFORE any fetch call', async () => {
+        enabledConfig();
+        let called = false;
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl: async () => { called = true; return jsonResponse(200, { status: 'DELIVERED' }); } });
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'MISSING_PROVIDER_MESSAGE_ID');
+        assert.equal(called, false, 'the confirmed contract requires login+txn_id+msg_id — a txn_id-only lookup is not proven and must never reach the network');
+    });
+
+    it('[S11] txn_id missing also fails closed before fetch, independent of msg_id', async () => {
+        enabledConfig();
+        let called = false;
+        const result = await queryOsonSmsStatus({ msgId: 'm1' }, { fetchImpl: async () => { called = true; } });
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'TXN_ID_REQUIRED');
+        assert.equal(called, false);
     });
 });
 
@@ -885,12 +909,17 @@ describe('MANUAL BOOKING SMS OUTBOX — TIMEOUT RETRY SAFETY', () => {
     });
 });
 
-describe('MANUAL BOOKING SMS OUTBOX — DUPLICATE TXN_ID RESOLUTION (HTTP 409 / code 108)', () => {
+describe('MANUAL BOOKING SMS OUTBOX — DUPLICATE TXN_ID RESOLUTION (HTTP 409 / code 108), CRITICAL ADDENDUM CORRECTED', () => {
     beforeEach(resetEnv);
     afterEach(resetEnv);
 
-    function makeDuplicateFlowClient({ statusResponseBody, statusResponseStatus = 200 }) {
+    // knownMsgId: null simulates the normal case (no msg_id was ever
+    // durably stored for this row — it never reached 'sent' before,
+    // otherwise it wouldn't be re-claimable). A non-null value simulates
+    // Variant A (an msg_id WAS already stored from an earlier confirmed send).
+    function makeDuplicateFlowClient({ knownMsgId = null, statusResponseBody, statusResponseStatus = 200, statusShouldBeCalled = null }) {
         const updates = [];
+        let statusFetchCalled = false;
         const client = {
             rpc: async (name) => {
                 if (name === 'fn_claim_manual_booking_sms_batch') {
@@ -903,7 +932,16 @@ describe('MANUAL BOOKING SMS OUTBOX — DUPLICATE TXN_ID RESOLUTION (HTTP 409 / 
             },
             from(table) {
                 if (table === 'manual_booking_sms_outbox') {
-                    return { update(patch) { return { eq(f, v) { updates.push({ patch, [f]: v }); return Promise.resolve({ error: null }); } }; } };
+                    return {
+                        update(patch) {
+                            return { eq(f, v) { updates.push({ patch, [f]: v }); return Promise.resolve({ error: null }); } };
+                        },
+                        select() {
+                            // Backs the worker's pre-duplicate-resolution read of
+                            // any already-known provider_message_id for this row.
+                            return { eq() { return { single: async () => ({ data: { provider_message_id: knownMsgId } }) }; } };
+                        }
+                    };
                 }
                 if (table === 'bus_ticket_bookings') {
                     return {
@@ -947,57 +985,140 @@ describe('MANUAL BOOKING SMS OUTBOX — DUPLICATE TXN_ID RESOLUTION (HTTP 409 / 
             }
         };
 
-        const fetchImpl = async (url) => {
+        const fetchImpl = async (url, init) => {
             if (url.includes('sendsms_v1.php')) {
                 return { ok: false, status: 409, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ error: { code: 108, msg: 'duplicate' } }) };
             }
             if (url.includes('query_sms.php')) {
+                statusFetchCalled = true;
                 return { ok: statusResponseStatus === 200, status: statusResponseStatus, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify(statusResponseBody) };
             }
             throw new Error('unexpected URL in duplicate-flow test: ' + url);
         };
 
-        return { client, updates, fetchImpl };
+        return { client, updates, fetchImpl, wasStatusFetchCalled: () => statusFetchCalled };
     }
 
-    it('[D1] duplicate resolved via query_sms.php DELIVERED -> outbox marked delivered (never assumed from the bare 409 alone)', async () => {
+    // ===== REQUIRED TEST CATEGORY 1: 409 without msg_id =====
+    it('[D1] Category 1 — 409/108 with NO known msg_id: status fetch is NEVER called, row becomes reconciliation_required, sent=false, delivered=false', async () => {
         enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
-        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { status: 'DELIVERED' } });
+        const { client, updates, fetchImpl, wasStatusFetchCalled } = makeDuplicateFlowClient({ knownMsgId: null });
         await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
-        const finalUpdate = updates[updates.length - 1];
-        assert.equal(finalUpdate.patch.status, 'delivered');
-    });
 
-    it('[D2] duplicate resolved via query_sms.php ENROUTE -> outbox marked sent, NOT delivered', async () => {
-        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
-        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { status: 'ENROUTE' } });
-        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        assert.equal(wasStatusFetchCalled(), false, 'query_sms.php must never be called without a durably known msg_id');
         const finalUpdate = updates[updates.length - 1];
-        assert.equal(finalUpdate.patch.status, 'sent');
-    });
-
-    it('[D3] duplicate resolved via query_sms.php UNKNOWN -> bounded retry, never delivered, same idempotency_key next attempt', async () => {
-        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
-        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { status: 'UNKNOWN' } });
-        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
-        const finalUpdate = updates[updates.length - 1];
-        assert.equal(finalUpdate.patch.status, 'retry');
-        assert.equal(finalUpdate.patch.last_error_code, 'PROVIDER_DUPLICATE_TXN_ID');
-    });
-
-    it('[D4] duplicate where the status query itself fails -> bounded retry, never delivered, never dead_letter on first attempt', async () => {
-        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
-        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { error: { code: 106 } }, statusResponseStatus: 400 });
-        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
-        const finalUpdate = updates[updates.length - 1];
-        assert.equal(finalUpdate.patch.status, 'retry');
+        assert.equal(finalUpdate.patch.status, 'reconciliation_required');
+        assert.equal(finalUpdate.patch.last_error_code, 'DUPLICATE_WITHOUT_PROVIDER_ID');
+        assert.notEqual(finalUpdate.patch.status, 'sent');
         assert.notEqual(finalUpdate.patch.status, 'delivered');
+        assert.equal(finalUpdate.patch.sent_at, undefined, 'sent_at must never be set for an unresolved duplicate');
+        assert.equal(finalUpdate.patch.delivered_at, undefined, 'delivered_at must never be set for an unresolved duplicate');
     });
 
-    it('[D5] a duplicate never mints a new txn_id on the resolving status query — the same stable id is used', async () => {
+    // ===== REQUIRED TEST CATEGORY 2: 409 with a previously stored msg_id =====
+    it('[D2] Category 2 — 409/108 WITH a previously stored msg_id: query_sms.php IS called, with login, txn_id AND msg_id', async () => {
         enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
         let capturedStatusUrl = null;
-        const { client } = makeDuplicateFlowClient({ statusResponseBody: { status: 'DELIVERED' } });
+        const { client } = makeDuplicateFlowClient({ knownMsgId: 'previously-known-msg-id', statusResponseBody: { status: 'DELIVERED' } });
+        const fetchImpl = async (url) => {
+            if (url.includes('sendsms_v1.php')) {
+                return { ok: false, status: 409, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ error: { code: 108 } }) };
+            }
+            capturedStatusUrl = url;
+            return { ok: true, status: 200, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ status: 'DELIVERED' }) };
+        };
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+
+        assert.ok(capturedStatusUrl, 'expected query_sms.php to be called when a msg_id is already known');
+        assert.ok(capturedStatusUrl.includes('login='));
+        assert.ok(capturedStatusUrl.includes('txn_id='));
+        assert.ok(capturedStatusUrl.includes('msg_id=previously-known-msg-id'));
+    });
+
+    it('[D2b] resolving via a known msg_id: DELIVERED -> delivered, ENROUTE -> sent (not delivered)', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        {
+            const { client, updates, fetchImpl } = makeDuplicateFlowClient({ knownMsgId: 'm1', statusResponseBody: { status: 'DELIVERED' } });
+            await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+            assert.equal(updates[updates.length - 1].patch.status, 'delivered');
+        }
+        {
+            const { client, updates, fetchImpl } = makeDuplicateFlowClient({ knownMsgId: 'm1', statusResponseBody: { status: 'ENROUTE' } });
+            await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+            assert.equal(updates[updates.length - 1].patch.status, 'sent');
+        }
+    });
+
+    // ===== REQUIRED TEST CATEGORY 3: status client without msg_id fails closed =====
+    // (also covered directly at the client level by [S10]/[S11] above — this
+    // proves the WORKER never even attempts to construct such a call.)
+    it('[D3] Category 3 — the worker never invokes queryOsonSmsStatus at all when no msg_id is known (not just "the client would refuse it")', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, fetchImpl, wasStatusFetchCalled } = makeDuplicateFlowClient({ knownMsgId: null });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        assert.equal(wasStatusFetchCalled(), false);
+    });
+
+    // ===== REQUIRED TEST CATEGORY 4: timeout -> retry (same txn_id) -> 409 without msg_id =====
+    it('[D4] Category 4 — timeout then retry with the SAME txn_id then 409 without msg_id: no new send attempt, no false success, excluded from further automatic retry', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const crypto = require('node:crypto');
+        const expectedTxnId = crypto.createHash('sha256').update('dup-key').digest('hex').slice(0, 24);
+
+        // Simulates: attempt 1 timed out (not modeled here directly — this
+        // test starts from attempt 2, which is what a retry with the SAME
+        // idempotency_key/txn_id looks like), attempt 2 gets 409 with no
+        // known msg_id.
+        let sendCallCount = 0;
+        let capturedSendTxnId = null;
+        const { client, updates } = makeDuplicateFlowClient({ knownMsgId: null });
+        const fetchImpl = async (url) => {
+            if (url.includes('sendsms_v1.php')) {
+                sendCallCount++;
+                const params = new URL(url).searchParams;
+                capturedSendTxnId = params.get('txn_id');
+                return { ok: false, status: 409, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ error: { code: 108 } }) };
+            }
+            throw new Error('status endpoint must not be called in this scenario: ' + url);
+        };
+
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+
+        assert.equal(sendCallCount, 1, 'exactly one send attempt per worker tick — no internal double-send');
+        assert.equal(capturedSendTxnId, expectedTxnId, 'the retry used the SAME stable txn_id, never a new one');
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'reconciliation_required', 'must be excluded from automatic retry, not silently retried again');
+        assert.notEqual(finalUpdate.patch.status, 'sent');
+        assert.notEqual(finalUpdate.patch.status, 'delivered');
+        assert.notEqual(finalUpdate.patch.status, 'retry', 'reconciliation_required must NOT be treated as a normal retry — it is never auto-reclaimed');
+    });
+
+    // ===== REQUIRED TEST CATEGORY 5: timeout -> retry -> HTTP 201 with msg_id =====
+    it('[D5] Category 5 — timeout then retry returns a clean HTTP 201 + msg_id: msg_id is stored, status is "sent" (never higher than sent/accepted until a delivery check)', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const crypto = require('node:crypto');
+        const expectedTxnId = crypto.createHash('sha256').update('dup-key').digest('hex').slice(0, 24);
+
+        const { client, updates } = makeDuplicateFlowClient({ knownMsgId: null });
+        const fetchImpl = async (url) => {
+            if (url.includes('sendsms_v1.php')) {
+                return jsonResponse(201, { status: 'ok', txn_id: expectedTxnId, msg_id: 'fresh-msg-id-99' });
+            }
+            throw new Error('status endpoint must not be called on a clean success: ' + url);
+        };
+
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'sent');
+        assert.equal(finalUpdate.patch.provider_message_id, 'fresh-msg-id-99');
+        assert.notEqual(finalUpdate.patch.status, 'delivered', 'a bare send success is never "delivered" — only an explicit DELIVERED status query result may set that');
+    });
+
+    it('[D6] a duplicate resolved via a known msg_id never mints a new txn_id — the same stable id is used for the status query', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        let capturedStatusUrl = null;
+        const { client } = makeDuplicateFlowClient({ knownMsgId: 'm1', statusResponseBody: { status: 'DELIVERED' } });
         const fetchImpl = async (url) => {
             if (url.includes('sendsms_v1.php')) {
                 return { ok: false, status: 409, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ error: { code: 108 } }) };
@@ -1009,6 +1130,64 @@ describe('MANUAL BOOKING SMS OUTBOX — DUPLICATE TXN_ID RESOLUTION (HTTP 409 / 
         const crypto = require('node:crypto');
         const expectedTxnId = crypto.createHash('sha256').update('dup-key').digest('hex').slice(0, 24);
         assert.ok(capturedStatusUrl.includes(`txn_id=${expectedTxnId}`));
+    });
+
+    it('[D7] duplicate resolved via a known msg_id + status UNKNOWN -> bounded retry (this path, unlike Variant B, DOES retry, since a resolution attempt was actually made)', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ knownMsgId: 'm1', statusResponseBody: { status: 'UNKNOWN' } });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'retry');
+        assert.equal(finalUpdate.patch.last_error_code, 'PROVIDER_DUPLICATE_TXN_ID');
+    });
+
+    it('[D8] duplicate resolved via a known msg_id where the status query itself fails -> bounded retry, never delivered', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ knownMsgId: 'm1', statusResponseBody: { error: { code: 106 } }, statusResponseStatus: 400 });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'retry');
+        assert.notEqual(finalUpdate.patch.status, 'delivered');
+    });
+
+    // ===== REQUIRED TEST CATEGORY 6: concurrent workers — one row never lands in two states =====
+    it('[D9] Category 6 — a single row processed once produces EXACTLY ONE terminal status transition, never both retry and reconciliation_required', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ knownMsgId: null });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        // Only one update ever touches `status` for this row within one worker pass.
+        const statusChangingUpdates = updates.filter(u => u.patch.status !== undefined);
+        assert.equal(statusChangingUpdates.length, 1, 'exactly one status-changing update per row per worker pass — no split between retry and reconciliation_required');
+        assert.equal(statusChangingUpdates[0].patch.status, 'reconciliation_required');
+    });
+    // Note: the DB-level guarantee that a SECOND, concurrently-running worker
+    // process can never claim the SAME row at the same time (so two workers
+    // can never race to write two different terminal statuses to one row) is
+    // proven separately against a real PostgreSQL 16 instance via
+    // FOR UPDATE SKIP LOCKED (see docs/oson-sms-audit-report.md, PostgreSQL
+    // Integration Gate) — not meaningfully provable against a mocked client.
+
+    // ===== REQUIRED TEST CATEGORY 7: lease recovery excludes reconciliation_required =====
+    // The claim RPC's own SQL WHERE clause only ever matches
+    // status IN ('pending','retry') or a stale-leased 'processing' row —
+    // 'reconciliation_required' is structurally excluded, not by a new
+    // exclusion rule that could itself be wrong. Proven for real against a
+    // local PostgreSQL 16 database (see docs/oson-sms-audit-report.md,
+    // "Duplicate Reconciliation Correction" — fn_claim_manual_booking_sms_batch
+    // never selects a 'reconciliation_required' row, confirmed by direct SQL).
+
+    // ===== REQUIRED TEST CATEGORY 8: PII/secret hygiene on the reconciliation path =====
+    it('[D10] Category 8 — the reconciliation_required update never includes the full provider response, token, URL, or unmasked phone', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret', OSON_SMS_TOKEN: 'super-secret-reconciliation-token' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ knownMsgId: null });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const finalUpdate = updates[updates.length - 1];
+        const serialized = JSON.stringify(finalUpdate.patch);
+        assert.ok(!serialized.includes('super-secret-reconciliation-token'));
+        assert.ok(!serialized.includes('sendsms_v1.php'));
+        assert.ok(!serialized.includes('query_sms.php'));
+        assert.ok(!serialized.includes('992900000001'), 'the raw phone must never appear — only the masked form');
+        assert.ok(finalUpdate.patch.recipient_phone_masked, 'a masked phone IS expected, for audit purposes');
     });
 });
 

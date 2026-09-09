@@ -9,10 +9,24 @@
  * this endpoint and mapping a real DELIVERED status back.
  * Project: POPUTKI.ONLINE
  *
+ * CRITICAL ADDENDUM CORRECTION: the confirmed OSON SMS API 2.0.2
+ * documentation for query_sms.php lists THREE parameters — login, txn_id,
+ * AND msg_id — not txn_id alone. Nothing in the confirmed contract states
+ * msg_id is optional, and nothing confirms a 409/duplicate response echoes
+ * the original msg_id. The prior version of this module accepted txn_id
+ * OR msg_id and was called with txn_id only from the duplicate-handling
+ * branch in manualBookingSmsOutboxService.js — that was NOT proven by the
+ * confirmed contract and has been removed. msg_id is now a hard
+ * requirement, checked and failed closed BEFORE any network call. See
+ * docs/oson-sms-audit-report.md ("Duplicate Reconciliation Correction")
+ * and docs/oson-contract-reconciliation-form.md for the open questions to
+ * OSON that would allow relaxing this.
+ *
  * Not wired into any automatic polling loop yet — that is deliberately out
  * of scope for this pass (no new functionality beyond the confirmed
  * contract itself). It IS used by the worker's duplicate-txn_id handling
- * (manualBookingSmsOutboxService.js) when a known msg_id is available.
+ * (manualBookingSmsOutboxService.js), but ONLY when a msg_id was already
+ * durably stored for that outbox row from an earlier confirmed send.
  */
 
 'use strict';
@@ -61,8 +75,13 @@ function safeHost(url) {
 
 /**
  * @param {Object} params
- * @param {string} params.txnId
- * @param {string} params.msgId
+ * @param {string} params.txnId - required
+ * @param {string} params.msgId - REQUIRED. Per the confirmed contract's
+ *   documented parameter list (login, txn_id, msg_id), this client never
+ *   calls the endpoint without it — there is no confirmed basis for a
+ *   txn_id-only lookup. Callers without a durably known msg_id must NOT
+ *   call this function at all (see manualBookingSmsOutboxService.js's
+ *   duplicate-handling Variant B).
  * @param {Object} [deps] - { fetchImpl }
  * @returns {Promise<{success:boolean, rawStatus?:string, internalStatus?:string, errorCode?:string, needsManualAttention?:boolean}>}
  */
@@ -72,14 +91,17 @@ async function queryOsonSmsStatus({ txnId, msgId }, deps = {}) {
 
     if (!cfg.enabled) return { success: false, errorCode: 'OSON_SMS_DISABLED' };
     if (!cfg.baseUrl || !cfg.login || !cfg.token) return { success: false, errorCode: 'OSON_SMS_CONFIG_INCOMPLETE' };
-    if (!txnId && !msgId) return { success: false, errorCode: 'TXN_ID_OR_MSG_ID_REQUIRED' };
+    if (!txnId) return { success: false, errorCode: 'TXN_ID_REQUIRED' };
+    // Fail closed BEFORE any network call: the confirmed contract's
+    // documented parameters for query_sms.php are login + txn_id + msg_id.
+    // A missing msg_id is not treated as "query by txn_id alone" — it is
+    // refused outright, never silently downgraded.
+    if (!msgId) return { success: false, errorCode: 'MISSING_PROVIDER_MESSAGE_ID' };
     if (!/^https:\/\//i.test(cfg.baseUrl)) return { success: false, errorCode: 'ERR_INSECURE_TRANSPORT' };
     if (safeHost(cfg.baseUrl) !== OSON_HOST) return { success: false, errorCode: 'ERR_UNEXPECTED_HOST' };
     if (typeof fetchImpl !== 'function') return { success: false, errorCode: 'FETCH_IMPL_UNAVAILABLE' };
 
-    const params = new URLSearchParams({ login: cfg.login });
-    if (txnId) params.set('txn_id', txnId);
-    if (msgId) params.set('msg_id', msgId);
+    const params = new URLSearchParams({ login: cfg.login, txn_id: txnId, msg_id: msgId });
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), cfg.timeoutMs);

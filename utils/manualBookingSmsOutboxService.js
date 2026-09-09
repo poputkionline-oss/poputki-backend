@@ -34,7 +34,11 @@ async function markOutboxRow(client, id, patch) {
 /**
  * Claims and processes up to batchSize manual-booking SMS outbox entries.
  * @param {Object} options - { supabaseClient, batchSize, dryRun, workerToken }
- * @returns {Promise<{processed:number, sent:number, cancelled:number, failed:number, dead_letter:number, retried:number, killSwitchOff?: boolean}>}
+ * @returns {Promise<{processed:number, sent:number, cancelled:number, failed:number, dead_letter:number, retried:number, reconciliation:number, killSwitchOff?: boolean}>}
+ *   reconciliation counts rows moved to 'reconciliation_required' — a
+ *   duplicate (409) with no durably known msg_id, which this worker will
+ *   never automatically retry, resend, or resolve; a human must check
+ *   OSON's own dashboard/support.
  */
 async function processManualBookingSmsOutbox(options = {}) {
     const { batchSize = 10, dryRun = false, workerToken = null } = options;
@@ -44,7 +48,7 @@ async function processManualBookingSmsOutbox(options = {}) {
     // Global kill switch, checked BEFORE claiming anything so pending rows
     // are left untouched (no lease churn) when the feature is off.
     if (process.env.OSON_SMS_ENABLED !== 'true') {
-        return { processed: 0, sent: 0, cancelled: 0, failed: 0, dead_letter: 0, retried: 0, killSwitchOff: true };
+        return { processed: 0, sent: 0, cancelled: 0, failed: 0, dead_letter: 0, retried: 0, reconciliation: 0, killSwitchOff: true };
     }
 
     const token = workerToken || `oson-worker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -58,7 +62,7 @@ async function processManualBookingSmsOutbox(options = {}) {
         });
         if (error) {
             // Migration not applied yet in this environment — safe no-op, not a crash.
-            return { processed: 0, sent: 0, cancelled: 0, failed: 0, dead_letter: 0, retried: 0, migrationMissing: true };
+            return { processed: 0, sent: 0, cancelled: 0, failed: 0, dead_letter: 0, retried: 0, reconciliation: 0, migrationMissing: true };
         }
         claimed = data || [];
     } else {
@@ -67,7 +71,7 @@ async function processManualBookingSmsOutbox(options = {}) {
         claimed = data || [];
     }
 
-    let sent = 0, cancelled = 0, failed = 0, deadLetter = 0, retried = 0;
+    let sent = 0, cancelled = 0, failed = 0, deadLetter = 0, retried = 0, reconciliation = 0;
 
     for (const entry of claimed) {
         const entryId = entry.outbox_id || entry.id;
@@ -205,10 +209,48 @@ async function processManualBookingSmsOutbox(options = {}) {
             // per attempt, so a duplicate here means a PRIOR attempt of
             // THIS SAME row got through even though our own client never
             // saw a success response for it, e.g. a timeout that actually
-            // sent). NEVER mark delivered on a duplicate by itself — resolve
-            // the real status via txn_id (always known, unlike msg_id at
-            // this point) before deciding anything.
-            const statusResult = await queryOsonSmsStatus({ txnId: result.txnId }, options.fetchImpl ? { fetchImpl: options.fetchImpl } : {});
+            // sent). NEVER mark delivered on a duplicate by itself.
+            //
+            // CRITICAL: the confirmed OSON SMS API 2.0.2 contract requires
+            // login + txn_id + msg_id for query_sms.php — nothing confirms
+            // txn_id alone is a valid lookup, and nothing confirms the 409
+            // response itself echoes the original msg_id. So:
+            //   Variant A — a msg_id was already durably stored for this
+            //     row (from an earlier confirmed 201 send) -> resolve via
+            //     query_sms.php with that stored msg_id.
+            //   Variant B — no msg_id is known at all -> do NOT call the
+            //     status endpoint (osonSmsStatusClient fails closed on this
+            //     anyway), do NOT retry with a new txn_id, do NOT assume
+            //     any outcome -> 'reconciliation_required', excluded from
+            //     all automatic re-claiming, for a human to resolve via
+            //     OSON's own dashboard/support.
+            const { data: currentRow } = await client
+                .from('manual_booking_sms_outbox')
+                .select('provider_message_id')
+                .eq('id', entryId)
+                .single();
+            const knownMsgId = currentRow && currentRow.provider_message_id ? String(currentRow.provider_message_id) : null;
+
+            if (!knownMsgId) {
+                // Variant B: no confirmed basis to query, retry, or assume
+                // any outcome. Masked phone/hmac only — never the full
+                // response, token, URL, or raw phone.
+                await markOutboxRow(client, entryId, {
+                    status: 'reconciliation_required',
+                    last_error_code: 'DUPLICATE_WITHOUT_PROVIDER_ID',
+                    recipient_phone_masked: maskPhone(phone),
+                    recipient_phone_hmac: safeHmac(phone),
+                    claim_token_hash: claimTokenHash
+                });
+                reconciliation++;
+                continue;
+            }
+
+            // Variant A
+            const statusResult = await queryOsonSmsStatus(
+                { txnId: result.txnId, msgId: knownMsgId },
+                options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}
+            );
 
             if (statusResult.success && statusResult.internalStatus === 'delivered') {
                 await markOutboxRow(client, entryId, {
@@ -277,7 +319,7 @@ async function processManualBookingSmsOutbox(options = {}) {
         }
     }
 
-    return { processed: claimed.length, sent, cancelled, failed, dead_letter: deadLetter, retried };
+    return { processed: claimed.length, sent, cancelled, failed, dead_letter: deadLetter, retried, reconciliation };
 }
 
 function safeHmac(phone) {

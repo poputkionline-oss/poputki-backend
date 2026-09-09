@@ -12,6 +12,33 @@ Once filled in, hand this back so `utils/osonSmsClient.js` and
 `OSON CONTRACT` / `OSON TLS GATE` / `OSON CREDENTIAL` verdicts can move
 from `BLOCKED` to `VERIFIED`/`READY`.
 
+---
+
+## URGENT — Duplicate-Reconciliation Open Questions (blocking, added by the Critical Addendum pass)
+
+The confirmed OSON SMS API 2.0.2 documentation for `query_sms.php` lists
+its parameters as `login` + `txn_id` + `msg_id`. Nothing in the confirmed
+contract states `msg_id` is optional, and nothing confirms whether a
+`HTTP 409 / error.code=108` (duplicate `txn_id`) response body itself
+contains the original `msg_id`. Until these are answered, this codebase
+treats a duplicate with no already-known `msg_id` as **unresolvable
+automatically** — it is moved to a dedicated `reconciliation_required`
+outbox status and excluded from all automatic retry/resend, for a human to
+resolve via OSON's own dashboard/support (see
+`docs/oson-sms-audit-report.md`, "Duplicate Reconciliation Correction").
+
+| # | Question | Why it matters | OSON's answer (fill in) |
+|---|---|---|---|
+| Q1 | Can `query_sms.php` be called with only `login` + `txn_id`, without `msg_id`? | If yes, this codebase can safely resolve a duplicate using only the `txn_id` it always has, without waiting on an already-known `msg_id`. If no/unconfirmed, the current fail-closed behavior (never call the endpoint without a stored `msg_id`) stays as-is. | |
+| Q2 | Does an `HTTP 409 / error.code=108` response body include the original `msg_id` for the duplicate `txn_id`? | If yes, and in which exact field, the client can extract it (after strict validation) and immediately resolve the real status instead of going to `reconciliation_required`. **Do not guess the field name — get it from OSON directly.** | |
+| Q3 | Can `msg_id` be looked up by `txn_id` through any other API endpoint or the OSON web cabinet? | Gives a resolution path for rows already in `reconciliation_required` even without editing this codebase — an operator could look it up manually and reconcile the row by hand. | |
+| Q4 | What is the officially recommended way to reconcile a send whose result is unknown after a client-side timeout (i.e. the client never received msg_id, but the message may have gone out)? | This is the exact ambiguous case a `PROVIDER_TIMEOUT` followed by a `409` on retry represents. An official recommended procedure would let this codebase automate reconciliation instead of requiring a human every time. | |
+
+**Until a written answer to at least Q1 or Q2 is received:
+`OSON DUPLICATE RECONCILIATION: BLOCKED`.** Do not relax
+`osonSmsStatusClient.js`'s `msg_id` requirement, and do not attempt to
+parse a `msg_id` out of a `409` response body, based on guesswork.
+
 | # | Item | Implementation assumes (current code) | OSON confirmed (fill in) | Match? |
 |---|---|---|---|---|
 | 1 | HTTPS endpoint (full URL) | `https://api.osonsms.com/sendsms_v1.php` (env `OSON_SMS_BASE_URL`) — plausible from public search snippets, never fetched from a primary source | | ☐ Y ☐ N |
@@ -35,6 +62,6 @@ from `BLOCKED` to `VERIFIED`/`READY`.
 ## Sign-off
 
 - [ ] Filled in by: ______________________  Date: __________
-- [ ] `OSON_SMS_HASH` rotated in OSON's dashboard (new value, never the one referenced in this session's earlier turns) and stored **only** as a Render Secret Environment Variable
+- [ ] `OSON_SMS_TOKEN` (Bearer token) rotated in OSON's dashboard (new value, never the retired `OSON_SMS_HASH` referenced in this session's earlier turns) and stored **only** as a Render Secret Environment Variable
 - [ ] New value never pasted into chat, code, tests, or any Markdown file
 - [ ] Reviewed against `utils/osonSmsClient.js` for any needed code change (e.g. switching from hash-based to Bearer auth) **before** `OSON_SMS_ENABLED` is ever set to `true` anywhere outside a local dry-run test

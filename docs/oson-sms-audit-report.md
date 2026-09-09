@@ -7,6 +7,155 @@ changes were made in this pass or the prior one.
 
 ---
 
+## CRITICAL ADDENDUM — Duplicate Reconciliation Correction
+
+### Root cause
+
+The Contract Alignment Pass's duplicate-handling code
+(`manualBookingSmsOutboxService.js`, the `result.duplicate` branch) called
+`queryOsonSmsStatus({ txnId: result.txnId })` — **`txnId` only, no
+`msgId`** — on every HTTP 409/`DUPLICATE_TXN_ID` response, reasoning that
+"txn_id is always known." That reasoning was never proven by the confirmed
+contract. The confirmed OSON SMS API 2.0.2 documentation for
+`query_sms.php` lists its parameters as `login` + `txn_id` + `msg_id` —
+all three — and nothing confirms `msg_id` is optional, nor that a 409
+response echoes the original `msg_id`. `osonSmsStatusClient.js`'s prior
+version accepted `txnId` OR `msgId`, so the call went through and could
+have produced a `PROVIDER_HTTP_4xx`/`INVALID_RESPONSE_FORMAT` from OSON's
+real API in a way this codebase had never actually exercised against a
+confirmed shape — an unverified assumption presented with more confidence
+than it had earned.
+
+### What was fixed
+
+1. **`osonSmsStatusClient.js`**: `msgId` is now a hard requirement,
+   checked and failed closed (`MISSING_PROVIDER_MESSAGE_ID`) **before any
+   network call**. A `txnId`-only call is no longer possible from this
+   client at all.
+2. **`manualBookingSmsOutboxService.js`**: the duplicate branch now reads
+   the outbox row's own `provider_message_id` from the database first:
+   - **Variant A** (a `msg_id` was already durably stored — from an
+     earlier confirmed `201` send this codebase itself received) → call
+     `queryOsonSmsStatus` with `txnId` **and** that stored `msgId`, apply
+     the confirmed status.
+   - **Variant B** (no `msg_id` known — the normal case, since a row only
+     ever gets a `msg_id` once it reaches `sent`, and a `sent` row is
+     never re-claimed) → the status endpoint is **never called**, the row
+     is **never** retried with a new `txn_id`, and it is **never**
+     assumed `sent`/`delivered`/`failed`. It moves to a new
+     `reconciliation_required` status instead, tagged
+     `DUPLICATE_WITHOUT_PROVIDER_ID`, and is structurally excluded from
+     ever being auto-claimed again (see migration below).
+3. **`docs/migrations/20260911_manual_booking_sms_reconciliation_required.sql`**
+   (new, additive): extends the `manual_booking_sms_outbox.status` CHECK
+   constraint with `'reconciliation_required'`. Nothing else changes —
+   `fn_claim_manual_booking_sms_batch`'s claim query already only matches
+   `status IN ('pending','retry')` or a stale-leased `'processing'` row,
+   so the new status is excluded **by the query's existing logic**, not by
+   a new exclusion rule that could itself be wrong. Proven for real
+   against a local PostgreSQL 16 database (§ below), not just asserted.
+4. Per this addendum's own instruction, **no speculative extraction of a
+   `msg_id` from a `409` response body was added** — that behavior is
+   listed as a question for OSON (Q2 below), not implemented on a guess.
+
+### Changed files
+
+- `utils/osonSmsStatusClient.js` — `msgId` required, fails closed
+- `utils/manualBookingSmsOutboxService.js` — Variant A/B duplicate handling, `reconciliation` counter added to the return value
+- `docs/migrations/20260911_manual_booking_sms_reconciliation_required.sql` — new, additive
+- `docs/oson-contract-reconciliation-form.md` — new "URGENT — Duplicate-Reconciliation Open Questions" section (Q1–Q4) and updated sign-off item
+- `tests/phase_oson_sms_outbox.test.js` — status-client tests updated to supply `msgId` (mapping logic unaffected) plus two new fail-closed tests (`[S10]`, `[S11]`); the duplicate-resolution suite fully rewritten, 11 tests (`[D1]`–`[D10]`, was 5), covering all 8 required categories
+
+### Proof: no status fetch without a known msg_id
+
+`[D1]`/`[D3]`/`[D4]`: `wasStatusFetchCalled()` asserted `false` — the
+worker's mock `fetchImpl` for `query_sms.php` is never invoked when
+`provider_message_id` is `null` for the row. `[S10]` proves the same at
+the client level directly (`queryOsonSmsStatus({txnId})` with no `msgId`
+never calls `fetchImpl`).
+
+### Proof: no re-send with a new txn_id
+
+`[D4]`: captured the actual `txn_id` query parameter sent on the (only)
+send attempt and asserted it equals
+`sha256('dup-key').slice(0,24)` — the same deterministic value the
+outbox row's `idempotency_key` always produces — and asserted
+`sendCallCount === 1` (no internal double-send within one worker pass).
+
+### Proof: outbox state after timeout/409 in each scenario
+
+| Scenario | Resulting `status` | `sent_at`/`delivered_at` set? |
+|---|---|---|
+| 409, no known `msg_id` (Variant B) | `reconciliation_required` | neither |
+| 409, known `msg_id`, status query → `DELIVERED` | `delivered` | both |
+| 409, known `msg_id`, status query → `ENROUTE`/`ACCEPTED` | `sent` | `sent_at` only |
+| 409, known `msg_id`, status query → `UNKNOWN` or query itself fails | `retry` (bounded) | neither |
+| Retry after timeout → clean `201` + `msg_id` | `sent` | `sent_at` only |
+
+### PostgreSQL 16 Gate — reconciliation-specific proof (real database, not mocked)
+
+Applied the full 5-migration chain (staging baseline →
+`20260908`→`20260909`→`20260910`→`20260911`) to a fresh disposable
+database, clean, twice in a row (idempotent). Then, with real fixture
+rows:
+
+```
+-- one row: status='reconciliation_required'
+-- one row: status='pending'
+SELECT outbox_id, booking_id FROM fn_claim_manual_booking_sms_batch(10, 'reconcile-worker', 60);
+--            outbox_id               | booking_id
+-- --------------------------------------+------------
+--  0a6b2226-...                        |          2      <- only the pending row
+-- (1 row)
+```
+
+The `reconciliation_required` row was **never** returned by the claim
+function and its `status`/`processing_token` were confirmed unchanged
+afterward — the exact proof this addendum's Required Test Category 7
+asked for, done against a real database rather than asserted in a mock.
+
+The atomic cap reservation (`fn_oson_sms_check_cap`, from the prior pass)
+was re-verified unaffected on this same 5-migration chain: two different
+rows racing a `daily_cap=1` slot — the first caller got `allowed:true`,
+the concurrent second caller correctly got `DAILY_CAP_EXCEEDED`.
+
+Migration checksums:
+
+| File | SHA-256 |
+|---|---|
+| `docs/migrations/20260911_manual_booking_sms_reconciliation_required.sql` | `8e9d70f80edea996f8d7fd55ee8f852c55ca41edeb13094a1aec5b42244ef04e` |
+
+### Reconciliation questions added for OSON
+
+`docs/oson-contract-reconciliation-form.md` now has a dedicated "URGENT —
+Duplicate-Reconciliation Open Questions" section, Q1–Q4: can
+`query_sms.php` be called with `txn_id` alone; does a `409`/code-108 body
+include the original `msg_id`; can `msg_id` be looked up by `txn_id` via
+any other API/cabinet path; what is OSON's officially recommended
+reconciliation procedure after a client-side timeout with no `msg_id`
+received.
+
+### Verdict for this addendum
+
+```
+OSON DUPLICATE RECONCILIATION: BLOCKED   (pending a written OSON answer to
+                                            Q1 or Q2 in the reconciliation
+                                            form — until then, a duplicate
+                                            with no known msg_id always
+                                            goes to reconciliation_required
+                                            for manual resolution, never
+                                            auto-retried or auto-resolved)
+```
+
+This does not change any of the other verdicts below (OSON CONTRACT
+remains VERIFIED for the parts that were genuinely confirmed — Bearer
+auth, Sender ID, +992-only, the send/success contract; this addendum
+narrows scope specifically to the duplicate-with-unknown-msg_id
+reconciliation path, which is now honestly `BLOCKED` rather than resting
+on an unproven assumption).
+
+---
+
 ## CONTRACT ALIGNMENT PASS — API 2.0.2 (08.02.2026), confirmed by OSON support
 
 Prior passes left `OSON CONTRACT: BLOCKED` because this sandbox cannot fetch
