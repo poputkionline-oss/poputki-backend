@@ -40,8 +40,8 @@ function readCap(envName, fallback) {
  * @param {string|null} [params.outboxId] - the specific outbox row being
  *   evaluated. REQUIRED for the atomic RPC path to actually close the
  *   concurrency race (see fn_oson_sms_check_cap's reservation step,
- *   20260910_manual_booking_sms_cap_reservation.sql) — without it the check
- *   only serializes the count, not the decision, which two DIFFERENT
+ *   docs/migrations/20260909185016_manual_booking_sms_ticket_delivery.sql)
+ *   — without it the check only serializes the count, not the decision, which two DIFFERENT
  *   concurrent rows can both pass before either has sent anything.
  * @param {Date} [params.now]
  * @returns {Promise<{allowed: boolean, reason?: string}>}
