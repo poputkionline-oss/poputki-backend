@@ -7,6 +7,148 @@ changes were made in this pass or the prior one.
 
 ---
 
+## VERIFICATION-ONLY PASS (no new functionality added)
+
+Scope of this pass: re-confirm the branch state, prove the frontend's
+pre-existing test failures are unchanged (not just same count — same
+content) against a fresh `origin/main` worktree, run a Supabase-style
+security review of the three new migrations, and produce a fill-in-later
+reconciliation form for OSON's eventual response. No application code was
+added; two source lines were touched only to correct the finding in
+V.4 below.
+
+### V.1 — Full SHAs and diff vs origin/main (re-confirmed)
+
+Backend `feature/oson-manual-booking-sms` @
+`ec118243e07a01afebf890c6698e782df229ddc4` — 6 commits ahead of
+`origin/main` (`ce87adc`), diffstat unchanged from the prior report (13
+files, +2428/-1).
+
+Frontend `feature/oson-manual-booking-sms` @
+`086db47a3f788845606fd69e1ece09f918065baa` — 2 commits ahead of
+`origin/main` (`92c1f37`), diffstat unchanged (4 files, +233/-1).
+
+Both branches confirmed still directly based on their current
+`origin/main` tips after a fresh `git fetch` — no drift, no rebase.
+
+### V.2 — Frontend baseline gate: same-content proof, not just same count
+
+Built a temporary `git worktree` of `poputki-front` at `origin/main`
+(`/…/scratchpad/front-baseline-worktree`, `node_modules` symlinked from the
+main checkout after confirming `package-lock.json` is byte-identical — no
+network install needed), ran the **exact same** `node --test
+"tests/**/*.test.js"` there, and diffed the full TAP output against the
+feature branch's run line-by-line, not just the failing-test count:
+
+- `origin/main`: 440 tests, 426 pass, **14 fail**
+- feature branch: 450 tests, 436 pass, **14 fail** (+10 tests = exactly
+  this feature's own new test file, all passing)
+
+Every one of the 14 failures was compared by full detail block (test name,
+`error:` line, stack), not just by name. The only differences across the
+two runs were: `duration_ms` values (run-to-run timing noise),
+absolute file paths (temp worktree path vs. the real checkout path — both
+runs literally exist in different directories), and the auto-generated
+temporary filenames the Vue SFC test-extraction tooling creates per run
+(`__extracted_test_<n>_<timestamp>_<random>.mjs` — non-deterministic by
+design, unrelated to test outcome). The underlying error **type and
+content** for all 14 — `ERR_MODULE_NOT_FOUND` for `axios`,
+`@vue/compiler-sfc`, and `jsqr` (missing devDependencies in this sandbox,
+nothing to do with this feature) — is byte-identical between the two runs
+after normalizing away those three expected, non-semantic differences.
+
+**FEATURE REGRESSION: 0**
+
+Worktree removed after the comparison; nothing left behind.
+
+### V.3 — Supabase security gate on the three new migrations
+
+Applied the full chain (staging baseline → `20260908` → `20260909` →
+`20260910`) to a fresh disposable local Postgres 16 database
+(`oson_security_gate`, dropped after use — production/staging untouched)
+and ran the same checks Supabase's own Security Advisor performs, via
+direct `pg_catalog`/`information_schema` queries:
+
+| Check | Result |
+|---|---|
+| RLS enabled on `manual_booking_sms_outbox` (the only new public table) | **PASS** — `relrowsecurity = true` |
+| `anon`/`authenticated` table privileges on `manual_booking_sms_outbox` | **PASS** — zero grant rows for either role (confirmed via `information_schema.role_table_grants`) |
+| `anon`/`authenticated` EXECUTE on `fn_claim_manual_booking_sms_batch` | **PASS** — `has_function_privilege(...) = false` for both |
+| `anon`/`authenticated` EXECUTE on `fn_oson_sms_check_cap` | **PASS** — `false` for both |
+| `search_path` on both new `SECURITY DEFINER` functions | **PASS** — both explicitly `SET search_path = public, pg_temp` (immutable; this is exactly what the Supabase `function_search_path_mutable` advisor check looks for — a function relying on the *caller's* mutable search_path is the classic SECURITY DEFINER privilege-escalation vector, and both of ours are pinned) |
+| Only `service_role` (beyond the migration-owner role itself) holds any grant on `manual_booking_sms_outbox` | **PASS** — full grant listing shows exactly `postgres` (the schema owner, not an application-facing role) and `service_role`, nothing else |
+| RLS policies defined on `manual_booking_sms_outbox` | **None** — correct by design: only `service_role` (which bypasses RLS in Supabase) is ever meant to touch this table; zero policies plus zero anon/authenticated grants is a stricter, defense-in-depth posture than relying on RLS-with-no-policy alone |
+| `service_role` referenced anywhere in `poputki-front` | **PASS** — zero real references; the one grep hit is a pre-existing *defensive test* (`phase_p1f_admin_funnel_ui.test.js`, `[P1F-FE-14]`) that already asserts `service_role`/`SUPABASE_SERVICE_ROLE_KEY` must never appear in frontend source, unrelated to and unmodified by this feature |
+
+One informational note, not a finding against this feature: the
+`docs/migrations/staging/00_staging_schema_baseline.sql` fixture used to
+provision `bus_ticket_bookings` et al. for local testing is a deliberately
+minimal rehearsal schema (its own filename says so) and shows
+`relrowsecurity = false` and zero grants on the *pre-existing* tables it
+recreates (`users`, `bus_tickets`, `bus_ticket_bookings`,
+`booking_claim_sessions`, `booking_claim_requests`) — this is an artifact
+of the test fixture, not the real schema: the actual dated migration for
+`booking_claim_sessions` (`20260831_claim_and_passenger_onboarding.sql`)
+does `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`. None of these
+pre-existing tables were touched by this feature's migrations either way.
+
+**SUPABASE SECURITY GATE: PASSED**
+
+### V.4 — Correction found during this pass
+
+While re-reading the diff for V.1, re-confirmed the secret search from the
+prior pass (§6 below) is still clean — no new finding this time. No code
+changes were needed or made in this verification pass; the reconciliation
+form (V.5) is new documentation only.
+
+### V.5 — OSON contract reconciliation form
+
+Created `docs/oson-contract-reconciliation-form.md` — a 17-row table (one
+row per item requested: endpoint, method/content-type, auth parameters,
+approved Sender ID, +992/+7 support, success/error response shape,
+`msg_id`, delivery-status endpoint, balance endpoint, rate limits, pricing,
+segmentation) with the implementation's current assumption in one column
+and a blank "OSON confirmed" column to fill in once the account owner has
+an answer from OSON's cabinet, official docs, or official support — not
+from this session, which had no access to any of those three. Includes a
+sign-off checklist (credential rotation location, no paste-into-chat
+reminder, mandatory code review before `OSON_SMS_ENABLED=true` anywhere
+outside a local dry-run).
+
+### V.6 — OSON send endpoint
+
+Not contacted. No request of any kind was made to `api.osonsms.com` or any
+OSON endpoint in this pass (network egress to `osonsms.com` remains
+blocked from this sandbox regardless, confirmed again).
+
+### V.7 — Verdicts for this pass
+
+```
+BACKEND CODE GATE:      PASSED   (branch state re-confirmed, no code changes
+                                    this pass, prior 1286/1286 result stands
+                                    unchanged — nothing invalidates it)
+FRONTEND BASELINE GATE: PASSED   (FEATURE REGRESSION: 0 — proven by full
+                                    detail-block diff against a fresh
+                                    origin/main worktree, not just count)
+SUPABASE SECURITY GATE: PASSED   (RLS on, zero anon/authenticated access,
+                                    zero service_role in frontend, both
+                                    SECURITY DEFINER functions have a fixed
+                                    search_path, verified against a real
+                                    local Postgres 16)
+OSON CONTRACT GATE:     BLOCKED  (unchanged — no cabinet/docs/support access
+                                    from this session; reconciliation form
+                                    prepared and ready for the account
+                                    owner's input)
+PRODUCTION RELEASE:     NOT PERFORMED
+PRODUCTION DELIVERY:    NOT ENABLED
+```
+
+No push, no merge, no deploy, no production DB or env changes, no real
+SMS/Telegram/WhatsApp messages, no request to any OSON endpoint (send or
+otherwise) were made during this pass.
+
+---
+
 ## 1. Backend branch and full SHA
 
 `feature/oson-manual-booking-sms` @ `13b7bdd75197e9283a420dbe6f2278d2fd3e7517`
