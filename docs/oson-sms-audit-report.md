@@ -1,9 +1,79 @@
 # OSON SMS — Manual Booking Automatic Ticket Delivery
 ## Implementation & Gate Report (Continuation: Contract Unblocking Attempt + Release Gate)
 
-Status: **local commits only — not pushed, not merged, not deployed**
-No real SMS, no real Telegram/WhatsApp messages, no production DB/env
-changes were made in this pass or the prior one.
+Status: **backend released — migration applied to production, backend
+pushed and fast-forward merged to `main`; frontend release paused pending
+this correction.** `OSON_SMS_ENABLED`/`OSON_SMS_DELIVERY_ENABLED` remain
+`false` in production. No real SMS, no real Telegram/WhatsApp messages, no
+production booking/trip/passenger data was touched by this or any prior
+pass.
+
+---
+
+## MIGRATION HISTORY ALIGNMENT — local filename corrected to match production's registered version
+
+### What happened
+
+The consolidated migration was applied to production Supabase (see the
+Production Release Report) under its local pre-apply name,
+`20260909185016_manual_booking_sms_ticket_delivery.sql`. Supabase's own
+migration-apply mechanism registers migrations under the version number
+it assigns at apply time, which is not always byte-identical to the
+source filename's timestamp — this repository already had precedent for
+that exact drift before this feature existed (e.g. the local
+`20260904144755_reconciliation_maintenance_lock.sql` is registered in
+production as version `20260904144836`, a 41-second drift). This
+migration landed with a larger drift: production registered it as
+`20260909192657`, about 8.5 minutes after the local timestamp.
+
+### Read-only confirmation before touching anything
+
+Queried production's applied-migration history (the credentialed
+equivalent of `supabase migration list --linked`, since the CLI's own
+`--linked` flag requires a database password not held in this session):
+production contains **exactly one** entry for this feature,
+`20260909192657_manual_booking_sms_ticket_delivery`, applied once.
+`20260909185016` does not appear anywhere in that history — confirming
+there was no duplicate application and no ambiguity to resolve by
+`migration repair`.
+
+### What changed
+
+Both local copies were renamed via `git mv`, filename only:
+
+```
+docs/migrations/20260909185016_manual_booking_sms_ticket_delivery.sql
+  -> docs/migrations/20260909192657_manual_booking_sms_ticket_delivery.sql
+supabase/migrations/20260909185016_manual_booking_sms_ticket_delivery.sql
+  -> supabase/migrations/20260909192657_manual_booking_sms_ticket_delivery.sql
+```
+
+**The SQL content was not touched** — unlike the earlier
+"MIGRATION CHRONOLOGY CORRECTION" pass (which also updated a
+self-referencing header comment, changing that file's checksum), this
+rename intentionally left the file's internal header comment referencing
+its old name (`20260909185016`) untouched, so the SHA-256 stays exactly
+`14e84818c744da31dc5c46257fc54fdd4960810a7ffa8fdf63c59939e3208baa` —
+proof that this was a pure filename alignment with zero content risk. The
+comment is now technically a stale self-reference (it names the file's
+own old timestamp); this is noted here rather than silently accepted, and
+left as-is per the explicit instruction for this pass.
+
+No `migration repair`, no re-apply, no change to production's migration
+history — production was only ever read (`list_migrations`), never
+written, during this alignment.
+
+### Verification (this pass)
+
+| Check | Result |
+|---|---|
+| Production migration history, read-only | ✅ exactly one entry, `20260909192657`, no `20260909185016` |
+| `git mv` rename, both copies | ✅ done, content untouched |
+| SHA-256 after rename (both copies) | ✅ unchanged: `14e84818c744da31dc5c46257fc54fdd4960810a7ffa8fdf63c59939e3208baa` |
+| Byte-identical mirror (`docs/` vs `supabase/`) | ✅ confirmed via `diff` |
+| References updated (code comment, this report) | ✅ `utils/osonSmsCaps.js`, this file's §13 table |
+| Test suite references to the old filename | ✅ none existed (this feature's tests are mock-only, never read migration files from disk) |
+| `manual_booking_sms_outbox` row count after this pass | ✅ still 0 (no SQL executed against production) |
 
 ---
 
@@ -917,25 +987,25 @@ explicit owner sign-off before go-live, and should be checked with the
 actual carrier/city names that will appear in production, not just this
 example route.
 
-## 13. Migrations and checksums (current — see "MIGRATION CONSOLIDATION" below for history)
+## 13. Migrations and checksums (current — see "MIGRATION HISTORY ALIGNMENT" and "MIGRATION CONSOLIDATION" below for history)
 
-**Superseded**: this section previously listed four separate files
-(`20260908_manual_booking_sms_outbox.sql`,
-`20260909_manual_booking_sms_atomic_cap_rpc.sql`,
-`20260910_manual_booking_sms_cap_reservation.sql`,
-`20260909174859_manual_booking_sms_reconciliation_required.sql`). All four
-were consolidated into a single migration before ever being applied or
-pushed — see "MIGRATION CONSOLIDATION" for the full rationale and proof
-that none had a published or applied state to preserve.
+**Superseded twice**: this section originally listed four separate files,
+then one consolidated file named `20260909185016_manual_booking_sms_ticket_delivery.sql`
+(the local pre-apply timestamp). After that file was applied to production
+Supabase, it was renamed locally to match the version number production's
+own migration mechanism actually registered — see "MIGRATION HISTORY
+ALIGNMENT" for the full rationale. **The SQL content and its SHA-256 were
+never touched by this rename** — only the filename changed.
 
-| File | SHA-256 |
-|---|---|
-| `docs/migrations/20260909185016_manual_booking_sms_ticket_delivery.sql` (mirrored byte-identically in `supabase/migrations/`) | `14e84818c744da31dc5c46257fc54fdd4960810a7ffa8fdf63c59939e3208baa` |
+| File | SHA-256 | Production migration version |
+|---|---|---|
+| `docs/migrations/20260909192657_manual_booking_sms_ticket_delivery.sql` (mirrored byte-identically in `supabase/migrations/`) | `14e84818c744da31dc5c46257fc54fdd4960810a7ffa8fdf63c59939e3208baa` | `20260909192657` (applied) |
 
 Purely additive relative to the rest of the schema (new table, new
-functions only — no `ALTER`/`DROP` touching any pre-existing table). Not
-applied to any Supabase project, staging or production — only to
-disposable local Postgres 16 databases, all dropped after use.
+functions only — no `ALTER`/`DROP` touching any pre-existing table).
+**Applied to production Supabase** (`poputki-online-prod`,
+`xzvtjcqwmuezxyeerkki`) exactly once — see "MIGRATION HISTORY ALIGNMENT"
+and the Production Release Report for the full verification.
 
 ## 14. Render env var names (no values)
 
