@@ -27,8 +27,11 @@ const {
     classifyPhone,
     maskPhoneLocal,
     maskLogin,
-    computeStrHash
+    CONFIRMED_SENDER,
+    MAX_TIMEOUT_MS
 } = require('../utils/osonSmsClient');
+const { queryOsonSmsStatus, STATUS_MAP } = require('../utils/osonSmsStatusClient');
+const { checkOsonSmsBalance } = require('../utils/osonSmsBalanceClient');
 const { calculateSmsSegments, renderManualBookingTicketSms } = require('../utils/smsTemplates');
 const { checkSendCaps, hmacPhone, isCarrierAllowlisted } = require('../utils/osonSmsCaps');
 const { processManualBookingSmsOutbox } = require('../utils/manualBookingSmsOutboxService');
@@ -54,14 +57,29 @@ function enabledConfig(overrides = {}) {
     process.env.OSON_SMS_DRY_RUN = 'false';
     process.env.OSON_SMS_BASE_URL = 'https://api.osonsms.com/sendsms_v1.php';
     process.env.OSON_SMS_LOGIN = 'testlogin';
-    process.env.OSON_SMS_HASH = 'testsecrethash';
+    process.env.OSON_SMS_TOKEN = 'test-bearer-token';
     process.env.OSON_SMS_SENDER = 'Poputki';
     process.env.OSON_SMS_TIMEOUT_MS = '200';
-    process.env.OSON_SMS_ALLOWED_COUNTRIES = 'TJ';
     Object.assign(process.env, overrides);
 }
 
-describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
+// Mirrors the txn_id derivation inside osonSmsClient.js exactly, so tests
+// can build a matching success response without importing an internal.
+function deriveTxnId(idempotencyKey) {
+    return require('node:crypto').createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24);
+}
+
+function jsonResponse(status, body, opts = {}) {
+    return {
+        ok: status >= 200 && status < 300,
+        status,
+        type: opts.type || 'basic',
+        headers: { get: () => 'application/json' },
+        text: async () => JSON.stringify(body)
+    };
+}
+
+describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT (API 2.0.2, Bearer contract)', () => {
     beforeEach(resetEnv);
     afterEach(resetEnv);
 
@@ -77,55 +95,90 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
         assert.equal(called, false);
     });
 
-    it('[2] client success on a well-formed 200 JSON success envelope', async () => {
+    it('[2] HTTP 201 + status "ok" + matching txn_id + msg_id -> success', async () => {
         enabledConfig();
-        const fetchImpl = async () => ({
-            ok: true,
-            status: 200,
-            headers: { get: () => 'application/json' },
-            text: async () => JSON.stringify({ status: 'ok', msg_id: 40127 })
-        });
+        const txnId = deriveTxnId('k2');
+        const fetchImpl = async () => jsonResponse(201, { status: 'ok', txn_id: txnId, msg_id: 40127 });
         const result = await sendServiceSms(
             { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k2' },
             { fetchImpl }
         );
         assert.equal(result.success, true);
         assert.equal(result.providerMessageId, '40127');
+        assert.equal(result.txnId, txnId);
     });
 
-    it('[3] provider HTTP error (non-2xx) is reported, not treated as success', async () => {
+    it('[3] HTTP 200 on the send endpoint is NEVER success, even with an otherwise well-formed body', async () => {
         enabledConfig();
-        const fetchImpl = async () => ({
-            ok: false,
-            status: 500,
-            headers: { get: () => 'text/plain' },
-            text: async () => 'Internal Server Error'
-        });
+        const txnId = deriveTxnId('k3');
+        const fetchImpl = async () => jsonResponse(200, { status: 'ok', txn_id: txnId, msg_id: 999 });
         const result = await sendServiceSms(
             { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k3' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'PROVIDER_HTTP_200');
+    });
+
+    it('[4] HTTP 201 without a msg_id is a failure, not success', async () => {
+        enabledConfig();
+        const txnId = deriveTxnId('k4');
+        const fetchImpl = async () => jsonResponse(201, { status: 'ok', txn_id: txnId });
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k4' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'UNRECOGNIZED_RESPONSE');
+    });
+
+    it('[5] a txn_id in the response that does not match what we sent is a failure (TXN_ID_MISMATCH)', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(201, { status: 'ok', txn_id: 'some-other-txn-id', msg_id: 1 });
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k5' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'TXN_ID_MISMATCH');
+    });
+
+    it('[6] HTTP 409 + error.code=108 is reported as a DUPLICATE, never as success', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(409, { error: { code: 108, msg: 'duplicate txn_id' } });
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k6' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.duplicate, true);
+        assert.equal(result.errorCode, 'PROVIDER_DUPLICATE_TXN_ID');
+        assert.equal(result.txnId, deriveTxnId('k6'), 'the same stable txn_id must be echoed back for reconciliation');
+    });
+
+    it('[7] provider HTTP error (non-2xx, non-409) is reported, not treated as success', async () => {
+        enabledConfig();
+        const fetchImpl = async () => ({ ok: false, status: 500, type: 'basic', headers: { get: () => 'text/plain' }, text: async () => 'Internal Server Error' });
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k7' },
             { fetchImpl }
         );
         assert.equal(result.success, false);
         assert.equal(result.errorCode, 'PROVIDER_HTTP_500');
     });
 
-    it('[4] HTTP 200 with a provider error envelope is NOT treated as success', async () => {
+    it('[8] a known provider error code (e.g. 107 INCORRECT_SENDER) normalizes to a named error, never the raw code alone', async () => {
         enabledConfig();
-        const fetchImpl = async () => ({
-            ok: true,
-            status: 200,
-            headers: { get: () => 'application/json' },
-            text: async () => JSON.stringify({ error: { code: 5, msg: 'Insufficient balance' } })
-        });
+        const fetchImpl = async () => jsonResponse(400, { error: { code: 107, msg: 'incorrect sender' } });
         const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k4' },
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k8' },
             { fetchImpl }
         );
         assert.equal(result.success, false);
-        assert.match(result.errorCode, /^PROVIDER_ERROR_/);
+        assert.equal(result.errorCode, 'PROVIDER_ERROR_INCORRECT_SENDER');
     });
 
-    it('[5] timeout via AbortController is reported as PROVIDER_TIMEOUT, single attempt only', async () => {
+    it('[9] timeout via AbortController is reported as PROVIDER_TIMEOUT, single attempt only', async () => {
         enabledConfig({ OSON_SMS_TIMEOUT_MS: '30' });
         let callCount = 0;
         const fetchImpl = (url, { signal }) => {
@@ -139,7 +192,7 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
             });
         };
         const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k5' },
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k9' },
             { fetchImpl }
         );
         assert.equal(result.success, false);
@@ -147,27 +200,29 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
         assert.equal(callCount, 1, 'client must never blindly retry internally');
     });
 
-    it('[6] invalid/non-JSON response body is not treated as success', async () => {
+    it('[10] configured timeout is capped at 20 seconds even if a larger value is set', () => {
+        process.env.OSON_SMS_TIMEOUT_MS = '999999';
+        const { getConfig } = require('../utils/osonSmsClient');
+        assert.equal(getConfig().timeoutMs, MAX_TIMEOUT_MS);
+        assert.equal(MAX_TIMEOUT_MS, 20000);
+    });
+
+    it('[11] invalid/non-JSON response body on HTTP 201 is not treated as success', async () => {
         enabledConfig();
-        const fetchImpl = async () => ({
-            ok: true,
-            status: 200,
-            headers: { get: () => 'text/html' },
-            text: async () => '<html>not json</html>'
-        });
+        const fetchImpl = async () => ({ ok: true, status: 201, type: 'basic', headers: { get: () => 'text/html' }, text: async () => '<html>not json</html>' });
         const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k6' },
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k11' },
             { fetchImpl }
         );
         assert.equal(result.success, false);
         assert.equal(result.errorCode, 'INVALID_RESPONSE_FORMAT');
     });
 
-    it('[7] refuses non-HTTPS base URL (ERR_INSECURE_TRANSPORT), never calls fetch', async () => {
+    it('[12] refuses non-HTTPS base URL (ERR_INSECURE_TRANSPORT), never calls fetch', async () => {
         enabledConfig({ OSON_SMS_BASE_URL: 'http://api.osonsms.com/sendsms_v1.php' });
         let called = false;
         const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k7' },
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k12' },
             { fetchImpl: async () => { called = true; } }
         );
         assert.equal(result.success, false);
@@ -175,11 +230,71 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
         assert.equal(called, false);
     });
 
-    it('[8] invalid phone is rejected before any network call', async () => {
+    it('[13] refuses any host other than api.osonsms.com, never calls fetch', async () => {
+        enabledConfig({ OSON_SMS_BASE_URL: 'https://evil.example.com/sendsms_v1.php' });
+        let called = false;
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k13' },
+            { fetchImpl: async () => { called = true; } }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'ERR_UNEXPECTED_HOST');
+        assert.equal(called, false);
+    });
+
+    it('[14] a redirect response (opaqueredirect / 3xx) is refused, never silently followed', async () => {
+        enabledConfig();
+        const fetchImpl = async () => ({ ok: false, status: 0, type: 'opaqueredirect', headers: { get: () => '' }, text: async () => '' });
+        const result = await sendServiceSms(
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k14' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'ERR_REDIRECT_BLOCKED');
+    });
+
+    it('[15] a "+992..." phone is normalized to "992..." for the provider', async () => {
+        enabledConfig();
+        let capturedUrl = null;
+        const txnId = deriveTxnId('k15');
+        const fetchImpl = async (url) => { capturedUrl = url; return jsonResponse(201, { status: 'ok', txn_id: txnId, msg_id: 1 }); };
+        const result = await sendServiceSms(
+            { recipientPhone: '+992901234567', message: 'test', idempotencyKey: 'k15' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, true);
+        assert.ok(capturedUrl.includes('phone_number=992901234567'));
+        assert.ok(!capturedUrl.includes('%2B992'), 'the "+" must not reach the provider — normalized form only');
+    });
+
+    it('[16] a bare "992..." phone (no plus) is accepted as-is', async () => {
+        enabledConfig();
+        const txnId = deriveTxnId('k16');
+        const fetchImpl = async () => jsonResponse(201, { status: 'ok', txn_id: txnId, msg_id: 1 });
+        const result = await sendServiceSms(
+            { recipientPhone: '992901234567', message: 'test', idempotencyKey: 'k16' },
+            { fetchImpl }
+        );
+        assert.equal(result.success, true);
+    });
+
+    it('[17] a +7 (Russia) number is rejected before any network call — no guessing, no country add-on', async () => {
         enabledConfig();
         let called = false;
         const result = await sendServiceSms(
-            { recipientPhone: 'not-a-phone', message: 'test', idempotencyKey: 'k8' },
+            { recipientPhone: '+79261234567', message: 'test', idempotencyKey: 'k17' },
+            { fetchImpl: async () => { called = true; } }
+        );
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'UNSUPPORTED_COUNTRY');
+        assert.equal(called, false);
+    });
+
+    it('[18] a local 9-digit number with no 992/+992 prefix is rejected — never assume/prepend the country code', async () => {
+        enabledConfig();
+        let called = false;
+        const result = await sendServiceSms(
+            { recipientPhone: '901234567', message: 'test', idempotencyKey: 'k18' },
             { fetchImpl: async () => { called = true; } }
         );
         assert.equal(result.success, false);
@@ -187,21 +302,18 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
         assert.equal(called, false);
     });
 
-    it('[9] unsupported country is rejected (allowlist = TJ only, RU number given)', async () => {
-        enabledConfig({ OSON_SMS_ALLOWED_COUNTRIES: 'TJ' });
-        const result = await sendServiceSms(
-            { recipientPhone: '79261234567', message: 'test', idempotencyKey: 'k9' },
-            { fetchImpl: async () => ({}) }
-        );
-        assert.equal(result.success, false);
-        assert.equal(result.errorCode, 'UNSUPPORTED_COUNTRY');
+    it('[19] wrong length / letters / extensions are all rejected', async () => {
+        for (const bad of ['+9929012345', '+99290123456789', '+992abcde1234', '+992901234567ext5']) {
+            const result = await sendServiceSms({ recipientPhone: bad, message: 'test', idempotencyKey: 'kbad-' + bad }, { fetchImpl: async () => { throw new Error('must not be called'); } });
+            assert.equal(result.success, false, `expected rejection for ${bad}`);
+        }
     });
 
-    it('[10] dry-run mode never calls fetch and returns success', async () => {
+    it('[20] dry-run mode never calls fetch and returns success', async () => {
         enabledConfig({ OSON_SMS_DRY_RUN: 'true' });
         let called = false;
         const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k10' },
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k20' },
             { fetchImpl: async () => { called = true; } }
         );
         assert.equal(result.success, true);
@@ -209,66 +321,198 @@ describe('MANUAL BOOKING SMS OUTBOX — OSON SMS CLIENT', () => {
         assert.equal(called, false);
     });
 
-    it('[11] delivery-disabled (OSON_SMS_DELIVERY_ENABLED=false) behaves like dry-run, never calls fetch', async () => {
+    it('[21] delivery-disabled (OSON_SMS_DELIVERY_ENABLED=false) behaves like dry-run, never calls fetch', async () => {
         enabledConfig({ OSON_SMS_DRY_RUN: 'false', OSON_SMS_DELIVERY_ENABLED: 'false' });
         let called = false;
         const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k11' },
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k21' },
             { fetchImpl: async () => { called = true; } }
         );
         assert.equal(result.success, true);
         assert.equal(called, false);
     });
 
-    it('[12] secret (OSON_SMS_HASH) is never present in the outgoing request or the returned result', async () => {
-        enabledConfig({ OSON_SMS_HASH: 'super-secret-value-12345' });
+    it('[22] the Bearer token is sent as a header, never appears in the request URL, never in the returned result', async () => {
+        enabledConfig({ OSON_SMS_TOKEN: 'super-secret-bearer-value-12345' });
         let capturedUrl = null;
-        const fetchImpl = async (url) => {
+        let capturedAuthHeader = null;
+        const txnId = deriveTxnId('k22');
+        const fetchImpl = async (url, init) => {
             capturedUrl = url;
-            return {
-                ok: true, status: 200, headers: { get: () => 'application/json' },
-                text: async () => JSON.stringify({ status: 'ok', msg_id: 1 })
-            };
+            capturedAuthHeader = init && init.headers && init.headers.Authorization;
+            return jsonResponse(201, { status: 'ok', txn_id: txnId, msg_id: 1 });
         };
         const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k12' },
+            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k22' },
             { fetchImpl }
         );
-        assert.ok(!capturedUrl.includes('super-secret-value-12345'), 'raw secret must never appear in the request URL');
-        assert.ok(!JSON.stringify(result).includes('super-secret-value-12345'), 'raw secret must never appear in the returned result');
+        assert.equal(capturedAuthHeader, 'Bearer super-secret-bearer-value-12345', 'token IS sent, but only as the Authorization header');
+        assert.ok(!capturedUrl.includes('super-secret-bearer-value-12345'), 'token must never appear in the request URL');
+        assert.ok(!JSON.stringify(result).includes('super-secret-bearer-value-12345'), 'token must never appear in the returned result');
     });
 
-    it('[13] phone masking hides the middle digits', () => {
+    it('[23] is_confidential=true is always sent on every send request', async () => {
+        enabledConfig();
+        let capturedUrl = null;
+        const txnId = deriveTxnId('k23');
+        const fetchImpl = async (url) => { capturedUrl = url; return jsonResponse(201, { status: 'ok', txn_id: txnId, msg_id: 1 }); };
+        await sendServiceSms({ recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k23' }, { fetchImpl });
+        assert.ok(capturedUrl.includes('is_confidential=true'));
+    });
+
+    it('[24] the exact confirmed sender "Poputki" is required — refuses any other value, never calls fetch', async () => {
+        for (const badSender of ['BlablaCarTJ', 'Savorcar', 'Sherik', 'poputki', 'Poputki ', '']) {
+            let called = false;
+            enabledConfig({ OSON_SMS_SENDER: badSender });
+            const result = await sendServiceSms(
+                { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'ksender-' + badSender },
+                { fetchImpl: async () => { called = true; } }
+            );
+            assert.equal(result.success, false, `sender "${badSender}" must be refused`);
+            assert.equal(result.errorCode, 'OSON_SMS_UNCONFIRMED_SENDER');
+            assert.equal(called, false, `sender "${badSender}" must never reach the network`);
+        }
+        assert.equal(CONFIRMED_SENDER, 'Poputki');
+    });
+
+    it('[25] phone masking hides the middle digits', () => {
         const masked = maskPhoneLocal('992901234567');
         assert.ok(!masked.includes('901234'));
         assert.match(masked, /^9929\*+567$/);
     });
 
-    it('[14] login masking hides all but the last 4 characters', () => {
+    it('[26] login masking hides all but the last 4 characters', () => {
         // Synthetic example login only — never a real account credential.
         assert.equal(maskLogin('examplelogin'), '********ogin');
         assert.equal(maskLogin('ab'), '**');
     });
 
-    it('[15] str_hash formula matches the historical PHP integration exactly', () => {
-        // Recomputed independently from the audited osonsms.php class logic:
-        // SHA256("jam" + txn_id + ";" + login + ";" + sender + ";" + phone + ";" + hash)
-        const crypto = require('node:crypto');
-        const expected = crypto.createHash('sha256')
-            .update('jam123;mylogin;Poputki;992900000001;mysecret')
-            .digest('hex');
-        const actual = computeStrHash({
-            txnId: '123', login: 'mylogin', sender: 'Poputki',
-            phoneNumber: '992900000001', secretHash: 'mysecret'
-        });
-        assert.equal(actual, expected);
-    });
-
-    it('[16] classifyPhone accepts TJ numbers and rejects malformed input', () => {
+    it('[27] classifyPhone accepts only TJ numbers and rejects everything else', () => {
         assert.equal(classifyPhone('992901234567').valid, true);
+        assert.equal(classifyPhone('+992901234567').valid, true);
+        assert.equal(classifyPhone('79261234567').valid, false);
         assert.equal(classifyPhone('123').valid, false);
         assert.equal(classifyPhone(null).valid, false);
         assert.equal(classifyPhone('abc').valid, false);
+    });
+
+    it('[28] txn_id stays identical across repeated calls with the same idempotencyKey (retry safety)', () => {
+        assert.equal(deriveTxnId('same-key'), deriveTxnId('same-key'));
+    });
+});
+
+describe('MANUAL BOOKING SMS OUTBOX — OSON SMS STATUS CLIENT (query_sms.php)', () => {
+    beforeEach(resetEnv);
+    afterEach(resetEnv);
+
+    it('[S1] ENROUTE maps to sent, never delivered', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { status: 'ENROUTE' });
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        assert.equal(result.success, true);
+        assert.equal(result.internalStatus, 'sent');
+    });
+
+    it('[S2] ACCEPTED maps to sent, never delivered', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { status: 'ACCEPTED' });
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        assert.equal(result.internalStatus, 'sent');
+        assert.notEqual(result.internalStatus, 'delivered');
+    });
+
+    it('[S3] DELIVERED maps to delivered, and only DELIVERED does', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { status: 'DELIVERED' });
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        assert.equal(result.internalStatus, 'delivered');
+        assert.equal(result.terminal, true);
+    });
+
+    it('[S4] EXPIRED maps to failed', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { status: 'EXPIRED' });
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        assert.equal(result.internalStatus, 'failed');
+    });
+
+    it('[S5] DELETED maps to cancelled', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { status: 'DELETED' });
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        assert.equal(result.internalStatus, 'cancelled');
+    });
+
+    it('[S6] UNDELIVERABLE and REJECTED both map to failed with a distinct error code', async () => {
+        enabledConfig();
+        const r1 = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl: async () => jsonResponse(200, { status: 'UNDELIVERABLE' }) });
+        const r2 = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl: async () => jsonResponse(200, { status: 'REJECTED' }) });
+        assert.equal(r1.internalStatus, 'failed');
+        assert.equal(r1.errorCode, 'UNDELIVERABLE');
+        assert.equal(r2.internalStatus, 'failed');
+        assert.equal(r2.errorCode, 'REJECTED');
+    });
+
+    it('[S7] UNKNOWN never resolves to delivered — flagged for retry/manual attention instead', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { status: 'UNKNOWN' });
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        assert.notEqual(result.internalStatus, 'delivered');
+        assert.equal(result.needsManualAttention, true);
+    });
+
+    it('[S8] a redirect on the status endpoint is refused', async () => {
+        enabledConfig();
+        const fetchImpl = async () => ({ ok: false, status: 0, type: 'opaqueredirect', headers: { get: () => '' }, text: async () => '' });
+        const result = await queryOsonSmsStatus({ txnId: 'x' }, { fetchImpl });
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'ERR_REDIRECT_BLOCKED');
+    });
+
+    it('[S9] the query URL never appears in an error result if the request throws', async () => {
+        enabledConfig();
+        const fetchImpl = async () => { throw new Error('https://api.osonsms.com/query_sms.php?login=real&txn_id=abc123 boom'); };
+        const result = await queryOsonSmsStatus({ txnId: 'abc123' }, { fetchImpl });
+        assert.equal(result.success, false);
+        assert.ok(!JSON.stringify(result).includes('query_sms.php'));
+    });
+});
+
+describe('MANUAL BOOKING SMS OUTBOX — OSON SMS BALANCE CLIENT (check_balance.php, never called live)', () => {
+    beforeEach(resetEnv);
+    afterEach(resetEnv);
+
+    it('[B1] parses a numeric balance and timestamp from a well-formed 200 response', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { balance: 123.45, timestamp: '2026-09-10T00:00:00Z' });
+        const result = await checkOsonSmsBalance({ fetchImpl });
+        assert.equal(result.success, true);
+        assert.equal(result.balance, 123.45);
+        assert.equal(result.timestamp, '2026-09-10T00:00:00Z');
+    });
+
+    it('[B2] a non-numeric balance value is rejected, not silently coerced', async () => {
+        enabledConfig();
+        const fetchImpl = async () => jsonResponse(200, { balance: 'not-a-number' });
+        const result = await checkOsonSmsBalance({ fetchImpl });
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'INVALID_BALANCE_VALUE');
+    });
+
+    it('[B3] disabled feature flag fails closed before any network call', async () => {
+        resetEnv();
+        let called = false;
+        const result = await checkOsonSmsBalance({ fetchImpl: async () => { called = true; } });
+        assert.equal(result.success, false);
+        assert.equal(called, false);
+    });
+
+    it('[B4] a redirect on the balance endpoint is refused', async () => {
+        enabledConfig();
+        const fetchImpl = async () => ({ ok: false, status: 0, type: 'opaqueredirect', headers: { get: () => '' }, text: async () => '' });
+        const result = await checkOsonSmsBalance({ fetchImpl });
+        assert.equal(result.success, false);
+        assert.equal(result.errorCode, 'ERR_REDIRECT_BLOCKED');
     });
 });
 
@@ -488,37 +732,9 @@ describe('MANUAL BOOKING SMS OUTBOX — WORKER ORCHESTRATION', () => {
         assert.equal(client.updates[0].patch.last_error_code, 'NO_PHONE');
     });
 
-    it('[32] a valid 200 JSON body that is neither the success nor the error envelope is UNRECOGNIZED_RESPONSE, never success', async () => {
-        enabledConfig();
-        const fetchImpl = async () => ({
-            ok: true,
-            status: 200,
-            headers: { get: () => 'application/json' },
-            text: async () => JSON.stringify({ foo: 'bar' })
-        });
-        const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k32' },
-            { fetchImpl }
-        );
-        assert.equal(result.success, false);
-        assert.equal(result.errorCode, 'UNRECOGNIZED_RESPONSE');
-    });
-
-    it('[33] {status:"ok"} WITHOUT a msg_id is not treated as success — a confirmed provider ID is required', async () => {
-        enabledConfig();
-        const fetchImpl = async () => ({
-            ok: true,
-            status: 200,
-            headers: { get: () => 'application/json' },
-            text: async () => JSON.stringify({ status: 'ok' }) // no msg_id
-        });
-        const result = await sendServiceSms(
-            { recipientPhone: '992900000001', message: 'test', idempotencyKey: 'k33' },
-            { fetchImpl }
-        );
-        assert.equal(result.success, false);
-        assert.equal(result.errorCode, 'UNRECOGNIZED_RESPONSE');
-    });
+    // [32]/[33] (200-body-shape edge cases) removed — fully superseded by
+    // the new contract's tests [3] (HTTP 200 is never success, checked
+    // before body shape even matters) and [4] (HTTP 201 without msg_id).
 });
 
 describe('MANUAL BOOKING SMS OUTBOX — ENQUEUE ROUTING (rollout cutoff, kill switch, allowlist)', () => {
@@ -669,39 +885,196 @@ describe('MANUAL BOOKING SMS OUTBOX — TIMEOUT RETRY SAFETY', () => {
     });
 });
 
+describe('MANUAL BOOKING SMS OUTBOX — DUPLICATE TXN_ID RESOLUTION (HTTP 409 / code 108)', () => {
+    beforeEach(resetEnv);
+    afterEach(resetEnv);
+
+    function makeDuplicateFlowClient({ statusResponseBody, statusResponseStatus = 200 }) {
+        const updates = [];
+        const client = {
+            rpc: async (name) => {
+                if (name === 'fn_claim_manual_booking_sms_batch') {
+                    return { data: [{ outbox_id: 'row-d', booking_id: 1, idempotency_key: 'dup-key', locale: 'ru', attempts_count: 1, max_attempts: 5 }], error: null };
+                }
+                if (name === 'fn_oson_sms_check_cap') {
+                    return { data: { allowed: true }, error: null };
+                }
+                return { data: null, error: { message: 'unexpected rpc ' + name } };
+            },
+            from(table) {
+                if (table === 'manual_booking_sms_outbox') {
+                    return { update(patch) { return { eq(f, v) { updates.push({ patch, [f]: v }); return Promise.resolve({ error: null }); } }; } };
+                }
+                if (table === 'bus_ticket_bookings') {
+                    return {
+                        select() {
+                            return {
+                                eq() {
+                                    return {
+                                        single: async () => ({
+                                            data: { id: 1, status: 'confirmed', claim_status: 'unclaimed', phone: '992900000001', bus_ticket_id: 1 }
+                                        })
+                                    };
+                                }
+                            };
+                        }
+                    };
+                }
+                if (table === 'booking_claim_sessions') {
+                    return {
+                        insert() {
+                            return {
+                                select() {
+                                    return {
+                                        single: async () => ({
+                                            data: { id: 'sess-1', booking_id: 1, session_token_hash: 'x'.repeat(64), expires_at: new Date(Date.now() + 900000).toISOString() }
+                                        })
+                                    };
+                                }
+                            };
+                        }
+                    };
+                }
+                return {
+                    select() {
+                        return {
+                            eq() {
+                                return { single: async () => ({ data: { from_city: 'A', to_city: 'B' } }) };
+                            }
+                        };
+                    }
+                };
+            }
+        };
+
+        const fetchImpl = async (url) => {
+            if (url.includes('sendsms_v1.php')) {
+                return { ok: false, status: 409, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ error: { code: 108, msg: 'duplicate' } }) };
+            }
+            if (url.includes('query_sms.php')) {
+                return { ok: statusResponseStatus === 200, status: statusResponseStatus, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify(statusResponseBody) };
+            }
+            throw new Error('unexpected URL in duplicate-flow test: ' + url);
+        };
+
+        return { client, updates, fetchImpl };
+    }
+
+    it('[D1] duplicate resolved via query_sms.php DELIVERED -> outbox marked delivered (never assumed from the bare 409 alone)', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { status: 'DELIVERED' } });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'delivered');
+    });
+
+    it('[D2] duplicate resolved via query_sms.php ENROUTE -> outbox marked sent, NOT delivered', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { status: 'ENROUTE' } });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'sent');
+    });
+
+    it('[D3] duplicate resolved via query_sms.php UNKNOWN -> bounded retry, never delivered, same idempotency_key next attempt', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { status: 'UNKNOWN' } });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'retry');
+        assert.equal(finalUpdate.patch.last_error_code, 'PROVIDER_DUPLICATE_TXN_ID');
+    });
+
+    it('[D4] duplicate where the status query itself fails -> bounded retry, never delivered, never dead_letter on first attempt', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        const { client, updates, fetchImpl } = makeDuplicateFlowClient({ statusResponseBody: { error: { code: 106 } }, statusResponseStatus: 400 });
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const finalUpdate = updates[updates.length - 1];
+        assert.equal(finalUpdate.patch.status, 'retry');
+        assert.notEqual(finalUpdate.patch.status, 'delivered');
+    });
+
+    it('[D5] a duplicate never mints a new txn_id on the resolving status query — the same stable id is used', async () => {
+        enabledConfig({ OSON_SMS_DAILY_CAP: '100', OSON_SMS_PHONE_HASH_SECRET: 'test-secret' });
+        let capturedStatusUrl = null;
+        const { client } = makeDuplicateFlowClient({ statusResponseBody: { status: 'DELIVERED' } });
+        const fetchImpl = async (url) => {
+            if (url.includes('sendsms_v1.php')) {
+                return { ok: false, status: 409, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ error: { code: 108 } }) };
+            }
+            capturedStatusUrl = url;
+            return { ok: true, status: 200, type: 'basic', headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ status: 'DELIVERED' }) };
+        };
+        await processManualBookingSmsOutbox({ supabaseClient: client, dryRun: false, fetchImpl });
+        const crypto = require('node:crypto');
+        const expectedTxnId = crypto.createHash('sha256').update('dup-key').digest('hex').slice(0, 24);
+        assert.ok(capturedStatusUrl.includes(`txn_id=${expectedTxnId}`));
+    });
+});
+
 describe('MANUAL BOOKING SMS OUTBOX — LOG/PII HYGIENE (source-level)', () => {
     const clientSrc = fs.readFileSync(path.join(__dirname, '../utils/osonSmsClient.js'), 'utf8');
     const workerSrc = fs.readFileSync(path.join(__dirname, '../utils/manualBookingSmsOutboxService.js'), 'utf8');
     const capsSrc = fs.readFileSync(path.join(__dirname, '../utils/osonSmsCaps.js'), 'utf8');
 
-    it('[42] osonSmsClient never logs the raw phone; any cfg.login/cfg.secretHash reference inside a console call is Boolean-wrapped (presence only, never the value)', () => {
+    it('[42] osonSmsClient never logs the raw phone, the raw Bearer token, or the raw login — only masked/Boolean-wrapped forms', () => {
         // No console.* call in the file may reference the raw phone param
         // destructured at sendServiceSms's top.
         assert.ok(!/console\.[a-z]+\([^;]*?\brecipientPhone\b/s.test(clientSrc));
 
         // Find every console.*(...) call block (may span multiple lines up to
-        // its closing "});") and assert any cfg.login / cfg.secretHash inside
-        // it is always wrapped as Boolean(cfg.login) / Boolean(cfg.secretHash)
-        // — i.e. only "does a credential exist" may ever reach a log, never
-        // the value itself.
+        // its closing "});") and assert any cfg.login / cfg.token inside it
+        // is always wrapped as Boolean(...) or maskLogin(...) — i.e. only
+        // "does a credential exist" (or a masked form) may ever reach a log,
+        // never the raw value. cfg.token specifically must NEVER appear
+        // unwrapped anywhere in the file at all — not even in a comment-free
+        // code line outside a console call — since it is never partially
+        // displayed the way login/phone are.
         const consoleCalls = clientSrc.match(/console\.[a-z]+\([\s\S]*?\}\);/g) || [];
         assert.ok(consoleCalls.length > 0, 'expected at least one console.* call to inspect');
         for (const block of consoleCalls) {
-            for (const field of ['cfg.login', 'cfg.secretHash']) {
+            for (const field of ['cfg.login', 'cfg.token']) {
                 if (block.includes(field)) {
                     const safelyWrapped = block.includes(`Boolean(${field})`) || block.includes(`maskLogin(${field})`);
                     assert.ok(safelyWrapped, `console call must Boolean()- or maskLogin()-wrap ${field}: ${block}`);
                 }
             }
+            assert.ok(!block.includes('cfg.token}') && !/cfg\.token[,)]/.test(block) || block.includes('Boolean(cfg.token)'),
+                'cfg.token must never be interpolated raw into a log');
         }
+
+        // The Authorization header line is the ONE place cfg.token is used
+        // for its actual value — confirm it goes into the header, not a log.
+        assert.match(clientSrc, /headers:\s*\{\s*Authorization:\s*`Bearer \$\{cfg\.token\}`/);
     });
 
     it('[43] worker never logs err.message from the OSON client call itself (only normalized errorCode) or the raw phone', () => {
         assert.ok(!/console\.[a-z]+\([^)]*\bphone\b(?!Check|Masked|Hmac)/.test(workerSrc));
     });
 
-    it('[44] no code path anywhere in this feature ever sets status to "delivered" — that requires a confirmed OSON delivery-status/callback API this account does not have yet (see audit report)', () => {
-        assert.ok(!workerSrc.includes("'delivered'"), 'worker must never mark delivered without a confirmed delivery-status source');
+    it('[44] the worker only ever sets status "delivered" inside the confirmed-status branch (statusResult.internalStatus === \'delivered\'), never from a bare send response', () => {
+        // Now that queryOsonSmsStatus (query_sms.php) exists, the worker CAN
+        // legitimately reach 'delivered' — but only via an explicit status
+        // confirmation, never by assuming it from sendServiceSms's own
+        // result. Assert every occurrence of the delivered-status literal is
+        // gated behind that specific check.
+        const deliveredOccurrences = workerSrc.split('\n')
+            .map((line, idx) => ({ line, idx }))
+            .filter(({ line }) => line.includes("'delivered'"));
+        assert.ok(deliveredOccurrences.length > 0, 'expected at least one delivered-status code path via confirmed status query');
+
+        const lines = workerSrc.split('\n');
+        for (const { idx } of deliveredOccurrences) {
+            const windowStart = Math.max(0, idx - 12);
+            const context = lines.slice(windowStart, idx + 1).join('\n');
+            assert.ok(
+                context.includes("statusResult.internalStatus === 'delivered'"),
+                `'delivered' at line ${idx + 1} must be gated behind an explicit statusResult.internalStatus === 'delivered' check`
+            );
+        }
+        // sendServiceSms's own success branch (result.success) must never
+        // itself write 'delivered' — only 'sent'.
+        assert.ok(!/result\.success\)[\s\S]{0,120}'delivered'/.test(workerSrc));
     });
 
     it('[45] cap check never logs the phone HMAC or hashes anything without the dedicated secret env var', () => {

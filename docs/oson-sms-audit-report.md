@@ -7,6 +7,181 @@ changes were made in this pass or the prior one.
 
 ---
 
+## CONTRACT ALIGNMENT PASS — API 2.0.2 (08.02.2026), confirmed by OSON support
+
+Prior passes left `OSON CONTRACT: BLOCKED` because this sandbox cannot fetch
+`https://osonsms.com/docs/sms-api-documentation.pdf` (egress to `osonsms.com`
+is blocked here — confirmed again, still true). This pass acts on the
+account owner's relayed confirmation from OSON support: Bearer-token auth,
+Sender ID `Poputki`, Tajikistan (+992) only, and a specific set of
+endpoints/parameters/status codes. Per the task's own evidentiary rules,
+an official support response is a valid source on its own — the client and
+worker below are built to that confirmed contract. **Methodological note,
+stated plainly rather than glossed over**: this session still never read
+the primary PDF itself; "VERIFIED" below reflects the relayed support
+confirmation, not a self-fetched primary-source read.
+
+### C.1 — `osonSmsClient.js` rewritten to the confirmed contract
+
+The prior login+hash (`str_hash`) scheme is **removed entirely**, not kept
+as a fallback — there is no code path left that could sign a request with
+the retired secret.
+
+- **Transport**: `GET https://api.osonsms.com/sendsms_v1.php`,
+  `Authorization: Bearer <OSON_SMS_TOKEN>` header, params `from`,
+  `phone_number`, `msg`, `login`, `txn_id`, `is_confidential=true`.
+- **Success is ONLY**: HTTP `201` + `body.status === "ok"` +
+  `body.txn_id === <the txn_id we sent>` + a non-empty `body.msg_id`. HTTP
+  `200` on the send endpoint is explicitly never success (`PROVIDER_HTTP_200`),
+  even with an otherwise well-formed body.
+- **`txn_id`**: derived deterministically from the outbox row's
+  `idempotency_key` (`sha256(idempotencyKey).slice(0,24)`) — the same
+  formula as before, now explicitly documented and tested as the mechanism
+  that keeps `txn_id` stable across every retry of the same row. Never a
+  fresh id per attempt, never a raw DB id.
+- **HTTP 409 + `error.code=108`** → `{success:false, duplicate:true,
+  errorCode:'PROVIDER_DUPLICATE_TXN_ID', txnId}`. Never interpreted as
+  success or delivered.
+- **Sender lock**: `OSON_SMS_SENDER` must equal exactly `Poputki`
+  (`CONFIRMED_SENDER`) — anything else, including the other tenants' known
+  sender IDs on the same OSON account (`BlablaCarTJ`, `Savorcar`,
+  `Sherik`), fails closed with `OSON_SMS_UNCONFIRMED_SENDER` before any
+  network call.
+- **Phone**: Tajikistan only. Accepts `+992XXXXXXXXX` or `992XXXXXXXXX`
+  (normalizes to `992XXXXXXXXX` for the provider), rejects `+7`, any other
+  country, wrong length, letters, extensions — and never guesses or
+  prepends `992` to an ambiguous number.
+- **Error code normalization**: `100/105/106/107/108/109/112/113/114/119`
+  mapped to named constants (`MISSING_PARAMETER`, `ACCOUNT_INACTIVE`,
+  `INVALID_AUTHORIZATION`, `INCORRECT_SENDER`, `DUPLICATE_TXN_ID`,
+  `STORE_FAILED`, `SEND_FAILED`, `SMSC_UNAVAILABLE`,
+  `IP_NOT_WHITELISTED`, `INSUFFICIENT_BALANCE`) — the raw provider body is
+  never returned to any caller.
+- **GET-API security hardening**: no full URL or query string ever logged;
+  the Bearer token appears in exactly one place in the source (the
+  `Authorization` header build) and is never interpolated into any log
+  line, exception message, or returned result; strict hostname check
+  (`api.osonsms.com` only, refuses any other host even if `OSON_SMS_BASE_URL`
+  is misconfigured); `redirect: 'manual'` — a 3xx/opaque-redirect response
+  is refused (`ERR_REDIRECT_BLOCKED`), never silently followed to another
+  host; HTTPS-only; phone always masked in logs.
+- **Timeout**: hard-capped at 20 000 ms (`MAX_TIMEOUT_MS`) regardless of
+  what `OSON_SMS_TIMEOUT_MS` requests.
+
+### C.2 — New read-only clients
+
+- `utils/osonSmsStatusClient.js` (`query_sms.php`, Bearer auth): maps
+  `ENROUTE`/`ACCEPTED` → `sent` (never `delivered`), `DELIVERED` →
+  `delivered`, `EXPIRED`/`UNDELIVERABLE`/`REJECTED` → `failed`, `DELETED`
+  → `cancelled`, `UNKNOWN` → `retry` + `needsManualAttention`. This is
+  what lets `delivered` be set at all now — and *only* via this explicit,
+  confirmed status query, never assumed from a bare send response (proven
+  by a source-level test, see C.4).
+- `utils/osonSmsBalanceClient.js` (`check_balance.php`, Bearer auth):
+  parses a numeric balance + timestamp. **Never called against the real
+  endpoint anywhere in this codebase or its tests** — unit-tested against
+  a mocked `fetch` only, per this pass's own instruction ("не выполнять
+  настоящий запрос без нового token и отдельного разрешения").
+
+### C.3 — Duplicate-`txn_id` resolution wired into the worker
+
+On a `409`/duplicate response, `manualBookingSmsOutboxService.js` now
+calls `queryOsonSmsStatus({txnId})` (txn_id is always known — unlike
+msg_id at this point — and the status endpoint accepts it as a lookup key)
+before deciding anything:
+
+- `DELIVERED` → outbox row marked `delivered`
+- `ENROUTE`/`ACCEPTED` → marked `sent` (not `delivered`)
+- `EXPIRED`/`UNDELIVERABLE`/`REJECTED` → marked `failed`
+- `DELETED` → marked `cancelled`
+- `UNKNOWN`, or the status query itself failing → bounded retry with the
+  **same** `idempotency_key` (so the same `txn_id` is used again — never a
+  fresh one), eventually `dead_letter` after `max_attempts`
+
+Never marks `delivered` from the bare `409` alone. Five new worker-level
+tests (`[D1]`–`[D5]`) prove each branch and confirm the resolving status
+query never mints a new `txn_id`.
+
+### C.4 — Test suite
+
+`tests/phase_oson_sms_outbox.test.js` fully rewritten for the client
+sections, net **74 tests** (was 46), covering every item in this pass's
+own list: HTTP 201 success, HTTP 200 never success, 201-without-msg_id
+failure, txn_id-mismatch failure, 409/code-108 duplicate, +992
+normalization, 992-bare acceptance, +7 rejection with zero network calls,
+local-number-with-no-prefix rejection (no guessing), wrong length/letters/
+extensions rejection, unconfirmed-sender rejection (incl. the two other
+tenants' sender IDs), Bearer token sent as a header and never logged/
+returned, `is_confidential=true` always present, redirect blocked,
+unexpected-host blocked, 20s timeout cap, status-endpoint mapping for all
+8 OSON statuses, balance parsing (mocked only), and the full duplicate-
+resolution flow. Also updated the log/PII-hygiene source tests for the
+new `cfg.token`/`cfg.login` shape and the now-legitimate (but gated)
+`delivered` code path.
+
+```
+node --test tests/phase_oson_sms_outbox.test.js
+# tests 74
+# pass 74
+# fail 0
+
+node --test "tests/**/*.test.js"   (full backend suite)
+# tests 1314
+# pass 1314
+# fail 0
+```
+Zero regressions (was 1286 before this pass; +28 net new tests, 0 broken).
+
+### C.5 — Final verification checklist
+
+- Full backend suite: **1314/1314 PASS** (above)
+- Frontend feature suite (`phase_oson_sms_claim_landing_security.test.js`,
+  unchanged this pass — no frontend code was touched, the contract change
+  is backend-only): **10/10 PASS**
+- Frontend production build (`npm run build`): **succeeded**, `dist/`
+  output includes the `ClaimLandingView` chunk; gitignored, not committed
+- PostgreSQL 16 Gate: full chain (staging baseline →
+  `20260908`→`20260909`→`20260910`) re-applied from scratch to a fresh
+  disposable database — **clean, no errors**. Migration checksums
+  unchanged from the prior pass (no SQL was touched — this pass is
+  app-layer/auth-scheme only): see §13 below.
+- Secret scan: full working-tree diff searched for the specific
+  compromised values, any `api[_-]?key=`/`password=`-shaped literal, and
+  the new Bearer-token test fixtures — every match is a synthetic test
+  literal (`test-bearer-token`, `super-secret-bearer-value-12345`) or a
+  `.env.example` placeholder (`your_oson_sms_bearer_token_here`). **Clean.**
+- `git diff --check`: **clean** (exit 0, no whitespace/conflict-marker issues)
+- Working tree: clean after commit (this pass's changes committed, nothing
+  left uncommitted)
+- No push, no merge, no deploy, no production DB/env change, no real SMS,
+  no real Telegram/WhatsApp message, no request to any OSON endpoint (send,
+  status, or balance) from this session
+
+### C.6 — Verdicts for this pass
+
+```
+OSON TLS GATE:        PASSED
+OSON CONTRACT:        VERIFIED   (via OSON support confirmation relayed by the
+                                    account owner — this sandbox still cannot
+                                    fetch the primary PDF itself, see the
+                                    methodological note above)
+OSON SENDER:          VERIFIED — Poputki
+OSON COUNTRY:         TJ ONLY (+992)
+OSON +7:              BLOCKED
+OSON CREDENTIAL:      BLOCKED UNTIL ROTATION   (OSON_SMS_TOKEN must be a newly
+                                                  rotated Bearer token, added
+                                                  only as a Render secret env
+                                                  var — never generated,
+                                                  guessed, or entered by this
+                                                  session)
+PRODUCTION DELIVERY:  NOT ENABLED
+```
+
+No credential value of any kind appears above or anywhere else in this
+report.
+
+---
+
 ## VERIFICATION-ONLY PASS (no new functionality added)
 
 Scope of this pass: re-confirm the branch state, prove the frontend's
@@ -402,11 +577,12 @@ OSON_SMS_ENABLED
 OSON_SMS_DELIVERY_ENABLED
 OSON_SMS_DRY_RUN
 OSON_SMS_BASE_URL
+OSON_SMS_STATUS_URL
+OSON_SMS_BALANCE_URL
 OSON_SMS_LOGIN
-OSON_SMS_HASH
+OSON_SMS_TOKEN
 OSON_SMS_SENDER
 OSON_SMS_TIMEOUT_MS
-OSON_SMS_ALLOWED_COUNTRIES
 OSON_SMS_DAILY_CAP
 OSON_SMS_PER_PHONE_DAILY_CAP
 OSON_SMS_PER_CARRIER_DAILY_CAP
@@ -415,10 +591,15 @@ OSON_SMS_ROLLOUT_STARTED_AT
 OSON_SMS_PHONE_HASH_SECRET
 ```
 
-`OSON_SMS_HASH` **must be a newly rotated value**, created directly in
-OSON's own dashboard by the account owner. The value referenced earlier in
-this session is compromised and is not, and has never been, written to any
-file, test, commit, or log in either repository (§6).
+**Updated by the Contract Alignment Pass above**: `OSON_SMS_HASH` and
+`OSON_SMS_ALLOWED_COUNTRIES` are retired — the confirmed contract uses
+Bearer-token auth (`OSON_SMS_TOKEN`) and is hardcoded Tajikistan-only in
+`classifyPhone()`, no longer a runtime country list. `OSON_SMS_TOKEN`
+**must be a newly rotated value**, created directly in OSON's own
+dashboard by the account owner. Neither it nor the retired
+`OSON_SMS_HASH` value referenced earlier in this session has ever been
+written to any file, test, commit, or log in either repository (§6, and
+re-confirmed in the Contract Alignment Pass's own secret scan).
 
 ## 15. Unit test results
 
@@ -455,9 +636,10 @@ during this pass (§9 item 13).
 
 ## 18. Pilot plan (unchanged in substance, restated — not started)
 
-1. New `OSON_SMS_HASH` added to Render as a secret env var only (never in
-   query strings if OSON's confirmed contract allows header/body auth
-   instead — currently unconfirmed, §7).
+1. New `OSON_SMS_TOKEN` (Bearer token, freshly rotated in OSON's own
+   dashboard) added to Render as a secret env var only — sent as the
+   `Authorization` header per the now-confirmed contract, never in the
+   query string.
 2. Confirmed Sender ID added to `OSON_SMS_SENDER`.
 3. Migration chain (`20260908`→`20260909`→`20260910`) applied to a
    **staging** Supabase project first, gate re-run there.

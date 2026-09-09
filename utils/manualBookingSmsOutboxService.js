@@ -14,6 +14,7 @@
 
 const { getServiceRoleClient } = require('../dbServiceRole');
 const { sendServiceSms, classifyPhone } = require('./osonSmsClient');
+const { queryOsonSmsStatus } = require('./osonSmsStatusClient');
 const { renderManualBookingTicketSms } = require('./smsTemplates');
 const { checkSendCaps, hmacPhone } = require('./osonSmsCaps');
 const { maskPhone, cleanPhoneForStorage } = require('./phoneHelper');
@@ -198,7 +199,64 @@ async function processManualBookingSmsOutbox(options = {}) {
                 });
                 retried++;
             }
-        } else if (['ERR_INSECURE_TRANSPORT', 'OSON_SMS_CONFIG_INCOMPLETE', 'OSON_SMS_DISABLED', 'INVALID_PHONE', 'UNSUPPORTED_COUNTRY'].includes(result.errorCode)) {
+        } else if (result.duplicate) {
+            // HTTP 409 / DUPLICATE_TXN_ID: OSON already has a message under
+            // this exact txn_id (stable per outbox row — never a fresh one
+            // per attempt, so a duplicate here means a PRIOR attempt of
+            // THIS SAME row got through even though our own client never
+            // saw a success response for it, e.g. a timeout that actually
+            // sent). NEVER mark delivered on a duplicate by itself — resolve
+            // the real status via txn_id (always known, unlike msg_id at
+            // this point) before deciding anything.
+            const statusResult = await queryOsonSmsStatus({ txnId: result.txnId }, options.fetchImpl ? { fetchImpl: options.fetchImpl } : {});
+
+            if (statusResult.success && statusResult.internalStatus === 'delivered') {
+                await markOutboxRow(client, entryId, {
+                    status: 'delivered',
+                    sent_at: new Date().toISOString(),
+                    delivered_at: new Date().toISOString(),
+                    recipient_phone_masked: maskPhone(phone),
+                    recipient_phone_hmac: safeHmac(phone),
+                    claim_token_hash: claimTokenHash,
+                    last_error_code: null
+                });
+                sent++;
+            } else if (statusResult.success && statusResult.internalStatus === 'sent') {
+                await markOutboxRow(client, entryId, {
+                    status: 'sent',
+                    sent_at: new Date().toISOString(),
+                    recipient_phone_masked: maskPhone(phone),
+                    recipient_phone_hmac: safeHmac(phone),
+                    claim_token_hash: claimTokenHash,
+                    last_error_code: null
+                });
+                sent++;
+            } else if (statusResult.success && statusResult.terminal) {
+                // EXPIRED/UNDELIVERABLE/REJECTED -> failed; DELETED -> cancelled.
+                await markOutboxRow(client, entryId, {
+                    status: statusResult.internalStatus,
+                    last_error_code: statusResult.errorCode || 'PROVIDER_DUPLICATE_RESOLVED_TERMINAL'
+                });
+                if (statusResult.internalStatus === 'cancelled') cancelled++; else deadLetter++;
+            } else {
+                // Status query itself failed, or came back UNKNOWN — do NOT
+                // mint a new txn_id and do NOT assume success. Bounded retry
+                // with the same idempotency_key (same txn_id next attempt too).
+                const attempts = entry.attempts_count || 1;
+                const maxAttempts = entry.max_attempts || 5;
+                if (attempts >= maxAttempts) {
+                    await markOutboxRow(client, entryId, { status: 'dead_letter', last_error_code: 'PROVIDER_DUPLICATE_TXN_ID_UNRESOLVED' });
+                    deadLetter++;
+                } else {
+                    await markOutboxRow(client, entryId, {
+                        status: 'retry',
+                        scheduled_at: new Date(Date.now() + DEFAULT_BACKOFF_SECONDS * 1000).toISOString(),
+                        last_error_code: 'PROVIDER_DUPLICATE_TXN_ID'
+                    });
+                    retried++;
+                }
+            }
+        } else if (['ERR_INSECURE_TRANSPORT', 'ERR_UNEXPECTED_HOST', 'ERR_REDIRECT_BLOCKED', 'OSON_SMS_CONFIG_INCOMPLETE', 'OSON_SMS_DISABLED', 'OSON_SMS_UNCONFIRMED_SENDER', 'INVALID_PHONE', 'UNSUPPORTED_COUNTRY', 'TXN_ID_MISMATCH'].includes(result.errorCode)) {
             await markOutboxRow(client, entryId, { status: 'dead_letter', last_error_code: result.errorCode });
             deadLetter++;
         } else {
