@@ -341,11 +341,50 @@ function buildTripPrintManifest(ticket, bookings, busMaster = null) {
     return ticketList;
 }
 
+/**
+ * Minimal, PII-safe projection for a Telegram subscriber of a manual
+ * booking (booking_followers). Deliberately NOT built on top of
+ * buildPassengerTicketProjection: that function always includes the
+ * passenger's full name (even in its isPublic mode) and is meant for the
+ * booking's actual owner/carrier, not for an independent subscriber who may
+ * not be the passenger at all. Only route/date/carrier/seat/status —
+ * no name, phone, passport, price, commission, or any other subscriber's
+ * data.
+ *
+ * @param {Object} booking - bus_ticket_bookings row
+ * @param {Object} ticket - bus_tickets row
+ * @returns {Object|null}
+ */
+function buildFollowerTicketProjection(booking, ticket) {
+    if (!booking || !ticket) return null;
+
+    let seats = [];
+    try {
+        seats = typeof booking.seat_numbers === 'string'
+            ? JSON.parse(booking.seat_numbers || '[]')
+            : (booking.seat_numbers || []);
+        if (!Array.isArray(seats)) seats = seats ? [seats] : [];
+    } catch {
+        seats = [];
+    }
+
+    return {
+        fromCity: ticket.from_city || null,
+        toCity: ticket.to_city || null,
+        departureDate: ticket.departure_date || null,
+        departureTime: ticket.departure_time || null,
+        carrierName: ticket.transport_company || null,
+        seatNumbers: seats,
+        status: booking.status || null
+    };
+}
+
 module.exports = {
     generateTicketVerificationToken,
     verifyTicketToken,
     extractBookingIdFromToken,
     formatTicketNumber,
     buildPassengerTicketProjection,
+    buildFollowerTicketProjection,
     buildTripPrintManifest
 };

@@ -28,7 +28,27 @@ const {
     tripBelongsToCarrier
 } = require('../utils/claimHelper');
 const { cleanPhoneForStorage } = require('../utils/phoneHelper');
-const { verifyTicketToken } = require('../utils/ticketHelper');
+const { verifyTicketToken, extractBookingIdFromToken, buildFollowerTicketProjection } = require('../utils/ticketHelper');
+const {
+    generateSubscriptionSession,
+    completeSubscription,
+    unsubscribeFollower,
+    isBookingSubscribable
+} = require('../utils/bookingSubscriptionHelper');
+const { isManualBooking } = require('../utils/bookingChannelHelper');
+
+// Manual-booking Telegram subscription model — additive, off by default.
+// When false: /subscribe-preview, /start-subscription, /bot/subscribe and
+// /bot/unsubscribe all 404 as if they don't exist, and no code path here
+// ever touches booking_subscription_sessions/booking_followers. The
+// existing online-booking claim flow (everything else in this file) is
+// never gated by this flag and is unaffected either way. Read fresh on
+// every call (not cached at module load) so tests can toggle it per case,
+// matching this codebase's existing convention for feature flags (see
+// utils/manualBookingSmsOutboxService.js's OSON_SMS_DELIVERY_ENABLED check).
+function isSubscriptionModelEnabled() {
+    return process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true';
+}
 
 const rateLimitMap = new Map();
 
@@ -826,6 +846,191 @@ router.post('/verify-and-claim', claimRateLimiter(10, 60000), async (req, res) =
     } catch (err) {
         console.error('[Claims] verify-and-claim failed:', err.message);
         res.status(500).json({ error: 'Не удалось подтвердить билет' });
+    }
+});
+
+// ============================================================================
+// Manual Booking Telegram Subscription Model (additive, feature-flagged)
+//
+// Deliberately separate from the routes above: booking_subscription_sessions
+// is a different table with a different hash namespace and a purpose CHECK
+// that locks it to 'booking_subscription' only, so a token minted here can
+// never be resolved by resolveClaimSession()/fn_claim_booking_auto, and a
+// claim_/s_ token can never complete a subscription. Never mutates
+// bus_ticket_bookings.claimed_by_user_id/claim_status — those remain
+// exclusively the online-claim-flow's fields, untouched by this section.
+// ============================================================================
+
+router.post('/subscribe-preview', claimRateLimiter(30, 60000), async (req, res) => {
+    if (!isSubscriptionModelEnabled()) {
+        return res.status(404).json({ error: 'NOT_FOUND' });
+    }
+
+    try {
+        const { verificationToken, bookingId } = req.body || {};
+        if (!verificationToken) {
+            return res.status(400).json({ error: 'Токен билета обязателен' });
+        }
+
+        const derivedBookingId = extractBookingIdFromToken(verificationToken);
+        if (!derivedBookingId || !verifyTicketToken(verificationToken, derivedBookingId)) {
+            return res.status(403).json({ error: 'Недействительный токен билета', code: 'INVALID_TOKEN' });
+        }
+        if (bookingId && Number(bookingId) !== Number(derivedBookingId)) {
+            return res.status(403).json({ error: 'Идентификатор бронирования не совпадает с токеном', code: 'BOOKING_ID_MISMATCH' });
+        }
+
+        const claimDb = getServiceRoleClient();
+        const { data: booking } = await claimDb
+            .from('bus_ticket_bookings')
+            .select('*')
+            .eq('id', derivedBookingId)
+            .maybeSingle();
+
+        if (!booking) {
+            return res.status(404).json({ error: 'Бронирование не найдено', code: 'BOOKING_NOT_FOUND' });
+        }
+
+        const { data: trip } = await claimDb
+            .from('bus_tickets')
+            .select('*')
+            .eq('id', booking.bus_ticket_id)
+            .maybeSingle();
+
+        const canSubscribe = isManualBooking(booking) && trip
+            ? isBookingSubscribable(booking, trip)
+            : false;
+
+        return res.json({
+            success: true,
+            canSubscribe,
+            trip: buildFollowerTicketProjection(booking, trip || {})
+        });
+    } catch (err) {
+        console.error('[Subscribe] preview failed:', err.message);
+        return res.status(500).json({ error: 'Не удалось открыть данные билета' });
+    }
+});
+
+router.post('/start-subscription', claimRateLimiter(10, 60000), async (req, res) => {
+    if (!isSubscriptionModelEnabled()) {
+        return res.status(404).json({ error: 'NOT_FOUND' });
+    }
+
+    try {
+        const { verificationToken, bookingId } = req.body || {};
+        if (!verificationToken) {
+            return res.status(400).json({ error: 'Токен билета обязателен' });
+        }
+
+        const derivedBookingId = extractBookingIdFromToken(verificationToken);
+        if (!derivedBookingId || !verifyTicketToken(verificationToken, derivedBookingId)) {
+            return res.status(403).json({ error: 'Недействительный токен билета', code: 'INVALID_TOKEN' });
+        }
+        if (bookingId && Number(bookingId) !== Number(derivedBookingId)) {
+            return res.status(403).json({ error: 'Идентификатор бронирования не совпадает с токеном', code: 'BOOKING_ID_MISMATCH' });
+        }
+
+        const claimDb = getServiceRoleClient();
+        const { data: booking } = await claimDb
+            .from('bus_ticket_bookings')
+            .select('*')
+            .eq('id', derivedBookingId)
+            .maybeSingle();
+
+        if (!booking) {
+            return res.status(404).json({ error: 'Бронирование не найдено', code: 'BOOKING_NOT_FOUND' });
+        }
+        if (!isManualBooking(booking)) {
+            return res.status(400).json({ error: 'Подписка доступна только для ручных броней', code: 'NOT_A_MANUAL_BOOKING' });
+        }
+
+        const session = await generateSubscriptionSession(booking.id);
+        if (!session.success) {
+            const status = session.error === 'BOOKING_NOT_SUBSCRIBABLE' ? 400 : 500;
+            return res.status(status).json({ error: 'Не удалось создать сессию подписки', code: session.error });
+        }
+
+        return res.json({ success: true, deepLink: session.deepLink, expiresAt: session.expiresAt });
+    } catch (err) {
+        console.error('[Subscribe] start-subscription failed:', err.message);
+        return res.status(500).json({ error: 'Не удалось подготовить Telegram' });
+    }
+});
+
+router.post('/bot/subscribe', claimRateLimiter(20, 60000), requireClaimBotSecret, async (req, res) => {
+    if (!isSubscriptionModelEnabled()) {
+        return res.status(404).json({ error: 'NOT_FOUND', code: 'FEATURE_DISABLED' });
+    }
+
+    try {
+        const { sessionToken, telegramUser, telegramContact, roleDeclared } = req.body || {};
+        if (!sessionToken) {
+            return res.status(400).json({ error: 'Токен сессии обязателен', code: 'SESSION_TOKEN_REQUIRED' });
+        }
+
+        // Same anti-spoof invariant as the existing claim flow: the
+        // Telegram-authenticated sender and the contact card's own user_id
+        // must match. p_user_id passed into the RPC is NEVER taken from
+        // client-supplied fields beyond this verified identity — it is the
+        // id of the platform user resolved/created from this exact pair.
+        if (!telegramContact?.user_id || !telegramUser?.id
+            || String(telegramContact.user_id) !== String(telegramUser.id)) {
+            return res.status(400).json({ error: 'Контакт не подтверждён отправителем', code: 'TELEGRAM_CONTACT_USER_ID_MISMATCH' });
+        }
+
+        const claimDb = getServiceRoleClient();
+        const resolved = await resolveOrCreateTelegramPassenger(claimDb, telegramUser, telegramContact);
+        if (!resolved.success) {
+            return res.status(400).json({ error: resolved.error, code: resolved.error });
+        }
+
+        const result = await completeSubscription(sessionToken, resolved.user.id, roleDeclared, { supabaseClient: claimDb });
+        if (!result.success) {
+            const status = result.error === 'BOOKING_NOT_SUBSCRIBABLE' ? 400 : 400;
+            return res.status(status).json({ error: result.error, code: result.error });
+        }
+
+        const { data: booking } = await claimDb.from('bus_ticket_bookings').select('*').eq('id', result.bookingId).maybeSingle();
+        const { data: trip } = booking ? await claimDb.from('bus_tickets').select('*').eq('id', booking.bus_ticket_id).maybeSingle() : { data: null };
+
+        return res.json({
+            success: true,
+            event: result.event,
+            trip: buildFollowerTicketProjection(booking, trip || {})
+        });
+    } catch (err) {
+        console.error('[Subscribe] bot/subscribe failed:', err.message);
+        return res.status(500).json({ error: 'Не удалось добавить билет в Telegram', code: 'SUBSCRIBE_FAILED' });
+    }
+});
+
+router.post('/bot/unsubscribe', claimRateLimiter(20, 60000), requireClaimBotSecret, async (req, res) => {
+    if (!isSubscriptionModelEnabled()) {
+        return res.status(404).json({ error: 'NOT_FOUND', code: 'FEATURE_DISABLED' });
+    }
+
+    try {
+        const { bookingId, telegramUserId } = req.body || {};
+        if (!bookingId || !telegramUserId) {
+            return res.status(400).json({ error: 'bookingId и telegramUserId обязательны', code: 'MISSING_PARAMS' });
+        }
+
+        const claimDb = getServiceRoleClient();
+        const { data: user } = await claimDb.from('users').select('id').eq('telegram_id', telegramUserId).maybeSingle();
+        if (!user) {
+            return res.status(404).json({ error: 'Пользователь не найден', code: 'USER_NOT_FOUND' });
+        }
+
+        const result = await unsubscribeFollower(Number(bookingId), user.id, { supabaseClient: claimDb });
+        if (!result.success) {
+            return res.status(400).json({ error: result.error, code: result.error });
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Subscribe] bot/unsubscribe failed:', err.message);
+        return res.status(500).json({ error: 'Не удалось отписаться', code: 'UNSUBSCRIBE_FAILED' });
     }
 });
 

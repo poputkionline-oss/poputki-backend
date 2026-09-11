@@ -370,6 +370,41 @@ router.get('/:id/bus-bookings', userAuth, async (req, res) => {
                 passengers_data: typeof b.passengers_data === 'string' ? JSON.parse(b.passengers_data || '[]') : b.passengers_data
             };
         });
+
+        // Manual Booking Telegram Subscription Model (additive, feature-flagged):
+        // a booking_followers subscriber sees a SEPARATE, minimal, PII-safe
+        // entry for bookings they follow but do not own — never merged into
+        // or upgraded to the full projection above, and never duplicated for
+        // a booking already returned as a full-owner entry.
+        if (process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true') {
+            const { buildFollowerTicketProjection } = require('../utils/ticketHelper');
+            const alreadyIncludedIds = new Set(result.map(b => b.id));
+
+            const { data: followedRows } = await supabase
+                .from('booking_followers')
+                .select(`
+                    booking_id, role_declared, notifications_enabled,
+                    bus_ticket_bookings!inner (
+                        id, status, seat_numbers,
+                        bus_tickets!inner (from_city, to_city, departure_date, departure_time, transport_company)
+                    )
+                `)
+                .eq('user_id', requestedId)
+                .is('unsubscribed_at', null);
+
+            (followedRows || []).forEach(row => {
+                const booking = row.bus_ticket_bookings;
+                if (!booking || alreadyIncludedIds.has(booking.id)) return;
+                result.push({
+                    id: booking.id,
+                    isFollowerView: true,
+                    roleDeclared: row.role_declared,
+                    notificationsEnabled: row.notifications_enabled,
+                    ...buildFollowerTicketProjection(booking, booking.bus_tickets)
+                });
+            });
+        }
+
         res.json(result);
     } catch (err) {
         res.status(500).json({ error: err.message });
