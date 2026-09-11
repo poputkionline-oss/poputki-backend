@@ -61,6 +61,24 @@ function safeSecretEqual(received, expected) {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// bus_ticket_bookings.seat_numbers is declared TEXT[] in the schema baseline
+// but the live column is actually varchar (schema drift) — Supabase/PostgREST
+// hands it back as the JSON-array text it was stored as (e.g. "[78]"), not a
+// real array. Every claim endpoint that surfaces seat numbers to a client
+// must go through this so the API contract (seatNumbers is always an array,
+// never a string) holds regardless of which shape the column happens to be
+// in right now. Never throws — any non-array shape becomes [].
+function parseSeatNumbers(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw !== 'string' || !raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
 function requireClaimBotSecret(req, res, next) {
     const configured = process.env.CLAIM_BOT_SHARED_SECRET;
     const received = req.headers['x-claim-bot-secret'];
@@ -414,7 +432,7 @@ router.post('/preview-trip', claimRateLimiter(20, 60000), async (req, res) => {
                 departureDate: trip?.departure_date,
                 departureTime: trip?.departure_time,
                 carrierName: trip?.transport_company,
-                seatNumbers: booking.seat_numbers,
+                seatNumbers: parseSeatNumbers(booking.seat_numbers),
                 passengerCount: booking.passenger_count || 1
             }
         });
@@ -548,7 +566,7 @@ router.post('/bot/open', claimRateLimiter(20, 60000), requireClaimBotSecret, asy
                 departureDate: trip?.departure_date || null,
                 departureTime: trip?.departure_time || null,
                 carrierName: trip?.transport_company || null,
-                seatNumbers: booking.seat_numbers,
+                seatNumbers: parseSeatNumbers(booking.seat_numbers),
                 passengerCount: booking.passenger_count || 1
             }
         });
@@ -911,3 +929,8 @@ router.post('/carrier/requests/:id/review', carrierAuth, async (req, res) => {
 });
 
 module.exports = router;
+// Exposed for direct unit testing of the varchar/text[] schema-drift parsing
+// logic without needing to stand up the full claim-session/DB chain — Express
+// only cares about the router being callable, so this extra property is inert
+// in production.
+module.exports.parseSeatNumbers = parseSeatNumbers;
