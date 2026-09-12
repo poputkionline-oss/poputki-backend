@@ -1381,24 +1381,31 @@ router.post('/bookings/manual', async (req, res) => {
         // Phase E.38.2 Manual Booking Handoff for Unregistered Contacts
         let handoff = { required: false };
         if (!isAutoClaimed) {
+            // Same flag-gated choice as /claim-link: when the subscription
+            // model is on, this freshly-created booking (always manual —
+            // created_by_user_id is always set above, no need to re-check
+            // isManualBooking()) gets ONLY the new subscribe page, with no
+            // legacy claim_ session minted alongside it. See /claim-link's
+            // own comment for why minting both in parallel is the wrong
+            // default once the new flow is the intended one for this
+            // booking.
+            const useSubscribeOnly = process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true';
+
             let session = null;
-            try {
-                const { generateClaimSession } = require('../utils/claimHelper');
-                session = await generateClaimSession(booking.id);
-            } catch (handoffErr) {
-                console.error('[ManualBooking] Error generating claim session handoff:', handoffErr.message);
+            if (!useSubscribeOnly) {
+                try {
+                    const { generateClaimSession } = require('../utils/claimHelper');
+                    session = await generateClaimSession(booking.id);
+                } catch (handoffErr) {
+                    console.error('[ManualBooking] Error generating claim session handoff:', handoffErr.message);
+                }
             }
 
             const { generateTicketVerificationToken } = require('../utils/ticketHelper');
             const verificationToken = generateTicketVerificationToken(booking.id);
             const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
 
-            // Same additive, flag-gated public subscribe page as
-            // /claim-link and /handoff — this booking was just created via
-            // this very route, so it is always a manual booking
-            // (created_by_user_id is always set above); no need to re-fetch
-            // and re-check isManualBooking() here.
-            const ticketSubscribeUrl = process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true'
+            const ticketSubscribeUrl = useSubscribeOnly
                 ? `https://www.poputki.online/ticket-subscribe/${verificationToken}`
                 : null;
 
@@ -1512,34 +1519,47 @@ router.post('/bookings/:bookingId/claim-link', async (req, res) => {
             return res.status(409).json({ error: 'BOOKING_ALREADY_CLAIMED', message: 'Поездка уже подтверждена пассажиром' });
         }
 
-        // 5. Generate fresh claim session
-        const { generateClaimSession } = require('../utils/claimHelper');
-        const { generateTicketVerificationToken } = require('../utils/ticketHelper');
+        // 5. Manual Booking Telegram Subscription Model (feature-flagged):
+        // for a qualifying manual booking with the flag on, the carrier
+        // modal should offer ONLY the new follower-subscription page — not
+        // also silently mint a fresh legacy claim_ deep link the passenger
+        // never asked for and the UI no longer surfaces. A live claim_
+        // session is a real, functional ownership-transfer channel; minting
+        // one on every modal open regardless of which flow the UI actually
+        // uses left a legacy link active in parallel with the new one,
+        // which is exactly how a booking's claim_status can end up
+        // reflecting the OLD claim/mismatch flow's outcome even though the
+        // carrier only ever intended to hand out the new subscribe page.
+        //
+        // When the flag is off, or the booking doesn't qualify as manual,
+        // this is completely unchanged: a claim session is generated exactly
+        // as before and claim_url is always populated.
+        const useSubscribeOnly = process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true' && isManualBooking(booking);
 
-        const session = await generateClaimSession(booking.id);
+        const { generateTicketVerificationToken } = require('../utils/ticketHelper');
         const verificationToken = generateTicketVerificationToken(booking.id);
         const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
 
-        // Manual Booking Telegram Subscription Model (additive, feature-
-        // flagged): a SEPARATE, re-openable public ticket page that offers
-        // the passenger the new follower-subscription flow instead of the
-        // claim/ownership-transfer one. Never replaces claim_url/ticket_url
-        // above (both keep working exactly as before for any existing
-        // consumer) — this is purely an additional field, present only when
-        // the flag is on AND the booking actually qualifies, so a caller
-        // that doesn't know about it sees no behavior change whatsoever.
-        let ticketSubscribeUrl = null;
-        if (process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true' && isManualBooking(booking)) {
-            ticketSubscribeUrl = `https://www.poputki.online/ticket-subscribe/${verificationToken}`;
+        let claimUrl = null;
+        let expiresAt = null;
+        if (!useSubscribeOnly) {
+            const { generateClaimSession } = require('../utils/claimHelper');
+            const session = await generateClaimSession(booking.id);
+            claimUrl = session.deepLink;
+            expiresAt = session.expiresAt;
         }
+
+        const ticketSubscribeUrl = useSubscribeOnly
+            ? `https://www.poputki.online/ticket-subscribe/${verificationToken}`
+            : null;
 
         return res.json({
             success: true,
             booking_id: booking.id,
-            claim_url: session.deepLink,
+            claim_url: claimUrl,
             ticket_url: ticketUrl,
             ticket_subscribe_url: ticketSubscribeUrl,
-            expires_at: session.expiresAt
+            expires_at: expiresAt
         });
     } catch (err) {
         console.error('[ClaimLink Regeneration] Error:', err);

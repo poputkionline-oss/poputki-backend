@@ -12,11 +12,16 @@
  *   - POST /bus-admin/bookings/:id/handoff      (per-channel share attempt)
  *   - POST /bus-admin/bookings/manual           (new booking creation)
  *
- * None of these ever stop returning claim_url/ticket_url (or claim_url in
- * the handoff object) — the new field is purely additive, present ONLY when
- * MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED=true AND the booking is a manual
- * one (created_by_user_id set). Same fakeSupabaseClient/carrier-JWT harness
- * as tests/phase_subscription_model_carrier_count.test.js.
+ * ticket_url is always returned unchanged. claim_url/handoff.claim_url is
+ * where behavior actually branches: when the flag is off, or the booking
+ * isn't manual, claim_url is generated exactly as before (a real
+ * booking_claim_sessions row is minted). When the flag is ON for a
+ * qualifying manual booking, NO claim_url is generated and NO
+ * booking_claim_sessions row is created at all — the carrier modal gets
+ * ONLY the new ticket_subscribe_url, so a legacy claim_ deep link is never
+ * left live in parallel with the new subscribe page for that booking. Same
+ * fakeSupabaseClient/carrier-JWT harness as
+ * tests/phase_subscription_model_carrier_count.test.js.
  */
 
 const { describe, it, beforeEach, afterEach } = require('node:test');
@@ -108,8 +113,9 @@ describe('POST /bookings/:id/claim-link — ticket_subscribe_url', () => {
         });
     });
 
-    it('flag on + manual booking: field present, correct /ticket-subscribe/ URL, same verification token as ticket_url', async () => {
+    it('flag on + manual booking: ticket_subscribe_url present with the same verification token as ticket_url; claim_url is null and NO booking_claim_sessions row is created', async () => {
         process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED = 'true';
+        const claimSessionsBefore = (tables.booking_claim_sessions || []).length;
         await withServer(async (port) => {
             const res = await fetch(`http://127.0.0.1:${port}/api/bus-admin/bookings/900/claim-link`, {
                 method: 'POST', headers: authHeaders(), body: '{}'
@@ -118,15 +124,18 @@ describe('POST /bookings/:id/claim-link — ticket_subscribe_url', () => {
             assert.equal(res.status, 200);
             assert.ok(body.ticket_subscribe_url, 'ticket_subscribe_url must be present when flag is on');
             assert.match(body.ticket_subscribe_url, /^https:\/\/www\.poputki\.online\/ticket-subscribe\/900-[a-f0-9]{32}$/);
+            assert.equal(body.claim_url, null, 'claim_url must be null — no legacy claim link minted alongside the new subscribe page');
 
             const ticketToken = body.ticket_url.split('/ticket-verify/')[1];
             const subscribeToken = body.ticket_subscribe_url.split('/ticket-subscribe/')[1];
             assert.equal(ticketToken, subscribeToken, 'both URLs must carry the exact same verification token');
         });
+        assert.equal((tables.booking_claim_sessions || []).length, claimSessionsBefore, 'no booking_claim_sessions row must be created when the flag is on for a manual booking');
     });
 
-    it('flag on but booking is NOT manual (created_by_user_id null): field stays null', async () => {
+    it('flag on but booking is NOT manual (created_by_user_id null): ticket_subscribe_url stays null, legacy claim_url is still generated (a claim session IS created, unchanged)', async () => {
         process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED = 'true';
+        const claimSessionsBefore = (tables.booking_claim_sessions || []).length;
         await withServer(async (port) => {
             const res = await fetch(`http://127.0.0.1:${port}/api/bus-admin/bookings/901/claim-link`, {
                 method: 'POST', headers: authHeaders(), body: '{}'
@@ -134,7 +143,20 @@ describe('POST /bookings/:id/claim-link — ticket_subscribe_url', () => {
             const body = await res.json();
             assert.equal(res.status, 200);
             assert.equal(body.ticket_subscribe_url, null);
+            assert.ok(body.claim_url.startsWith('https://t.me/'), 'a non-manual booking must still get a legacy claim link, unchanged');
         });
+        assert.equal((tables.booking_claim_sessions || []).length, claimSessionsBefore + 1, 'exactly one booking_claim_sessions row must still be created for a non-manual booking');
+    });
+
+    it('flag off: a real booking_claim_sessions row is still created (legacy behavior fully unchanged)', async () => {
+        const claimSessionsBefore = (tables.booking_claim_sessions || []).length;
+        await withServer(async (port) => {
+            const res = await fetch(`http://127.0.0.1:${port}/api/bus-admin/bookings/900/claim-link`, {
+                method: 'POST', headers: authHeaders(), body: '{}'
+            });
+            assert.equal(res.status, 200);
+        });
+        assert.equal((tables.booking_claim_sessions || []).length, claimSessionsBefore + 1, 'exactly one booking_claim_sessions row must be created when the flag is off');
     });
 
     it('tenant isolation is unaffected by the new field: a different carrier\'s booking is still 403', async () => {
@@ -207,8 +229,9 @@ describe('POST /bookings/manual — handoff.ticket_subscribe_url on booking crea
         });
     });
 
-    it('flag on: handoff.ticket_subscribe_url present and correctly formed', async () => {
+    it('flag on: handoff.ticket_subscribe_url present and correctly formed; claim_url is null and NO booking_claim_sessions row is created', async () => {
         process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED = 'true';
+        const claimSessionsBefore = (tables.booking_claim_sessions || []).length;
         await withServer(async (port) => {
             const res = await fetch(`http://127.0.0.1:${port}/api/bus-admin/bookings/manual`, {
                 method: 'POST', headers: authHeaders(), body: JSON.stringify({
@@ -223,6 +246,8 @@ describe('POST /bookings/manual — handoff.ticket_subscribe_url on booking crea
             assert.equal(res.status, 200);
             assert.equal(body.handoff.required, true);
             assert.match(body.handoff.ticket_subscribe_url, /^https:\/\/www\.poputki\.online\/ticket-subscribe\/\d+-[a-f0-9]{32}$/);
+            assert.equal(body.handoff.claim_url, null, 'claim_url must be null — no legacy claim link minted for a fresh manual booking when the flag is on');
         });
+        assert.equal((tables.booking_claim_sessions || []).length, claimSessionsBefore, 'no booking_claim_sessions row must be created for this new booking when the flag is on');
     });
 });
