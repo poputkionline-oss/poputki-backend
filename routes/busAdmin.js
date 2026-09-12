@@ -687,14 +687,43 @@ router.put('/tickets/:id', async (req, res) => {
 
         // 6. Gather passenger Telegram IDs & language preferences
         const userIds = [...new Set(activeBookings.map(b => b.claimed_by_user_id || b.passenger_id).filter(Boolean))];
+
+        // Manual Booking Telegram Subscription Model (additive, feature-
+        // flagged): active booking_followers for these bookings are folded
+        // into the SAME recipient-resolution pass — never a change to the
+        // existing claimed_by_user_id/passenger_id recipient for the online
+        // claim flow, only additional independent recipients per booking.
+        // When the flag is off, followersByBookingId stays empty and every
+        // line below behaves exactly as before this change.
+        const followersByBookingId = {};
+        if (process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true') {
+            try {
+                const bookingIds = activeBookings.map(b => b.id);
+                const { data: followerRows } = await supabase
+                    .from('booking_followers')
+                    .select('booking_id, user_id, notifications_enabled')
+                    .in('booking_id', bookingIds)
+                    .is('unsubscribed_at', null);
+
+                (followerRows || []).forEach(row => {
+                    if (!row.notifications_enabled) return;
+                    if (!followersByBookingId[row.booking_id]) followersByBookingId[row.booking_id] = [];
+                    followersByBookingId[row.booking_id].push({ user_id: row.user_id, notifications_enabled: true });
+                    userIds.push(row.user_id);
+                });
+            } catch (followerErr) {
+                console.warn('[BusAdmin TripEdit] Failed to load booking_followers (non-fatal, online-claim recipients unaffected):', followerErr.message);
+            }
+        }
+        const uniqueUserIds = [...new Set(userIds)];
         let userTelegramMap = {};
         let userLangMap = {};
-        if (userIds.length > 0) {
+        if (uniqueUserIds.length > 0) {
             try {
                 const { data: usersData } = await supabase
                     .from('users')
                     .select('id, telegram_id, language')
-                    .in('id', userIds);
+                    .in('id', uniqueUserIds);
                 (usersData || []).forEach(u => {
                     userTelegramMap[u.id] = u.telegram_id || null;
                     userLangMap[u.id] = u.language || 'ru';
@@ -762,6 +791,41 @@ router.put('/tickets/:id', async (req, res) => {
                 payload: msgPayload,
                 status: outboxStatus
             });
+
+            // Manual Booking Telegram Subscription Model: additional,
+            // independent outbox rows for this booking's active followers —
+            // deduplicated against the recipient above (and against each
+            // other) by user_id, so the same person is never queued twice
+            // for the same trip-change event regardless of how many of
+            // passenger_id/claimed_by_user_id/booking_followers they appear
+            // under. Each follower gets their OWN outbox row, so a delivery
+            // failure for one (handled by the existing per-row try/catch in
+            // processTripChangeOutbox) can never block any other recipient.
+            const bookingFollowers = followersByBookingId[b.id] || [];
+            if (bookingFollowers.length > 0) {
+                const { buildNotificationCandidates } = require('../utils/notificationRecipientDedup');
+                const candidates = buildNotificationCandidates(
+                    { claimed_by_user_id: b.claimed_by_user_id, passenger_id: b.passenger_id },
+                    bookingFollowers
+                );
+                for (const candidate of candidates) {
+                    if (String(candidate.userId) === String(effectiveUserId)) continue; // already queued above
+                    const followerTgId = userTelegramMap[candidate.userId];
+                    const followerLang = userLangMap[candidate.userId] || 'ru';
+                    const followerStatus = followerTgId ? 'pending' : 'unreachable';
+                    if (!followerTgId) unreachableCount++; else notificationsQueued++;
+
+                    outboxEntries.push({
+                        booking_id: b.id,
+                        recipient_user_id: candidate.userId,
+                        recipient_telegram_id: followerTgId || null,
+                        channel: 'telegram',
+                        language: followerLang,
+                        payload: msgPayload,
+                        status: followerStatus
+                    });
+                }
+            }
         }
 
         const finalIdempotencyKey = idempotencyKey || `trip-edit-${id}-${Date.now()}`;
@@ -1455,6 +1519,55 @@ router.post('/bookings/:bookingId/claim-link', async (req, res) => {
     } catch (err) {
         console.error('[ClaimLink Regeneration] Error:', err);
         return res.status(500).json({ error: 'INTERNAL_ERROR', message: err.message });
+    }
+});
+
+/**
+ * @swagger
+ * /api/bus-admin/bookings/{bookingId}/telegram-subscribers-count:
+ *   get:
+ *     summary: Aggregate-only count of active Telegram subscribers for a manual booking (carrier tenant-scoped)
+ *     tags: [Bus Admin]
+ */
+router.get('/bookings/:bookingId/telegram-subscribers-count', async (req, res) => {
+    const { bookingId } = req.params;
+    const numId = Number(bookingId);
+    if (!numId || isNaN(numId)) {
+        return res.status(400).json({ error: 'INVALID_BOOKING_ID', message: 'Некорректный ID бронирования' });
+    }
+
+    // Feature flag off, or the migration not applied in this environment
+    // yet: respond with count 0 rather than breaking the caller — never a
+    // 404/500 that would surprise a carrier UI that always expects this
+    // field to be present.
+    if (process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED !== 'true') {
+        return res.json({ success: true, booking_id: numId, telegram_subscribers_count: 0 });
+    }
+
+    try {
+        const { data: booking, error: bErr } = await supabase
+            .from('bus_ticket_bookings')
+            .select('id, bus_ticket_id')
+            .eq('id', numId)
+            .single();
+
+        if (bErr || !booking) {
+            return res.status(404).json({ error: 'BOOKING_NOT_FOUND', message: 'Бронирование не найдено' });
+        }
+
+        const hasAccess = await verifyTicketAccess(req.carrier, booking.bus_ticket_id);
+        if (!hasAccess) {
+            return res.status(403).json({ error: 'FORBIDDEN', message: 'Доступ запрещен: рейс не принадлежит вашему аккаунту перевозчика' });
+        }
+
+        const { getActiveFollowerCount } = require('../utils/bookingSubscriptionHelper');
+        const count = await getActiveFollowerCount(numId);
+
+        // Aggregate ONLY — never user_id/telegram_id/username/phone/name.
+        return res.json({ success: true, booking_id: numId, telegram_subscribers_count: count });
+    } catch (err) {
+        console.error('[TelegramSubscribersCount] Error:', err);
+        return res.json({ success: true, booking_id: numId, telegram_subscribers_count: 0 });
     }
 });
 

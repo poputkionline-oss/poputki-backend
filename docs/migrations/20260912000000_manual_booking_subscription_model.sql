@@ -26,13 +26,24 @@ CREATE TABLE IF NOT EXISTS public.booking_subscription_sessions (
     booking_id INTEGER NOT NULL REFERENCES public.bus_ticket_bookings(id) ON DELETE CASCADE,
     session_token_hash TEXT NOT NULL UNIQUE,
     purpose TEXT NOT NULL DEFAULT 'booking_subscription' CHECK (purpose = 'booking_subscription'),
+    -- Set once, by fn_bind_booking_subscription_session, the moment the bot
+    -- receives /start subscribe_<token> — from that point on the session is
+    -- looked up by (bound_telegram_id, most recent) rather than by hash, so
+    -- the bot never has to persist the raw token anywhere, not even in its
+    -- own Supabase-backed pending-state table (bot_user_states' existing
+    -- equivalent for the claim flow). See fn_complete_booking_subscription.
+    bound_telegram_id BIGINT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 COMMENT ON TABLE public.booking_subscription_sessions IS
-    'Short-lived (15 min) token session for adding a Telegram subscriber to a manual booking. Purpose-locked so a token minted here can never be consumed by the unrelated booking_claim_sessions/fn_claim_booking_auto ownership-transfer flow. Raw token is never stored — only session_token_hash (SHA-256).';
+    'Short-lived (15 min) token session for adding a Telegram subscriber to a manual booking. Purpose-locked so a token minted here can never be consumed by the unrelated booking_claim_sessions/fn_claim_booking_auto ownership-transfer flow. Raw token is never stored — only session_token_hash (SHA-256), used exactly once at bind time; completion afterwards is keyed by bound_telegram_id.';
+
+CREATE INDEX IF NOT EXISTS idx_booking_subscription_sessions_bound_telegram
+    ON public.booking_subscription_sessions(bound_telegram_id, created_at DESC)
+    WHERE bound_telegram_id IS NOT NULL;
 
 -- ------------------------------------------------------------------------
 -- (b) booking_followers — additive. Multiple independent subscribers per
@@ -139,15 +150,65 @@ REVOKE ALL ON FUNCTION public.fn_start_booking_subscription_session(INTEGER, TEX
 GRANT EXECUTE ON FUNCTION public.fn_start_booking_subscription_session(INTEGER, TEXT) TO service_role;
 
 -- ------------------------------------------------------------------------
--- (f) fn_complete_booking_subscription — atomic hash+purpose+TTL+consumed
---     check, re-checks fn_is_booking_subscribable (booking could have been
---     cancelled between session start and bot confirmation), normalizes
---     role_declared server-side (never a raw CHECK violation), records the
---     correct subscribed/resubscribed event based on the row's state
---     BEFORE the upsert, and is idempotent for an already-active follower.
+-- (e2) fn_bind_booking_subscription_session — the ONLY point where the raw
+--      token (hashed here) is ever presented again after being minted.
+--      Called once, synchronously, from the bot's /start subscribe_<token>
+--      webhook handler, in the same request/response cycle — the raw token
+--      is never written to any table, bot-side or backend-side, before or
+--      after this call. From here on the session is addressed by
+--      bound_telegram_id instead of by hash.
+-- ------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.fn_bind_booking_subscription_session(
+    p_session_token_hash TEXT,
+    p_telegram_id BIGINT
+)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_id UUID;
+BEGIN
+    UPDATE public.booking_subscription_sessions
+    SET bound_telegram_id = p_telegram_id
+    WHERE session_token_hash = p_session_token_hash
+      AND purpose = 'booking_subscription'
+      AND consumed_at IS NULL
+      AND expires_at > NOW()
+    RETURNING id INTO v_id;
+
+    IF v_id IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'error', 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
+    END IF;
+
+    RETURN jsonb_build_object('success', true);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.fn_bind_booking_subscription_session(TEXT, BIGINT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.fn_bind_booking_subscription_session(TEXT, BIGINT) TO service_role;
+
+-- ------------------------------------------------------------------------
+-- (f) fn_complete_booking_subscription — looked up by (bound_telegram_id,
+--     most recently bound) rather than by hash, since the bot no longer
+--     holds the raw token by the time the contact-share message arrives
+--     (see (e2) above). Re-checks purpose/consumed_at/expires_at and
+--     fn_is_booking_subscribable (booking could have been cancelled between
+--     bind and bot confirmation), normalizes role_declared server-side
+--     (never a raw CHECK violation), records the correct
+--     subscribed/resubscribed event based on the row's state BEFORE the
+--     upsert, and is idempotent for an already-active follower. If a
+--     telegram_id has more than one bound, still-valid, unconsumed session
+--     (e.g. two different manual bookings started in quick succession), the
+--     most recently bound one is completed — the rest remain available
+--     until their own TTL, requiring the user to reopen that specific
+--     subscribe link to bind (and then complete) it separately; this
+--     mirrors the underlying Telegram UX constraint that only the latest
+--     reply keyboard's button is actually tappable, not an added
+--     limitation of this design.
 -- ------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_complete_booking_subscription(
-    p_session_hash TEXT,
+    p_telegram_id BIGINT,
     p_user_id INTEGER,
     p_role_declared TEXT
 )
@@ -162,16 +223,14 @@ DECLARE
     v_existing RECORD;
     v_event_type TEXT;
 BEGIN
-    -- Looked up by hash ALONE, exactly like the existing
-    -- resolveClaimSession()/booking_claim_sessions pattern — the caller
-    -- (the bot, via the raw token from the Telegram deep link) never knows
-    -- the session's UUID id, only the raw token it hashes client-side.
     SELECT id, booking_id INTO v_session_id, v_booking_id
     FROM public.booking_subscription_sessions
-    WHERE session_token_hash = p_session_hash
+    WHERE bound_telegram_id = p_telegram_id
       AND purpose = 'booking_subscription'
       AND consumed_at IS NULL
       AND expires_at > NOW()
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
     FOR UPDATE;
 
     IF v_booking_id IS NULL THEN
@@ -225,8 +284,8 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.fn_complete_booking_subscription(TEXT, INTEGER, TEXT) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.fn_complete_booking_subscription(TEXT, INTEGER, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.fn_complete_booking_subscription(BIGINT, INTEGER, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.fn_complete_booking_subscription(BIGINT, INTEGER, TEXT) TO service_role;
 
 -- ------------------------------------------------------------------------
 -- (g) fn_unsubscribe_booking_follower — soft unsubscribe only, never a
@@ -291,7 +350,8 @@ COMMIT;
 -- Rollback Instructions:
 -- BEGIN;
 -- DROP FUNCTION IF EXISTS public.fn_unsubscribe_booking_follower(INTEGER, INTEGER);
--- DROP FUNCTION IF EXISTS public.fn_complete_booking_subscription(TEXT, INTEGER, TEXT);
+-- DROP FUNCTION IF EXISTS public.fn_complete_booking_subscription(BIGINT, INTEGER, TEXT);
+-- DROP FUNCTION IF EXISTS public.fn_bind_booking_subscription_session(TEXT, BIGINT);
 -- DROP FUNCTION IF EXISTS public.fn_start_booking_subscription_session(INTEGER, TEXT);
 -- DROP FUNCTION IF EXISTS public.fn_is_booking_subscribable(INTEGER);
 -- DROP TABLE IF EXISTS public.booking_follower_events;

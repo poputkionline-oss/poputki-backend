@@ -24,8 +24,11 @@ const {
     isBookingSubscribable,
     normalizeRoleDeclared,
     generateSubscriptionSession,
+    bindSubscriptionSession,
+    hasPendingSubscription,
     completeSubscription,
-    unsubscribeFollower
+    unsubscribeFollower,
+    getActiveFollowerCount
 } = require('../utils/bookingSubscriptionHelper');
 const { isManualBooking } = require('../utils/bookingChannelHelper');
 const { resolveClaimSession } = require('../utils/claimHelper');
@@ -298,59 +301,162 @@ describe('generateSubscriptionSession — availability gating and independence',
     });
 });
 
-describe('completeSubscription — subscribed / resubscribed / idempotent, and audit events', () => {
-    it('first-time subscription logs a "subscribed" event', async () => {
+// Convenience matching the real bot flow exactly: /start subscribe_<token>
+// binds the session to a telegram id (raw token used once, then discarded);
+// completion later is keyed purely by that telegram id.
+async function startAndBind(db, bookingId, telegramId, now) {
+    const session = await generateSubscriptionSession(bookingId, { supabaseClient: db, now });
+    const bind = await bindSubscriptionSession(session.sessionToken, telegramId, { supabaseClient: db, now });
+    return { session, bind };
+}
+
+describe('bindSubscriptionSession — the only point the raw token is used again', () => {
+    it('binds a valid, unconsumed session to a telegram id', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
         const session = await generateSubscriptionSession(900, { supabaseClient: db });
-        const result = await completeSubscription(session.sessionToken, 2, 'passenger', { supabaseClient: db });
+        const bind = await bindSubscriptionSession(session.sessionToken, 555000111, { supabaseClient: db });
+        assert.equal(bind.success, true);
+        const row = [...db._tables.booking_subscription_sessions.values()].find(r => r.id === session.sessionId);
+        assert.equal(row.bound_telegram_id, 555000111);
+    });
+
+    it('rejects an already-consumed session hash', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        const { session } = await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        const rebind = await bindSubscriptionSession(session.sessionToken, 555000111, { supabaseClient: db });
+        assert.equal(rebind.success, false);
+        assert.equal(rebind.error, 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
+    });
+
+    it('rejects a garbage/empty token without throwing', async () => {
+        const db = createMockDb();
+        const bind = await bindSubscriptionSession('', 555000111, { supabaseClient: db });
+        assert.equal(bind.success, false);
+    });
+});
+
+describe('hasPendingSubscription — cheap existence check, used by routes/claims.js before touching the users table', () => {
+    it('true right after a session is bound to a telegram id', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        assert.equal(await hasPendingSubscription(555000111, { supabaseClient: db }), true);
+    });
+
+    it('false for a telegram id with no bound session at all', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        assert.equal(await hasPendingSubscription(999999999, { supabaseClient: db }), false);
+    });
+
+    it('false once the bound session has already been consumed', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        assert.equal(await hasPendingSubscription(555000111, { supabaseClient: db }), false);
+    });
+
+    it('false for an expired bound session', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        const past = new Date(Date.now() - SUBSCRIPTION_SESSION_TTL_MS - 1000);
+        await startAndBind(db, 900, 555000111, past);
+        assert.equal(await hasPendingSubscription(555000111, { supabaseClient: db }), false);
+    });
+
+    it('never throws even when the underlying query errors out', async () => {
+        const db = createMockDb();
+        // A client with no .rpc() (so isInjectedMock is true) but whose
+        // _tables lacks the expected Map shape entirely — the mock path
+        // should degrade to false rather than throwing.
+        const brokenDb = { _tables: {} };
+        assert.equal(await hasPendingSubscription(1, { supabaseClient: brokenDb }), false);
+    });
+});
+
+describe('completeSubscription — keyed by telegram id, subscribed / resubscribed / idempotent, and audit events', () => {
+    it('first-time subscription (after bind) logs a "subscribed" event', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
         assert.equal(result.success, true);
         assert.equal(result.event, 'subscribed');
         assert.equal(db._tables.booking_follower_events.length, 1);
         assert.equal(db._tables.booking_follower_events[0].event_type, 'subscribed');
     });
 
-    it('a second, different subscriber on the same booking succeeds independently (no "first wins" blocking)', async () => {
+    it('completion with no prior bind for this telegram id fails cleanly (nothing to complete)', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const sessionA = await generateSubscriptionSession(900, { supabaseClient: db });
-        const sessionB = await generateSubscriptionSession(900, { supabaseClient: db });
-        const resultA = await completeSubscription(sessionA.sessionToken, 2, 'passenger', { supabaseClient: db });
-        const resultB = await completeSubscription(sessionB.sessionToken, 3, 'intermediary', { supabaseClient: db });
+        const result = await completeSubscription(999999999, 2, 'passenger', { supabaseClient: db });
+        assert.equal(result.success, false);
+        assert.equal(result.error, 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
+    });
+
+    it('a second, different subscriber (different telegram id, different platform user) succeeds independently (no "first wins" blocking)', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        await startAndBind(db, 900, 777000222);
+        const resultA = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        const resultB = await completeSubscription(777000222, 3, 'intermediary', { supabaseClient: db });
         assert.equal(resultA.success, true);
         assert.equal(resultB.success, true);
         assert.equal(db._tables.booking_followers.size, 2);
     });
 
-    it('re-using an already-consumed session fails', async () => {
+    it('re-completing for the same telegram id after it already consumed its session fails', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const session = await generateSubscriptionSession(900, { supabaseClient: db });
-        await completeSubscription(session.sessionToken, 2, 'passenger', { supabaseClient: db });
-        const reuse = await completeSubscription(session.sessionToken, 2, 'passenger', { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        const reuse = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
         assert.equal(reuse.success, false);
         assert.equal(reuse.error, 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
     });
 
-    it('an expired session is rejected', async () => {
+    it('an expired (bound) session is rejected at completion time', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const past = new Date(Date.now() - 1000);
-        const session = await generateSubscriptionSession(900, { supabaseClient: db, now: new Date(Date.now() - 20 * 60 * 1000) });
-        const result = await completeSubscription(session.sessionToken, 2, 'passenger', { supabaseClient: db, now: new Date() });
+        await startAndBind(db, 900, 555000111, new Date(Date.now() - 20 * 60 * 1000));
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db, now: new Date() });
         assert.equal(result.success, false);
         assert.equal(result.error, 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
-        void past;
+    });
+
+    it('two sessions bound to the SAME telegram id (two different bookings started in quick succession): completion resolves the most recently bound one, the older stays open', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db, { bookingId: 900, tripId: 100 });
+        seedBookingAndTrip(db, { bookingId: 901, tripId: 100 });
+        const { session: sessionEarly } = await startAndBind(db, 900, 555000111);
+        const { session: sessionLate } = await startAndBind(db, 901, 555000111);
+        // Force a deterministic, unambiguous ordering rather than relying on
+        // real wall-clock granularity between two awaits in a fast test.
+        db._tables.booking_subscription_sessions.get(sessionEarly.sessionId).created_at = new Date(Date.now() - 60000).toISOString();
+        db._tables.booking_subscription_sessions.get(sessionLate.sessionId).created_at = new Date().toISOString();
+
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db, now: new Date() });
+        assert.equal(result.success, true);
+        assert.equal(result.bookingId, 901, 'the most recently bound session must win');
+
+        const olderSession = [...db._tables.booking_subscription_sessions.values()].find(r => r.booking_id === 900);
+        assert.ok(!olderSession.consumed_at, 'the older bound session must remain open, not silently consumed');
     });
 
     it('idempotent re-subscribe on an already-active follower logs no duplicate event', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const sessionA = await generateSubscriptionSession(900, { supabaseClient: db });
-        await completeSubscription(sessionA.sessionToken, 2, 'passenger', { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
 
-        const sessionB = await generateSubscriptionSession(900, { supabaseClient: db });
-        const result = await completeSubscription(sessionB.sessionToken, 2, 'passenger', { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
 
         assert.equal(result.success, true);
         assert.equal(result.event, 'already_active');
@@ -361,14 +467,14 @@ describe('completeSubscription — subscribed / resubscribed / idempotent, and a
     it('unsubscribe then re-subscribe logs "resubscribed", not a second "subscribed"', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const sessionA = await generateSubscriptionSession(900, { supabaseClient: db });
-        await completeSubscription(sessionA.sessionToken, 2, 'passenger', { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
 
         const unsub = await unsubscribeFollower(900, 2, { supabaseClient: db });
         assert.equal(unsub.success, true);
 
-        const sessionB = await generateSubscriptionSession(900, { supabaseClient: db });
-        const result = await completeSubscription(sessionB.sessionToken, 2, 'unknown', { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
+        const result = await completeSubscription(555000111, 2, 'unknown', { supabaseClient: db });
         assert.equal(result.event, 'resubscribed');
 
         const events = db._tables.booking_follower_events.filter(e => e.user_id === 2).map(e => e.event_type);
@@ -386,8 +492,8 @@ describe('completeSubscription — subscribed / resubscribed / idempotent, and a
     it('unsubscribe is soft: the row is never deleted, only flagged', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const session = await generateSubscriptionSession(900, { supabaseClient: db });
-        await completeSubscription(session.sessionToken, 2, 'passenger', { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
         await unsubscribeFollower(900, 2, { supabaseClient: db });
 
         const row = [...db._tables.booking_followers.values()].find(r => r.user_id === 2);
@@ -399,19 +505,19 @@ describe('completeSubscription — subscribed / resubscribed / idempotent, and a
     it('malformed/unrecognized role_declared never throws and is stored as "unknown"', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const session = await generateSubscriptionSession(900, { supabaseClient: db });
-        const result = await completeSubscription(session.sessionToken, 2, 'DROP TABLE users;--', { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
+        const result = await completeSubscription(555000111, 2, 'DROP TABLE users;--', { supabaseClient: db });
         assert.equal(result.success, true);
         const row = [...db._tables.booking_followers.values()].find(r => r.user_id === 2);
         assert.equal(row.role_declared, 'unknown');
     });
 
-    it('booking cancelled between session start and bot confirmation is caught at completion time too', async () => {
+    it('booking cancelled between bind and bot confirmation is caught at completion time too', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db);
-        const session = await generateSubscriptionSession(900, { supabaseClient: db });
+        await startAndBind(db, 900, 555000111);
         db._tables.bus_ticket_bookings.get(900).status = 'cancelled';
-        const result = await completeSubscription(session.sessionToken, 2, 'passenger', { supabaseClient: db });
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
         assert.equal(result.success, false);
         assert.equal(result.error, 'BOOKING_NOT_SUBSCRIBABLE');
     });
@@ -428,5 +534,49 @@ describe('Cross-flow isolation: a subscription token can never be used by the ol
         const claimResult = await resolveClaimSession(session.sessionToken, { supabaseClient: db });
         assert.equal(claimResult.isValid, false);
         assert.equal(claimResult.reason, 'SESSION_NOT_FOUND');
+    });
+});
+
+describe('getActiveFollowerCount — carrier-facing aggregate only', () => {
+    it('0 followers', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        assert.equal(await getActiveFollowerCount(900, { supabaseClient: db }), 0);
+    });
+
+    it('counts only active (non-unsubscribed) followers', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        await startAndBind(db, 900, 777000222);
+        await completeSubscription(777000222, 3, 'intermediary', { supabaseClient: db });
+        assert.equal(await getActiveFollowerCount(900, { supabaseClient: db }), 2);
+
+        await unsubscribeFollower(900, 2, { supabaseClient: db });
+        assert.equal(await getActiveFollowerCount(900, { supabaseClient: db }), 1);
+    });
+
+    it('never throws and returns 0 when the underlying table is unreachable', async () => {
+        const brokenClient = { from() { throw new Error('table does not exist'); } };
+        const count = await getActiveFollowerCount(900, { supabaseClient: brokenClient });
+        assert.equal(count, 0);
+    });
+});
+
+describe('Raw token lifecycle: never persisted anywhere after bind', () => {
+    it('the mock DB (standing in for both backend and bot-side storage) holds no row containing the raw token after bind — only its hash', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        const session = await generateSubscriptionSession(900, { supabaseClient: db });
+        await bindSubscriptionSession(session.sessionToken, 555000111, { supabaseClient: db });
+
+        for (const table of Object.values(db._tables)) {
+            if (!(table instanceof Map)) continue;
+            for (const row of table.values()) {
+                const serialized = JSON.stringify(row);
+                assert.ok(!serialized.includes(session.sessionToken), 'raw token leaked into a stored row');
+            }
+        }
     });
 });

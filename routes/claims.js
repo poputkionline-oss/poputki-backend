@@ -31,6 +31,8 @@ const { cleanPhoneForStorage } = require('../utils/phoneHelper');
 const { verifyTicketToken, extractBookingIdFromToken, buildFollowerTicketProjection } = require('../utils/ticketHelper');
 const {
     generateSubscriptionSession,
+    bindSubscriptionSession,
+    hasPendingSubscription,
     completeSubscription,
     unsubscribeFollower,
     isBookingSubscribable
@@ -958,16 +960,49 @@ router.post('/start-subscription', claimRateLimiter(10, 60000), async (req, res)
     }
 });
 
+// /bot/subscribe/bind — called ONCE, synchronously, from the bot's own
+// /start subscribe_<token> webhook handler, in the same request/response
+// cycle that received the raw token from the Telegram deep link. This is
+// the only point in the entire flow where the raw token is presented again
+// after being minted; the bot discards it immediately afterwards and never
+// persists it anywhere (not in bot_user_states, not in any bot-side table)
+// — see fn_bind_booking_subscription_session's doc comment in the
+// migration. From here on the session is addressed by bound_telegram_id.
+router.post('/bot/subscribe/bind', claimRateLimiter(20, 60000), requireClaimBotSecret, async (req, res) => {
+    if (!isSubscriptionModelEnabled()) {
+        return res.status(404).json({ error: 'NOT_FOUND', code: 'FEATURE_DISABLED' });
+    }
+
+    try {
+        const { sessionToken, telegramId } = req.body || {};
+        if (!sessionToken || !telegramId) {
+            return res.status(400).json({ error: 'sessionToken и telegramId обязательны', code: 'MISSING_PARAMS' });
+        }
+
+        const result = await bindSubscriptionSession(sessionToken, telegramId);
+        if (!result.success) {
+            return res.status(400).json({ error: result.error, code: result.error });
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Subscribe] bot/subscribe/bind failed:', err.message);
+        return res.status(500).json({ error: 'Не удалось начать добавление билета', code: 'BIND_FAILED' });
+    }
+});
+
+// /bot/subscribe — called after the bot receives the native Telegram
+// contact-share message. Deliberately takes NO session token/id at all: by
+// this point the bot no longer holds it (see /bot/subscribe/bind above),
+// only sender.id — the backend resolves the most recently bound,
+// still-valid session for that telegram id itself.
 router.post('/bot/subscribe', claimRateLimiter(20, 60000), requireClaimBotSecret, async (req, res) => {
     if (!isSubscriptionModelEnabled()) {
         return res.status(404).json({ error: 'NOT_FOUND', code: 'FEATURE_DISABLED' });
     }
 
     try {
-        const { sessionToken, telegramUser, telegramContact, roleDeclared } = req.body || {};
-        if (!sessionToken) {
-            return res.status(400).json({ error: 'Токен сессии обязателен', code: 'SESSION_TOKEN_REQUIRED' });
-        }
+        const { telegramUser, telegramContact, roleDeclared } = req.body || {};
 
         // Same anti-spoof invariant as the existing claim flow: the
         // Telegram-authenticated sender and the contact card's own user_id
@@ -980,15 +1015,27 @@ router.post('/bot/subscribe', claimRateLimiter(20, 60000), requireClaimBotSecret
         }
 
         const claimDb = getServiceRoleClient();
+
+        // Cheap existence check BEFORE touching the users table at all: the
+        // bot calls this endpoint opportunistically for every contact share
+        // that isn't an in-flight ticket claim (it no longer tracks any
+        // subscribe-specific state of its own — see attemptSubscribeFromContact
+        // in the bot repo), so most calls here have no bound session at all.
+        // Without this early exit, resolveOrCreateTelegramPassenger below
+        // would link/create user records on every ordinary contact share.
+        const pending = await hasPendingSubscription(telegramUser.id, { supabaseClient: claimDb });
+        if (!pending) {
+            return res.status(400).json({ error: 'Нет активной сессии подписки', code: 'SESSION_INVALID_EXPIRED_OR_CONSUMED' });
+        }
+
         const resolved = await resolveOrCreateTelegramPassenger(claimDb, telegramUser, telegramContact);
         if (!resolved.success) {
             return res.status(400).json({ error: resolved.error, code: resolved.error });
         }
 
-        const result = await completeSubscription(sessionToken, resolved.user.id, roleDeclared, { supabaseClient: claimDb });
+        const result = await completeSubscription(telegramUser.id, resolved.user.id, roleDeclared, { supabaseClient: claimDb });
         if (!result.success) {
-            const status = result.error === 'BOOKING_NOT_SUBSCRIBABLE' ? 400 : 400;
-            return res.status(status).json({ error: result.error, code: result.error });
+            return res.status(400).json({ error: result.error, code: result.error });
         }
 
         const { data: booking } = await claimDb.from('bus_ticket_bookings').select('*').eq('id', result.bookingId).maybeSingle();

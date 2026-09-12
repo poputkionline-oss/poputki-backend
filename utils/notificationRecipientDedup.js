@@ -56,11 +56,17 @@ function dedupeNotificationRecipients(candidates) {
  */
 function buildNotificationCandidates(booking, followers = []) {
     const candidates = [];
-    if (booking?.claimed_by_user_id) {
-        candidates.push({ userId: booking.claimed_by_user_id, source: 'claimed_by_user_id' });
-    }
-    if (booking?.passenger_id) {
-        candidates.push({ userId: booking.passenger_id, source: 'passenger_id' });
+    // Mirrors routes/busAdmin.js's own `effectiveUserId = b.claimed_by_user_id
+    // || b.passenger_id` exactly — these are NOT two independent recipients.
+    // For a manual booking, passenger_id is set to the CARRIER's own user id
+    // at booking-creation time (routes/busAdmin.js's manual-booking insert:
+    // "passenger_id: req.carrier.user_id // Authenticated carrier manager
+    // (legacy surrogate)") — it is a fallback identity for the same single
+    // "owner" slot, never a second, additional recipient alongside
+    // claimed_by_user_id.
+    const effectiveUserId = booking?.claimed_by_user_id || booking?.passenger_id;
+    if (effectiveUserId) {
+        candidates.push({ userId: effectiveUserId, source: booking?.claimed_by_user_id ? 'claimed_by_user_id' : 'passenger_id' });
     }
     for (const follower of followers) {
         if (follower && follower.notifications_enabled) {

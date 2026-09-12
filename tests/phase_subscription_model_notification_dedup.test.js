@@ -56,12 +56,12 @@ describe('dedupeNotificationRecipients', () => {
 });
 
 describe('buildNotificationCandidates', () => {
-    it('a booking with claimed_by_user_id AND an unrelated follower notifies both, once each', () => {
+    it('a booking with claimed_by_user_id AND an unrelated follower notifies both, once each (passenger_id is a fallback for the SAME owner slot, not a second recipient, when claimed_by_user_id is already set)', () => {
         const booking = { claimed_by_user_id: 5, passenger_id: 1 };
         const followers = [{ user_id: 3, notifications_enabled: true }];
         const result = buildNotificationCandidates(booking, followers);
         const ids = result.map(r => r.userId).sort();
-        assert.deepEqual(ids, [1, 3, 5]);
+        assert.deepEqual(ids, [3, 5]);
     });
 
     it('a follower who disabled notifications is excluded entirely', () => {

@@ -61,9 +61,17 @@ describe('Feature flag MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED=false (default)
         assert.equal(body.error, 'NOT_FOUND');
     });
 
+    it('POST /bot/subscribe/bind -> 404 even with a valid bot secret', async () => {
+        const { status, body } = await post('/bot/subscribe/bind',
+            { sessionToken: 'x', telegramId: 1 },
+            { 'X-Claim-Bot-Secret': 'test-claim-bot-secret' });
+        assert.equal(status, 404);
+        assert.equal(body.code, 'FEATURE_DISABLED');
+    });
+
     it('POST /bot/subscribe -> 404 even with a valid bot secret', async () => {
         const { status, body } = await post('/bot/subscribe',
-            { sessionToken: 'x', telegramUser: { id: 1 }, telegramContact: { user_id: 1, phone_number: '+992900000000' } },
+            { telegramUser: { id: 1 }, telegramContact: { user_id: 1, phone_number: '+992900000000' } },
             { 'X-Claim-Bot-Secret': 'test-claim-bot-secret' });
         assert.equal(status, 404);
         assert.equal(body.code, 'FEATURE_DISABLED');
@@ -136,13 +144,37 @@ describe('Feature flag = true — new routes reachable, still fail closed before
         assert.equal(body.code, 'TELEGRAM_CONTACT_USER_ID_MISMATCH');
     });
 
-    it('POST /bot/subscribe without sessionToken -> 400 SESSION_TOKEN_REQUIRED', async () => {
+    it('POST /bot/subscribe takes NO session token/id at all (the bot only ever has telegramUser/telegramContact by this point)', async () => {
+        // A well-formed, non-spoofed contact but no matching bound session
+        // in this test's DB still exercises the route past the anti-spoof
+        // check and into completeSubscription() — proving the endpoint
+        // never required a session token in its request contract.
         const { status, body } = await post('/bot/subscribe', {
             telegramUser: { id: 1 },
             telegramContact: { user_id: 1, phone_number: '+992900000000' }
         }, { 'X-Claim-Bot-Secret': 'test-claim-bot-secret' });
+        assert.notEqual(body.code, 'SESSION_TOKEN_REQUIRED');
+        assert.notEqual(status, 404);
+    });
+
+    it('POST /bot/subscribe/bind without sessionToken/telegramId -> 400 MISSING_PARAMS', async () => {
+        const { status, body } = await post('/bot/subscribe/bind', {}, { 'X-Claim-Bot-Secret': 'test-claim-bot-secret' });
         assert.equal(status, 400);
-        assert.equal(body.code, 'SESSION_TOKEN_REQUIRED');
+        assert.equal(body.code, 'MISSING_PARAMS');
+    });
+
+    it('POST /bot/subscribe/bind without X-Claim-Bot-Secret -> 401', async () => {
+        const { status, body } = await post('/bot/subscribe/bind', { sessionToken: 'x', telegramId: 1 });
+        assert.equal(status, 401);
+        assert.equal(body.code, 'BOT_CLAIM_UNAUTHORIZED');
+    });
+
+    it('POST /bot/subscribe/bind -> 404 when the feature flag is off', async () => {
+        delete process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED;
+        const { status, body } = await post('/bot/subscribe/bind', { sessionToken: 'x', telegramId: 1 }, { 'X-Claim-Bot-Secret': 'test-claim-bot-secret' });
+        assert.equal(status, 404);
+        assert.equal(body.code, 'FEATURE_DISABLED');
+        process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED = 'true';
     });
 
     it('POST /bot/unsubscribe without required params -> 400 MISSING_PARAMS', async () => {
@@ -155,6 +187,26 @@ describe('Feature flag = true — new routes reachable, still fail closed before
         const { status, body } = await post('/bot/unsubscribe', { bookingId: 1, telegramUserId: 1 }, { 'X-Claim-Bot-Secret': 'wrong-secret' });
         assert.equal(status, 401);
         assert.equal(body.code, 'BOT_CLAIM_UNAUTHORIZED');
+    });
+});
+
+describe('/bot/subscribe source-level ordering — hasPendingSubscription gates resolveOrCreateTelegramPassenger', () => {
+    const fs = require('node:fs');
+    const content = fs.readFileSync(require.resolve('../routes/claims.js'), 'utf8');
+    const block = content.slice(
+        content.indexOf("router.post('/bot/subscribe',"),
+        content.indexOf("router.post('/bot/unsubscribe',")
+    );
+
+    it('calls hasPendingSubscription before resolveOrCreateTelegramPassenger, so an ordinary contact share never touches the users table', () => {
+        const pendingIdx = block.indexOf('hasPendingSubscription(');
+        const resolveIdx = block.indexOf('resolveOrCreateTelegramPassenger(');
+        assert.ok(pendingIdx !== -1 && resolveIdx !== -1);
+        assert.ok(pendingIdx < resolveIdx);
+    });
+
+    it('returns the same SESSION_INVALID_EXPIRED_OR_CONSUMED code the bot already treats as "nothing pending" when hasPendingSubscription is false', () => {
+        assert.match(block, /if\s*\(!pending\)\s*\{\s*return res\.status\(400\)\.json\(\{[^}]*code:\s*'SESSION_INVALID_EXPIRED_OR_CONSUMED'/);
     });
 });
 

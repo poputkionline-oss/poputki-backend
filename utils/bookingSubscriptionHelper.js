@@ -131,18 +131,21 @@ async function generateSubscriptionSession(bookingId, options = {}) {
 }
 
 /**
- * Completes a subscription: verifies the raw token against the stored hash,
- * TTL, purpose and consumed_at, re-checks booking/trip availability, and
- * atomically upserts booking_followers + a booking_follower_events row.
- * Idempotent for an already-active follower (no duplicate event).
+ * Binds a just-started subscription session to a Telegram user id. This is
+ * the ONLY function that ever sees the raw token again after
+ * generateSubscriptionSession() minted it — called once, synchronously,
+ * from the bot's /start subscribe_<token> webhook handler. The raw token is
+ * discarded by the caller immediately afterwards: it is never written to
+ * any table, bot-side (bot_user_states or otherwise) or backend-side, and
+ * this function itself only ever persists the hash it computes here (which
+ * was already being stored anyway) plus the telegram id.
  */
-async function completeSubscription(sessionToken, userId, roleDeclared, options = {}) {
+async function bindSubscriptionSession(sessionToken, telegramId, options = {}) {
     const dbClient = getSubscriptionDb(options);
     if (!sessionToken || typeof sessionToken !== 'string') {
         return { success: false, error: 'INVALID_SESSION_TOKEN' };
     }
     const tokenHash = hashSubscriptionToken(sessionToken.trim());
-    const safeRole = normalizeRoleDeclared(roleDeclared);
 
     if (isInjectedMock(options)) {
         const now = options.now || new Date();
@@ -154,6 +157,94 @@ async function completeSubscription(sessionToken, userId, roleDeclared, options 
 
         if (!session || session.purpose !== 'booking_subscription' || session.consumed_at
             || new Date(session.expires_at) <= now) {
+            return { success: false, error: 'SESSION_INVALID_EXPIRED_OR_CONSUMED' };
+        }
+
+        await dbClient.from('booking_subscription_sessions').update({ bound_telegram_id: telegramId }).eq('id', session.id);
+        return { success: true };
+    }
+
+    const { data, error } = await dbClient.rpc('fn_bind_booking_subscription_session', {
+        p_session_token_hash: tokenHash,
+        p_telegram_id: telegramId
+    });
+
+    if (error || !data || data.success !== true) {
+        return { success: false, error: (data && data.error) || (error && error.message) || 'BIND_SUBSCRIPTION_SESSION_FAILED' };
+    }
+    return { success: true };
+}
+
+/**
+ * Cheap, side-effect-free existence check: is there ANY bound, unconsumed,
+ * unexpired subscription session for this telegramId? Used by routes/
+ * claims.js's /bot/subscribe handler to decide, BEFORE touching the users
+ * table at all, whether an incoming contact-share is actually a subscribe
+ * completion attempt or just an ordinary contact share the bot opportunistically
+ * offered to this endpoint (see api/bot-claim.js's attemptSubscribeFromContact
+ * in the bot repo). Without this early check, resolveOrCreateTelegramPassenger
+ * would run — and potentially link/create user records — on every contact
+ * share, not just ones that actually intended to subscribe.
+ */
+async function hasPendingSubscription(telegramId, options = {}) {
+    const dbClient = getSubscriptionDb(options);
+    const now = options.now || new Date();
+
+    if (isInjectedMock(options)) {
+        const allSessions = [...(dbClient._tables?.booking_subscription_sessions?.values?.() || [])];
+        return allSessions.some(r => String(r.bound_telegram_id) === String(telegramId)
+            && r.purpose === 'booking_subscription' && !r.consumed_at && new Date(r.expires_at) > now);
+    }
+
+    try {
+        const { data, error } = await dbClient
+            .from('booking_subscription_sessions')
+            .select('id')
+            .eq('bound_telegram_id', telegramId)
+            .eq('purpose', 'booking_subscription')
+            .is('consumed_at', null)
+            .gt('expires_at', now.toISOString())
+            .limit(1);
+
+        if (error) return false;
+        return Array.isArray(data) && data.length > 0;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Completes a subscription for whichever session was most recently bound to
+ * this telegramId (see bindSubscriptionSession above) — NOT by raw token,
+ * which the bot no longer holds by the time the Telegram contact-share
+ * message arrives. Re-checks purpose/consumed_at/TTL and booking/trip
+ * availability, and atomically upserts booking_followers + a
+ * booking_follower_events row. Idempotent for an already-active follower
+ * (no duplicate event). If more than one session is currently bound to this
+ * telegramId (e.g. two different manual bookings' subscribe links opened in
+ * quick succession), only the most recently bound one is completed — see
+ * the migration's own comment on fn_complete_booking_subscription for why
+ * this is a Telegram UX constraint, not an added limitation.
+ */
+async function completeSubscription(telegramId, userId, roleDeclared, options = {}) {
+    const dbClient = getSubscriptionDb(options);
+    const safeRole = normalizeRoleDeclared(roleDeclared);
+
+    if (isInjectedMock(options)) {
+        const now = options.now || new Date();
+        // The lightweight test mock only supports single-row select/eq
+        // lookups; emulate "most recently bound, still-valid session for
+        // this telegramId" by scanning the mock's own in-memory rows
+        // directly (production does the equivalent as one indexed SQL query
+        // inside fn_complete_booking_subscription — see the migration).
+        const allSessions = [...(dbClient._tables?.booking_subscription_sessions?.values?.() || [])];
+        const candidates = allSessions
+            .filter(r => String(r.bound_telegram_id) === String(telegramId)
+                && r.purpose === 'booking_subscription' && !r.consumed_at && new Date(r.expires_at) > now)
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        const session = candidates[0] || null;
+
+        if (!session) {
             return { success: false, error: 'SESSION_INVALID_EXPIRED_OR_CONSUMED' };
         }
 
@@ -190,7 +281,7 @@ async function completeSubscription(sessionToken, userId, roleDeclared, options 
     }
 
     const { data, error } = await dbClient.rpc('fn_complete_booking_subscription', {
-        p_session_hash: tokenHash,
+        p_telegram_id: telegramId,
         p_user_id: userId,
         p_role_declared: safeRole
     });
@@ -199,6 +290,33 @@ async function completeSubscription(sessionToken, userId, roleDeclared, options 
         return { success: false, error: (data && data.error) || (error && error.message) || 'COMPLETE_SUBSCRIPTION_FAILED' };
     }
     return { success: true, bookingId: data.booking_id, event: data.event };
+}
+
+/**
+ * Carrier-facing aggregate only — count of currently active (not
+ * unsubscribed) followers for a booking. Never returns user_id, telegram_id,
+ * username, phone, or name. Returns 0 (never throws) when the subscription
+ * model tables aren't reachable — e.g. the feature flag is off in an
+ * environment where the migration hasn't been applied — so the caller's
+ * existing response shape is never broken by this being additive.
+ */
+async function getActiveFollowerCount(bookingId, options = {}) {
+    const dbClient = getSubscriptionDb(options);
+    try {
+        if (isInjectedMock(options)) {
+            const all = [...(dbClient._tables?.booking_followers?.values?.() || [])];
+            return all.filter(r => String(r.booking_id) === String(bookingId) && !r.unsubscribed_at).length;
+        }
+        const { count, error } = await dbClient
+            .from('booking_followers')
+            .select('id', { count: 'exact', head: true })
+            .eq('booking_id', bookingId)
+            .is('unsubscribed_at', null);
+        if (error) return 0;
+        return count || 0;
+    } catch {
+        return 0;
+    }
 }
 
 async function unsubscribeFollower(bookingId, userId, options = {}) {
@@ -239,6 +357,9 @@ module.exports = {
     isBookingSubscribable,
     normalizeRoleDeclared,
     generateSubscriptionSession,
+    bindSubscriptionSession,
+    hasPendingSubscription,
     completeSubscription,
-    unsubscribeFollower
+    unsubscribeFollower,
+    getActiveFollowerCount
 };
