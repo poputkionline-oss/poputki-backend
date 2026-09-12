@@ -160,7 +160,27 @@ async function bindSubscriptionSession(sessionToken, telegramId, options = {}) {
             return { success: false, error: 'SESSION_INVALID_EXPIRED_OR_CONSUMED' };
         }
 
-        await dbClient.from('booking_subscription_sessions').update({ bound_telegram_id: telegramId }).eq('id', session.id);
+        // superseded_at is explicitly cleared here too — re-opening a
+        // previously-superseded link is itself a fresh bind action and must
+        // reactivate it (mirrors fn_bind_booking_subscription_session).
+        await dbClient.from('booking_subscription_sessions').update({ bound_telegram_id: telegramId, superseded_at: null }).eq('id', session.id);
+
+        // Mirrors fn_bind_booking_subscription_session's own supersede step:
+        // every OTHER still-open session already bound to this SAME
+        // telegramId is marked superseded, so at most one non-superseded
+        // bound session can ever exist per telegramId (see the migration's
+        // comment on the bound_telegram_id column for why this must not be
+        // inferred from created_at/ORDER BY at completion time instead).
+        const allSessions = [...(dbClient._tables?.booking_subscription_sessions?.values?.() || [])];
+        for (const row of allSessions) {
+            if (row.id !== session.id
+                && String(row.bound_telegram_id) === String(telegramId)
+                && !row.consumed_at
+                && !row.superseded_at) {
+                row.superseded_at = now.toISOString();
+            }
+        }
+
         return { success: true };
     }
 
@@ -193,7 +213,7 @@ async function hasPendingSubscription(telegramId, options = {}) {
     if (isInjectedMock(options)) {
         const allSessions = [...(dbClient._tables?.booking_subscription_sessions?.values?.() || [])];
         return allSessions.some(r => String(r.bound_telegram_id) === String(telegramId)
-            && r.purpose === 'booking_subscription' && !r.consumed_at && new Date(r.expires_at) > now);
+            && r.purpose === 'booking_subscription' && !r.consumed_at && !r.superseded_at && new Date(r.expires_at) > now);
     }
 
     try {
@@ -203,6 +223,7 @@ async function hasPendingSubscription(telegramId, options = {}) {
             .eq('bound_telegram_id', telegramId)
             .eq('purpose', 'booking_subscription')
             .is('consumed_at', null)
+            .is('superseded_at', null)
             .gt('expires_at', now.toISOString())
             .limit(1);
 
@@ -233,14 +254,18 @@ async function completeSubscription(telegramId, userId, roleDeclared, options = 
     if (isInjectedMock(options)) {
         const now = options.now || new Date();
         // The lightweight test mock only supports single-row select/eq
-        // lookups; emulate "most recently bound, still-valid session for
-        // this telegramId" by scanning the mock's own in-memory rows
-        // directly (production does the equivalent as one indexed SQL query
-        // inside fn_complete_booking_subscription — see the migration).
+        // lookups; emulate the real RPC's lookup by scanning the mock's own
+        // in-memory rows directly (production does the equivalent as one
+        // indexed SQL query inside fn_complete_booking_subscription — see
+        // the migration). superseded_at IS NULL is the load-bearing filter
+        // for correctness (bindSubscriptionSession's own mock path already
+        // guarantees at most one non-superseded row per telegramId) — the
+        // ORDER BY below is only a defensive tie-breaker, exactly mirroring
+        // the real RPC.
         const allSessions = [...(dbClient._tables?.booking_subscription_sessions?.values?.() || [])];
         const candidates = allSessions
             .filter(r => String(r.bound_telegram_id) === String(telegramId)
-                && r.purpose === 'booking_subscription' && !r.consumed_at && new Date(r.expires_at) > now)
+                && r.purpose === 'booking_subscription' && !r.consumed_at && !r.superseded_at && new Date(r.expires_at) > now)
             .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
         const session = candidates[0] || null;
 
@@ -305,13 +330,21 @@ async function getActiveFollowerCount(bookingId, options = {}) {
     try {
         if (isInjectedMock(options)) {
             const all = [...(dbClient._tables?.booking_followers?.values?.() || [])];
-            return all.filter(r => String(r.booking_id) === String(bookingId) && !r.unsubscribed_at).length;
+            return all.filter(r => String(r.booking_id) === String(bookingId) && !r.unsubscribed_at && r.notifications_enabled).length;
         }
+        // Must mirror EXACTLY the same predicate routes/busAdmin.js's trip-
+        // edit notification fan-out uses to decide who actually gets
+        // notified (unsubscribed_at IS NULL AND notifications_enabled =
+        // true) — otherwise the carrier-facing count could report someone
+        // as an active subscriber who has muted notifications (schema
+        // allows notifications_enabled and unsubscribed_at to be set
+        // independently) and would never actually be messaged.
         const { count, error } = await dbClient
             .from('booking_followers')
             .select('id', { count: 'exact', head: true })
             .eq('booking_id', bookingId)
-            .is('unsubscribed_at', null);
+            .is('unsubscribed_at', null)
+            .eq('notifications_enabled', true);
         if (error) return 0;
         return count || 0;
     } catch {

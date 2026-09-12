@@ -84,4 +84,49 @@ describe('buildNotificationCandidates', () => {
         const result = buildNotificationCandidates(booking, followers);
         assert.deepEqual(result.map(r => r.userId).sort(), [2, 3]);
     });
+
+    it('passenger_id and claimed_by_user_id identical (same person): exactly one notification, not two', () => {
+        const booking = { claimed_by_user_id: 7, passenger_id: 7 };
+        const result = buildNotificationCandidates(booking, []);
+        assert.deepEqual(result.map(r => r.userId), [7]);
+    });
+
+    it('passenger_id and claimed_by_user_id DIFFERENT: still exactly one notification — for this booking model passenger_id is never an independently legitimate second addressee once claimed_by_user_id is set (it is the carrier\'s own surrogate id at manual-booking creation time, not a second real person; claiming a booking is a full ownership handoff, not an addition) — never merge them by any other means (phone/name/role), simply never treat passenger_id as live once claimed_by_user_id exists', () => {
+        const booking = { claimed_by_user_id: 5, passenger_id: 1 };
+        const result = buildNotificationCandidates(booking, []);
+        assert.deepEqual(result.map(r => r.userId), [5]);
+        assert.equal(result.length, 1);
+    });
+
+    it('a follower who IS the passenger_id (booking not yet claimed): exactly one notification, not two', () => {
+        const booking = { claimed_by_user_id: null, passenger_id: 4 };
+        const followers = [{ user_id: 4, notifications_enabled: true }];
+        const result = buildNotificationCandidates(booking, followers);
+        assert.deepEqual(result.map(r => r.userId), [4]);
+    });
+
+    it('two DIFFERENT followers on an unclaimed booking with no passenger: both are notified, once each', () => {
+        const booking = { claimed_by_user_id: null, passenger_id: null };
+        const followers = [
+            { user_id: 11, notifications_enabled: true },
+            { user_id: 12, notifications_enabled: true }
+        ];
+        const result = buildNotificationCandidates(booking, followers);
+        assert.deepEqual(result.map(r => r.userId).sort((a, b) => a - b), [11, 12]);
+        assert.equal(result.length, 2, 'never collapsed into one — they are genuinely distinct people');
+    });
+
+    it('never merges two distinct followers by a shared/similar phone, name, or role — only exact userId equality dedups', () => {
+        // role_declared/notes such as a matching phone or display name are
+        // NOT inputs to this function at all — only user_id is compared.
+        // Two different platform accounts that happen to share a phone
+        // number (e.g. a family plan) must never be collapsed into one.
+        const booking = { claimed_by_user_id: null, passenger_id: null };
+        const followers = [
+            { user_id: 21, notifications_enabled: true, role_declared: 'passenger' },
+            { user_id: 22, notifications_enabled: true, role_declared: 'passenger' } // same declared role, different user
+        ];
+        const result = buildNotificationCandidates(booking, followers);
+        assert.deepEqual(result.map(r => r.userId).sort((a, b) => a - b), [21, 22]);
+    });
 });

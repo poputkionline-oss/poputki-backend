@@ -21,6 +21,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { buildNotificationCandidates } = require('../utils/notificationRecipientDedup');
+const { processTripChangeOutbox } = require('../utils/tripChangeNotificationService');
 
 const busAdminSource = fs.readFileSync(path.resolve(__dirname, '../routes/busAdmin.js'), 'utf-8');
 
@@ -137,5 +138,41 @@ describe('Feature flag = false — trip-edit notification fan-out fully reverts 
         const booking = { claimed_by_user_id: null, passenger_id: 1 };
         const candidates = buildNotificationCandidates(booking, []);
         assert.deepEqual(candidates.map(c => c.userId), [1]);
+    });
+});
+
+describe('End-to-end delivery isolation: one recipient\'s outbox row failing never blocks another\'s (real processTripChangeOutbox, not a reimplementation)', () => {
+    it('a malformed-payload row (the online-claim owner, say) is marked failed while a follower\'s valid row in the SAME batch is still delivered', async () => {
+        // Two outbox rows for the same trip-change event, exactly as
+        // routes/busAdmin.js's trip-edit handler would produce: one row
+        // whose payload is missing everything processTripChangeOutbox needs
+        // to render a message (simulating any real-world prep failure —
+        // corrupt payload, missing trip/booking data, etc.), and one
+        // follower row with a normal, valid payload.
+        const rows = [
+            { id: 501, booking_id: 900, recipient_user_id: 5, recipient_telegram_id: 111, status: 'pending', payload: {} },
+            { id: 502, booking_id: 900, recipient_user_id: 8, recipient_telegram_id: 222, status: 'pending', payload: { text: 'Изменения в вашем рейсе' } }
+        ];
+        const updates = [];
+        const fakeClient = {
+            from() {
+                return {
+                    select() { return { eq() { return { limit: () => Promise.resolve({ data: rows, error: null }) }; } }; },
+                    update(patch) {
+                        return { eq(_field, id) { updates.push({ id, patch }); return Promise.resolve({ error: null }); } };
+                    }
+                };
+            }
+        };
+
+        const stats = await processTripChangeOutbox({ supabaseClient: fakeClient, batchSize: 10, dryRun: true });
+
+        assert.equal(stats.failed, 1, 'the malformed row must fail on its own');
+        assert.equal(stats.sent, 1, 'the follower\'s valid row must still succeed, unaffected by the other row\'s failure');
+
+        const row501Update = updates.find(u => u.id === 501);
+        const row502Update = updates.find(u => u.id === 502);
+        assert.equal(row501Update.patch.status, 'failed');
+        assert.equal(row502Update.patch.status, 'sent');
     });
 });

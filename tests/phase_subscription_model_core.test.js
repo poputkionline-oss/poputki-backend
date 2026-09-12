@@ -336,6 +336,31 @@ describe('bindSubscriptionSession — the only point the raw token is used again
         const bind = await bindSubscriptionSession('', 555000111, { supabaseClient: db });
         assert.equal(bind.success, false);
     });
+
+    it('a second bind for the same telegram_id supersedes the first, but re-opening the FIRST link again reactivates it and supersedes the second', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db, { bookingId: 900, tripId: 100 });
+        seedBookingAndTrip(db, { bookingId: 901, tripId: 100 });
+        const sessionA = await generateSubscriptionSession(900, { supabaseClient: db });
+        const sessionB = await generateSubscriptionSession(901, { supabaseClient: db });
+
+        await bindSubscriptionSession(sessionA.sessionToken, 555000111, { supabaseClient: db });
+        await bindSubscriptionSession(sessionB.sessionToken, 555000111, { supabaseClient: db });
+        assert.ok(db._tables.booking_subscription_sessions.get(sessionA.sessionId).superseded_at, 'A superseded by B');
+
+        // User goes back and re-opens A's link (re-triggers /start
+        // subscribe_<tokenA> in the bot, hence a fresh bind(A) call).
+        const rebindA = await bindSubscriptionSession(sessionA.sessionToken, 555000111, { supabaseClient: db });
+        assert.equal(rebindA.success, true);
+
+        const rowA = db._tables.booking_subscription_sessions.get(sessionA.sessionId);
+        const rowB = db._tables.booking_subscription_sessions.get(sessionB.sessionId);
+        assert.equal(rowA.superseded_at, null, 'A must be reactivated (superseded_at cleared)');
+        assert.ok(rowB.superseded_at, 'B must now be the superseded one');
+
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        assert.equal(result.bookingId, 900, 'completion must resolve A, the most recently (re)bound session');
+    });
 });
 
 describe('hasPendingSubscription — cheap existence check, used by routes/claims.js before touching the users table', () => {
@@ -430,23 +455,100 @@ describe('completeSubscription — keyed by telegram id, subscribed / resubscrib
         assert.equal(result.error, 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
     });
 
-    it('two sessions bound to the SAME telegram id (two different bookings started in quick succession): completion resolves the most recently bound one, the older stays open', async () => {
+    it('one user opens booking A then booking B\'s subscribe link (bind order A, B): completion resolves ONLY B, never both, regardless of which session was created earlier', async () => {
         const db = createMockDb();
         seedBookingAndTrip(db, { bookingId: 900, tripId: 100 });
         seedBookingAndTrip(db, { bookingId: 901, tripId: 100 });
-        const { session: sessionEarly } = await startAndBind(db, 900, 555000111);
-        const { session: sessionLate } = await startAndBind(db, 901, 555000111);
-        // Force a deterministic, unambiguous ordering rather than relying on
-        // real wall-clock granularity between two awaits in a fast test.
-        db._tables.booking_subscription_sessions.get(sessionEarly.sessionId).created_at = new Date(Date.now() - 60000).toISOString();
-        db._tables.booking_subscription_sessions.get(sessionLate.sessionId).created_at = new Date().toISOString();
+        // B's underlying session row is deliberately made the OLDER one by
+        // created_at (i.e. the carrier generated link B's session before
+        // link A's) — proving the outcome tracks BIND order, not creation
+        // order, which is exactly the ambiguity a naive "ORDER BY
+        // created_at DESC" would get wrong.
+        const sessionB = await generateSubscriptionSession(901, { supabaseClient: db });
+        db._tables.booking_subscription_sessions.get(sessionB.sessionId).created_at = new Date(Date.now() - 60000).toISOString();
+        const sessionA = await generateSubscriptionSession(900, { supabaseClient: db });
 
-        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db, now: new Date() });
+        // Bind order: A first, then B (the user clicks A's link, then B's).
+        await bindSubscriptionSession(sessionA.sessionToken, 555000111, { supabaseClient: db });
+        const bindB = await bindSubscriptionSession(sessionB.sessionToken, 555000111, { supabaseClient: db });
+        assert.equal(bindB.success, true);
+
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
         assert.equal(result.success, true);
-        assert.equal(result.bookingId, 901, 'the most recently bound session must win');
+        assert.equal(result.bookingId, 901, 'the most recently BOUND session (B) must win, even though it was created earlier');
 
-        const olderSession = [...db._tables.booking_subscription_sessions.values()].find(r => r.booking_id === 900);
-        assert.ok(!olderSession.consumed_at, 'the older bound session must remain open, not silently consumed');
+        const sessionARow = [...db._tables.booking_subscription_sessions.values()].find(r => r.booking_id === 900);
+        assert.ok(sessionARow.superseded_at, 'A must be marked superseded the instant B is bound');
+        assert.ok(!sessionARow.consumed_at, 'A must never be silently consumed — only superseded');
+
+        // A second, independent completion attempt must never also resolve
+        // the superseded session A — there is exactly one outcome, not two.
+        const secondAttempt = await completeSubscription(555000111, 3, 'passenger', { supabaseClient: db });
+        assert.equal(secondAttempt.success, false, 'B is already consumed and A is superseded — nothing left to complete');
+    });
+
+    it('a bind for one telegram_id never supersedes a DIFFERENT telegram_id\'s session (an intermediary and a passenger with different telegram accounts both work independently)', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db, { bookingId: 900, tripId: 100 });
+        seedBookingAndTrip(db, { bookingId: 901, tripId: 100 });
+        await startAndBind(db, 900, 555000111); // passenger's own telegram
+        await startAndBind(db, 901, 777000222); // intermediary's own, different telegram
+
+        const passengerResult = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        const intermediaryResult = await completeSubscription(777000222, 3, 'intermediary', { supabaseClient: db });
+
+        assert.equal(passengerResult.success, true);
+        assert.equal(passengerResult.bookingId, 900);
+        assert.equal(intermediaryResult.success, true);
+        assert.equal(intermediaryResult.bookingId, 901);
+    });
+
+    it('repeat contact-share after a completed subscription never creates a second subscription for that telegram_id', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        const first = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        assert.equal(first.success, true);
+
+        // The bot re-sends the same contact-share (e.g. a duplicate webhook
+        // delivery) with no new bind in between — there is no bound,
+        // unconsumed session left for this telegram_id anymore.
+        const repeat = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        assert.equal(repeat.success, false);
+        assert.equal(repeat.error, 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
+        assert.equal(db._tables.booking_followers.size, 1, 'still exactly one follower row, never a duplicate');
+    });
+
+    it('a superseded session can never be completed, even before its own TTL expires', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db, { bookingId: 900, tripId: 100 });
+        seedBookingAndTrip(db, { bookingId: 901, tripId: 100 });
+        const sessionA = await generateSubscriptionSession(900, { supabaseClient: db });
+        await bindSubscriptionSession(sessionA.sessionToken, 555000111, { supabaseClient: db });
+        const sessionB = await generateSubscriptionSession(901, { supabaseClient: db });
+        await bindSubscriptionSession(sessionB.sessionToken, 555000111, { supabaseClient: db }); // supersedes A
+
+        const sessionARow = db._tables.booking_subscription_sessions.get(sessionA.sessionId);
+        assert.ok(sessionARow.superseded_at);
+        assert.ok(new Date(sessionARow.expires_at) > new Date(), 'A has not actually expired, only been superseded');
+
+        const result = await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        assert.equal(result.bookingId, 901, 'only B (the non-superseded session) can ever be completed');
+    });
+
+    it('binding a second session for the same telegram_id leaves exactly one non-superseded bound session, never two', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db, { bookingId: 900, tripId: 100 });
+        seedBookingAndTrip(db, { bookingId: 901, tripId: 100 });
+        const sessionA = await generateSubscriptionSession(900, { supabaseClient: db });
+        const sessionB = await generateSubscriptionSession(901, { supabaseClient: db });
+        await bindSubscriptionSession(sessionA.sessionToken, 555000111, { supabaseClient: db });
+        await bindSubscriptionSession(sessionB.sessionToken, 555000111, { supabaseClient: db });
+
+        const active = [...db._tables.booking_subscription_sessions.values()]
+            .filter(r => String(r.bound_telegram_id) === '555000111' && !r.consumed_at && !r.superseded_at);
+        assert.equal(active.length, 1, 'at most one active bound session per telegram_id, ever');
+        assert.equal(active[0].booking_id, 901);
     });
 
     it('idempotent re-subscribe on an already-active follower logs no duplicate event', async () => {
@@ -561,6 +663,22 @@ describe('getActiveFollowerCount — carrier-facing aggregate only', () => {
         const brokenClient = { from() { throw new Error('table does not exist'); } };
         const count = await getActiveFollowerCount(900, { supabaseClient: brokenClient });
         assert.equal(count, 0);
+    });
+
+    it('a follower with notifications muted (notifications_enabled:false) but NOT unsubscribed is excluded from the count — it must mirror exactly who the trip-edit fan-out would actually notify', async () => {
+        const db = createMockDb();
+        seedBookingAndTrip(db);
+        await startAndBind(db, 900, 555000111);
+        await completeSubscription(555000111, 2, 'passenger', { supabaseClient: db });
+        assert.equal(await getActiveFollowerCount(900, { supabaseClient: db }), 1);
+
+        // Mute without unsubscribing — a distinct state the schema allows
+        // (unsubscribed_at and notifications_enabled are independent
+        // columns), which getActiveFollowerCount must not conflate with an
+        // active, notifiable subscriber.
+        const row = [...db._tables.booking_followers.values()].find(r => r.booking_id === 900 && r.user_id === 2);
+        row.notifications_enabled = false;
+        assert.equal(await getActiveFollowerCount(900, { supabaseClient: db }), 0);
     });
 });
 

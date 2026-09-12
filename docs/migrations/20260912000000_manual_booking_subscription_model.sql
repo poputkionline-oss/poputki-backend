@@ -28,22 +28,35 @@ CREATE TABLE IF NOT EXISTS public.booking_subscription_sessions (
     purpose TEXT NOT NULL DEFAULT 'booking_subscription' CHECK (purpose = 'booking_subscription'),
     -- Set once, by fn_bind_booking_subscription_session, the moment the bot
     -- receives /start subscribe_<token> — from that point on the session is
-    -- looked up by (bound_telegram_id, most recent) rather than by hash, so
-    -- the bot never has to persist the raw token anywhere, not even in its
-    -- own Supabase-backed pending-state table (bot_user_states' existing
+    -- looked up by bound_telegram_id rather than by hash, so the bot never
+    -- has to persist the raw token anywhere, not even in its own
+    -- Supabase-backed pending-state table (bot_user_states' existing
     -- equivalent for the claim flow). See fn_complete_booking_subscription.
     bound_telegram_id BIGINT NULL,
+    -- Set by fn_bind_booking_subscription_session on every OTHER still-open
+    -- session already bound to the SAME telegram_id, the instant a new bind
+    -- for that telegram_id succeeds. created_at reflects when the session
+    -- was STARTED (by the carrier generating the link), not when it was
+    -- bound — so a naive "ORDER BY created_at DESC" at completion time is
+    -- NOT guaranteed to reflect bind order (an older session could be bound
+    -- after a newer one). superseded_at makes "the most recently bound
+    -- session for this telegram_id" an explicit, race-safe fact instead of
+    -- an inference from an unrelated timestamp: at most one bound,
+    -- unconsumed, unsuperseded session can ever exist per telegram_id, so
+    -- fn_complete_booking_subscription's lookup is unambiguous by
+    -- construction, not by ordering.
+    superseded_at TIMESTAMPTZ NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 COMMENT ON TABLE public.booking_subscription_sessions IS
-    'Short-lived (15 min) token session for adding a Telegram subscriber to a manual booking. Purpose-locked so a token minted here can never be consumed by the unrelated booking_claim_sessions/fn_claim_booking_auto ownership-transfer flow. Raw token is never stored — only session_token_hash (SHA-256), used exactly once at bind time; completion afterwards is keyed by bound_telegram_id.';
+    'Short-lived (15 min) token session for adding a Telegram subscriber to a manual booking. Purpose-locked so a token minted here can never be consumed by the unrelated booking_claim_sessions/fn_claim_booking_auto ownership-transfer flow. Raw token is never stored — only session_token_hash (SHA-256), used exactly once at bind time; completion afterwards is keyed by bound_telegram_id, with superseded_at guaranteeing at most one active bound session per telegram_id.';
 
 CREATE INDEX IF NOT EXISTS idx_booking_subscription_sessions_bound_telegram
     ON public.booking_subscription_sessions(bound_telegram_id, created_at DESC)
-    WHERE bound_telegram_id IS NOT NULL;
+    WHERE bound_telegram_id IS NOT NULL AND superseded_at IS NULL;
 
 -- ------------------------------------------------------------------------
 -- (b) booking_followers — additive. Multiple independent subscribers per
@@ -157,6 +170,18 @@ GRANT EXECUTE ON FUNCTION public.fn_start_booking_subscription_session(INTEGER, 
 --      is never written to any table, bot-side or backend-side, before or
 --      after this call. From here on the session is addressed by
 --      bound_telegram_id instead of by hash.
+--
+--      A single telegram_id can have at most ONE bound, unconsumed,
+--      unsuperseded session at a time: right after binding the target
+--      session, this function marks EVERY OTHER still-open session already
+--      bound to the SAME telegram_id as superseded (never touching sessions
+--      of any other telegram_id, and never touching an already-consumed
+--      session — it has nothing left to supersede). Both the bind UPDATE
+--      and the supersede UPDATE run inside this function's own single
+--      transaction, so a concurrent bind for the same telegram_id either
+--      fully completes before or fully after this one (standard row-level
+--      locking) — there is never a window with two live bound sessions for
+--      one telegram_id.
 -- ------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_bind_booking_subscription_session(
     p_session_token_hash TEXT,
@@ -169,8 +194,15 @@ AS $$
 DECLARE
     v_id UUID;
 BEGIN
+    -- superseded_at is explicitly cleared here too: re-opening a link whose
+    -- session had previously been superseded (by a later bind of a
+    -- DIFFERENT session to this same telegram_id) is itself a fresh bind
+    -- action, and must reactivate it — the supersede step below then flips
+    -- activity away from whatever else is currently bound to this
+    -- telegram_id, exactly as if this were the first time it was bound.
     UPDATE public.booking_subscription_sessions
-    SET bound_telegram_id = p_telegram_id
+    SET bound_telegram_id = p_telegram_id,
+        superseded_at = NULL
     WHERE session_token_hash = p_session_token_hash
       AND purpose = 'booking_subscription'
       AND consumed_at IS NULL
@@ -181,6 +213,13 @@ BEGIN
         RETURN jsonb_build_object('success', false, 'error', 'SESSION_INVALID_EXPIRED_OR_CONSUMED');
     END IF;
 
+    UPDATE public.booking_subscription_sessions
+    SET superseded_at = NOW()
+    WHERE bound_telegram_id = p_telegram_id
+      AND id <> v_id
+      AND consumed_at IS NULL
+      AND superseded_at IS NULL;
+
     RETURN jsonb_build_object('success', true);
 END;
 $$;
@@ -189,23 +228,27 @@ REVOKE ALL ON FUNCTION public.fn_bind_booking_subscription_session(TEXT, BIGINT)
 GRANT EXECUTE ON FUNCTION public.fn_bind_booking_subscription_session(TEXT, BIGINT) TO service_role;
 
 -- ------------------------------------------------------------------------
--- (f) fn_complete_booking_subscription — looked up by (bound_telegram_id,
---     most recently bound) rather than by hash, since the bot no longer
---     holds the raw token by the time the contact-share message arrives
---     (see (e2) above). Re-checks purpose/consumed_at/expires_at and
---     fn_is_booking_subscribable (booking could have been cancelled between
---     bind and bot confirmation), normalizes role_declared server-side
---     (never a raw CHECK violation), records the correct
---     subscribed/resubscribed event based on the row's state BEFORE the
---     upsert, and is idempotent for an already-active follower. If a
---     telegram_id has more than one bound, still-valid, unconsumed session
---     (e.g. two different manual bookings started in quick succession), the
---     most recently bound one is completed — the rest remain available
---     until their own TTL, requiring the user to reopen that specific
---     subscribe link to bind (and then complete) it separately; this
---     mirrors the underlying Telegram UX constraint that only the latest
---     reply keyboard's button is actually tappable, not an added
---     limitation of this design.
+-- (f) fn_complete_booking_subscription — looked up by bound_telegram_id,
+--     since the bot no longer holds the raw token by the time the
+--     contact-share message arrives (see (e2) above). Re-checks
+--     purpose/consumed_at/expires_at and fn_is_booking_subscribable
+--     (booking could have been cancelled between bind and bot
+--     confirmation), normalizes role_declared server-side (never a raw
+--     CHECK violation), records the correct subscribed/resubscribed event
+--     based on the row's state BEFORE the upsert, and is idempotent for an
+--     already-active follower. AND superseded_at IS NULL is the load-bearing
+--     predicate for correctness, not ORDER BY: fn_bind_booking_subscription_
+--     session guarantees at most one non-superseded bound session per
+--     telegram_id at any time (see its own comment), so this lookup is
+--     unambiguous by construction — the ORDER BY/LIMIT 1 below is only a
+--     defensive tie-breaker and should never actually need to break a tie
+--     in normal operation. If a telegram_id opens a second manual booking's
+--     subscribe link while a first one is still pending, the first is
+--     superseded at that moment (see fn_bind_booking_subscription_session)
+--     and can no longer be completed here — the user must reopen that link
+--     to bind (and then complete) it again; this mirrors the underlying
+--     Telegram UX constraint that only the latest reply keyboard's button
+--     is actually tappable, not an added limitation of this design.
 -- ------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_complete_booking_subscription(
     p_telegram_id BIGINT,
@@ -228,6 +271,7 @@ BEGIN
     WHERE bound_telegram_id = p_telegram_id
       AND purpose = 'booking_subscription'
       AND consumed_at IS NULL
+      AND superseded_at IS NULL
       AND expires_at > NOW()
     ORDER BY created_at DESC, id DESC
     LIMIT 1
