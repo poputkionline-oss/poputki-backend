@@ -5,6 +5,7 @@ const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinar
 const { carrierAuth, verifyTicketAccess } = require('../utils/carrierAuth');
 const { aggregateCarrierCustomers, getCustomerDetails } = require('../utils/crmHelper');
 const { AUDIT_ACTIONS, AUDIT_ENTITY_TYPES, logCarrierActivity } = require('../utils/auditHelper');
+const { isManualBooking } = require('../utils/bookingChannelHelper');
 const {
     getBusinessLocalDate,
     getBusinessLocalTime,
@@ -1392,12 +1393,22 @@ router.post('/bookings/manual', async (req, res) => {
             const verificationToken = generateTicketVerificationToken(booking.id);
             const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
 
+            // Same additive, flag-gated public subscribe page as
+            // /claim-link and /handoff — this booking was just created via
+            // this very route, so it is always a manual booking
+            // (created_by_user_id is always set above); no need to re-fetch
+            // and re-check isManualBooking() here.
+            const ticketSubscribeUrl = process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true'
+                ? `https://www.poputki.online/ticket-subscribe/${verificationToken}`
+                : null;
+
             handoff = {
                 required: true,
                 contact_role: effectiveContactRole,
                 booking_id: booking.id,
                 claim_url: session?.deepLink || null,
                 ticket_url: ticketUrl,
+                ticket_subscribe_url: ticketSubscribeUrl,
                 expires_at: session?.expiresAt || null
             };
         }
@@ -1477,7 +1488,7 @@ router.post('/bookings/:bookingId/claim-link', async (req, res) => {
         // 1. Fetch booking
         const { data: booking, error: bErr } = await supabase
             .from('bus_ticket_bookings')
-            .select('id, bus_ticket_id, status, claim_status, claimed_by_user_id, contact_role, phone')
+            .select('id, bus_ticket_id, status, claim_status, claimed_by_user_id, contact_role, phone, created_by_user_id')
             .eq('id', numId)
             .single();
 
@@ -1509,11 +1520,25 @@ router.post('/bookings/:bookingId/claim-link', async (req, res) => {
         const verificationToken = generateTicketVerificationToken(booking.id);
         const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}`;
 
+        // Manual Booking Telegram Subscription Model (additive, feature-
+        // flagged): a SEPARATE, re-openable public ticket page that offers
+        // the passenger the new follower-subscription flow instead of the
+        // claim/ownership-transfer one. Never replaces claim_url/ticket_url
+        // above (both keep working exactly as before for any existing
+        // consumer) — this is purely an additional field, present only when
+        // the flag is on AND the booking actually qualifies, so a caller
+        // that doesn't know about it sees no behavior change whatsoever.
+        let ticketSubscribeUrl = null;
+        if (process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true' && isManualBooking(booking)) {
+            ticketSubscribeUrl = `https://www.poputki.online/ticket-subscribe/${verificationToken}`;
+        }
+
         return res.json({
             success: true,
             booking_id: booking.id,
             claim_url: session.deepLink,
             ticket_url: ticketUrl,
+            ticket_subscribe_url: ticketSubscribeUrl,
             expires_at: session.expiresAt
         });
     } catch (err) {
@@ -1593,7 +1618,7 @@ router.post('/bookings/:bookingId/handoff', async (req, res) => {
     try {
         const { data: booking, error: bErr } = await supabase
             .from('bus_ticket_bookings')
-            .select('id, bus_ticket_id, status, claim_status, claimed_by_user_id, contact_role, phone')
+            .select('id, bus_ticket_id, status, claim_status, claimed_by_user_id, contact_role, phone, created_by_user_id')
             .eq('id', numId)
             .single();
 
@@ -1623,10 +1648,19 @@ router.post('/bookings/:bookingId/handoff', async (req, res) => {
         const verificationToken = generateTicketVerificationToken(numId);
         const ticketUrl = `https://www.poputki.online/ticket-verify/${verificationToken}?h=${result.handoff.id}`;
 
+        // Same additive, flag-gated public subscribe page as /claim-link
+        // above — the handoff-attribution query param (?h=) is carried
+        // over so a subsequent visit is still attributable to this handoff.
+        let ticketSubscribeUrl = null;
+        if (process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true' && isManualBooking(booking)) {
+            ticketSubscribeUrl = `https://www.poputki.online/ticket-subscribe/${verificationToken}?h=${result.handoff.id}`;
+        }
+
         return res.json({
             success: true,
             handoffId: result.handoff.id,
             ticketUrl,
+            ticketSubscribeUrl,
             maskedRecipientPhone: result.handoff.recipient_phone_masked,
             createdAt: result.handoff.created_at,
             handoff: result.handoff

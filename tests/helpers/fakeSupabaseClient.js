@@ -34,9 +34,47 @@ function matchesFilters(row, filters) {
 }
 
 function createFakeSupabaseClient(tables = {}) {
+    let autoId = 1000000; // far above any seeded fixture id, to avoid collisions
     return {
+        // Minimal, narrowly-scoped RPC support — only for the specific
+        // production RPCs this fake's test callers actually need (currently
+        // just fn_create_booking_handoff, used by utils/journeyHelper.js's
+        // real, non-mock createBookingHandoff() path). Anything else throws
+        // clearly rather than silently no-opping, so a test relying on an
+        // unsupported RPC fails loudly instead of getting a false pass.
+        async rpc(fnName, params = {}) {
+            if (fnName === 'fn_create_booking_handoff') {
+                if (!tables.booking_handoffs) tables.booking_handoffs = [];
+                if (!tables.booking_journey_events) tables.booking_journey_events = [];
+                const now = new Date().toISOString();
+                const handoffId = autoId++;
+                const eventId = autoId++;
+                tables.booking_handoffs.push({
+                    id: handoffId,
+                    booking_id: params.p_booking_id,
+                    claim_session_id: params.p_claim_session_id,
+                    channel: params.p_channel,
+                    recipient_phone_masked: params.p_recipient_phone_masked,
+                    initiated_by_user_id: params.p_initiated_by_user_id,
+                    created_at: now
+                });
+                tables.booking_journey_events.push({
+                    id: eventId,
+                    booking_id: params.p_booking_id,
+                    handoff_id: handoffId,
+                    event_type: 'SHARE_INITIATED',
+                    created_at: now
+                });
+                return {
+                    data: { success: true, handoff_id: handoffId, event_id: eventId, created_at: now },
+                    error: null
+                };
+            }
+            throw new Error(`fakeSupabaseClient: unsupported rpc "${fnName}" — add explicit support in tests/helpers/fakeSupabaseClient.js if a test genuinely needs it`);
+        },
         from(tableName) {
-            const rows = tables[tableName] || [];
+            if (!tables[tableName]) tables[tableName] = [];
+            const rows = tables[tableName];
             const filters = [];
 
             const builder = {
@@ -70,6 +108,59 @@ function createFakeSupabaseClient(tables = {}) {
                     if (matches.length === 0) return { data: null, error: new Error('fakeSupabaseClient: no rows matched') };
                     if (matches.length > 1) return { data: null, error: new Error(`fakeSupabaseClient: ${matches.length} rows matched, expected exactly 1`) };
                     return { data: matches[0], error: null };
+                },
+                // .insert([{...}]).select().single()/.maybeSingle(), or bare
+                // .insert([{...}]) awaited directly. The inserted row is
+                // pushed into this table's in-memory array so a later read in
+                // the SAME test can see it.
+                insert(newRows) {
+                    const inserted = (Array.isArray(newRows) ? newRows : [newRows]).map(r => {
+                        const row = { id: r.id ?? autoId++, created_at: new Date().toISOString(), ...r };
+                        rows.push(row);
+                        return row;
+                    });
+                    return {
+                        select() { return this; },
+                        async single() {
+                            return inserted.length === 1
+                                ? { data: inserted[0], error: null }
+                                : { data: null, error: new Error('fakeSupabaseClient: insert().single() expected exactly 1 row') };
+                        },
+                        async maybeSingle() {
+                            return { data: inserted[0] || null, error: null };
+                        },
+                        then(resolve, reject) {
+                            return Promise.resolve({ data: inserted, error: null }).then(resolve, reject);
+                        }
+                    };
+                },
+                // .update({...}).eq(col, val)[.eq(...)] applied in-place to
+                // matching rows, then optionally .select().single()/
+                // .maybeSingle(), or awaited bare.
+                update(patch) {
+                    const updateFilters = [];
+                    const updateBuilder = {
+                        eq(col, val) { updateFilters.push([col, val, 'eq']); return updateBuilder; },
+                        select() { return updateBuilder; },
+                        async single() {
+                            const matches = rows.filter(row => matchesFilters(row, updateFilters));
+                            matches.forEach(row => Object.assign(row, patch));
+                            return matches.length === 1
+                                ? { data: matches[0], error: null }
+                                : { data: null, error: new Error('fakeSupabaseClient: update().single() expected exactly 1 matching row') };
+                        },
+                        async maybeSingle() {
+                            const matches = rows.filter(row => matchesFilters(row, updateFilters));
+                            matches.forEach(row => Object.assign(row, patch));
+                            return { data: matches[0] || null, error: null };
+                        },
+                        then(resolve, reject) {
+                            const matches = rows.filter(row => matchesFilters(row, updateFilters));
+                            matches.forEach(row => Object.assign(row, patch));
+                            return Promise.resolve({ data: matches, error: null }).then(resolve, reject);
+                        }
+                    };
+                    return updateBuilder;
                 }
             };
 
@@ -99,4 +190,34 @@ function installFakeDbModule(fakeClient) {
     return fakeClient;
 }
 
-module.exports = { createFakeSupabaseClient, installFakeDbModule };
+/**
+ * Same idea as installFakeDbModule, but for dbServiceRole.js's
+ * getServiceRoleClient() — used by utils/claimHelper.js,
+ * utils/bookingSubscriptionHelper.js and others in preference to plain
+ * require('../db') whenever it's reachable. Without this, any route that
+ * calls getServiceRoleClient() with no SUPABASE_SERVICE_ROLE_KEY configured
+ * in the test process throws synchronously (dbServiceRole.js fails closed
+ * by design) before ever falling back to the fake db module. Must be called
+ * before any route/helper file that requires dbServiceRole.js is first
+ * required in this process, same ordering rule as installFakeDbModule.
+ */
+function installFakeServiceRoleModule(fakeClient) {
+    const path = require.resolve('../../dbServiceRole');
+    require.cache[path] = {
+        id: path,
+        filename: path,
+        loaded: true,
+        exports: {
+            getServiceRoleClient: () => fakeClient,
+            getServiceRoleDiagnostics: () => ({
+                serviceRoleEnvPresent: true,
+                serviceRoleClientCached: true,
+                moduleInstanceId: 'fake-service-role',
+                processPid: process.pid
+            })
+        }
+    };
+    return fakeClient;
+}
+
+module.exports = { createFakeSupabaseClient, installFakeDbModule, installFakeServiceRoleModule };
