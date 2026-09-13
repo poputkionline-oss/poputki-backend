@@ -14,7 +14,10 @@ const {
 } = require('../utils/ticketHelper');
 const { getServiceRoleClient } = require('../dbServiceRole');
 const { isManualBooking } = require('../utils/bookingChannelHelper');
-const { isBookingSubscribable } = require('../utils/bookingSubscriptionHelper');
+// Not destructured: kept as a module reference (not a copied function
+// binding) so route logic can wrap the call in try/catch per-request
+// without ever assuming the check itself is infallible.
+const bookingSubscriptionHelper = require('../utils/bookingSubscriptionHelper');
 
 function isSubscriptionModelEnabled() {
     return process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true';
@@ -578,19 +581,41 @@ router.get('/verify/:token', async (req, res) => {
         const projection = buildPassengerTicketProjection(booking, ticket, busMaster, { isPublic: true });
 
         // Manual Booking Telegram Subscription Model (additive, flag-gated):
-        // a single explicit boolean, true only when the flag is on AND this
-        // is a manual booking AND the trip still passes the same
-        // subscribability rule /claims/subscribe-preview uses — never an
-        // internal reason code, never anything claim_status-derived. This is
-        // the ONLY subscription-model signal this public endpoint exposes;
-        // it must not leak WHY a booking isn't subscribable (flag off vs.
-        // not manual vs. trip already arrived are all indistinguishable from
-        // the outside, on purpose).
-        const canSubscribe = isSubscriptionModelEnabled() && isManualBooking(booking) && isBookingSubscribable(booking, ticket);
+        // two independent booleans, never one collapsed flag, so the
+        // frontend can tell "this booking is on the new model at all" apart
+        // from "…and it currently passes the subscribability check":
+        //   - subscriptionModelActive: true whenever the flag is on AND this
+        //     is a manual booking. Independent of trip status/arrival time —
+        //     it never flips back to false just because the subscribability
+        //     check below fails or errors, so the frontend can reliably tell
+        //     "this booking is on the new model at all" (never show the
+        //     legacy claim_ flow) apart from "...and can subscribe right
+        //     now".
+        //   - canSubscribe: true only when subscriptionModelActive AND the
+        //     same subscribability rule /claims/subscribe-preview uses
+        //     currently passes. Any error evaluating that rule is treated as
+        //     "not currently subscribable" (canSubscribe=false), never
+        //     surfaced to the client and never allowed to touch
+        //     subscriptionModelActive.
+        // Neither field is ever derived from claim_status/claimed_by_user_id
+        // — those stay exclusively the legacy claim flow's fields. Never an
+        // internal reason code either: the client only ever sees these two
+        // plain booleans.
+        const subscriptionModelActive = isSubscriptionModelEnabled() && isManualBooking(booking);
+
+        let canSubscribe = false;
+        if (subscriptionModelActive) {
+            try {
+                canSubscribe = Boolean(bookingSubscriptionHelper.isBookingSubscribable(booking, ticket));
+            } catch (subscribabilityErr) {
+                console.error('[Public Ticket Verify] subscribability check failed:', subscribabilityErr.message);
+                canSubscribe = false;
+            }
+        }
 
         res.json({
             valid: true,
-            ticket: { ...projection, canSubscribe }
+            ticket: { ...projection, subscriptionModelActive, canSubscribe }
         });
     } catch (err) {
         console.error('[Public Ticket Verify] Error:', err);
