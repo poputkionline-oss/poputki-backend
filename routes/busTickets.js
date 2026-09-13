@@ -13,6 +13,12 @@ const {
     buildPassengerTicketProjection
 } = require('../utils/ticketHelper');
 const { getServiceRoleClient } = require('../dbServiceRole');
+const { isManualBooking } = require('../utils/bookingChannelHelper');
+const { isBookingSubscribable } = require('../utils/bookingSubscriptionHelper');
+
+function isSubscriptionModelEnabled() {
+    return process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true';
+}
 
 function getSafeServiceRoleClient() {
     try {
@@ -531,7 +537,7 @@ router.get('/verify/:token', async (req, res) => {
                 id, bus_ticket_id, passenger_id, seat_numbers, passenger_count, passengers_data, status, total_price, passenger_name, pickup_city, drop_off_city, created_at,
                 boarding_status, boarded_at,
                 commission_rate, commission_amount, carrier_amount,
-                claim_status, claimed_by_user_id, channel, source_type, contact_role,
+                claim_status, claimed_by_user_id, channel, source_type, contact_role, created_by_user_id,
                 users:passenger_id (name)
             `)
             .eq('id', bookingId)
@@ -571,9 +577,20 @@ router.get('/verify/:token', async (req, res) => {
 
         const projection = buildPassengerTicketProjection(booking, ticket, busMaster, { isPublic: true });
 
+        // Manual Booking Telegram Subscription Model (additive, flag-gated):
+        // a single explicit boolean, true only when the flag is on AND this
+        // is a manual booking AND the trip still passes the same
+        // subscribability rule /claims/subscribe-preview uses — never an
+        // internal reason code, never anything claim_status-derived. This is
+        // the ONLY subscription-model signal this public endpoint exposes;
+        // it must not leak WHY a booking isn't subscribable (flag off vs.
+        // not manual vs. trip already arrived are all indistinguishable from
+        // the outside, on purpose).
+        const canSubscribe = isSubscriptionModelEnabled() && isManualBooking(booking) && isBookingSubscribable(booking, ticket);
+
         res.json({
             valid: true,
-            ticket: projection
+            ticket: { ...projection, canSubscribe }
         });
     } catch (err) {
         console.error('[Public Ticket Verify] Error:', err);
