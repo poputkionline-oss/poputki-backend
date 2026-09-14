@@ -2677,7 +2677,42 @@ router.get('/bookings/:bookingId/ticket', async (req, res) => {
 
         const ticketProjection = buildPassengerTicketProjection(booking, ticket, busMaster, { includeCarrierPhone: true });
 
-        res.json(ticketProjection);
+        // Manual Booking Telegram Subscription Model (additive, flag-gated):
+        // overrides buildPassengerTicketProjection's own `isManual` (which
+        // uses the old, admittedly-unreliable channel/source_type heuristic
+        // — see bookingChannelHelper.js's doc comment) with the canonical
+        // isManualBooking(booking) check (created_by_user_id-based) used
+        // everywhere else in the subscription model, so this carrier-facing
+        // ticket modal classifies the SAME booking the SAME way as the
+        // passenger-facing /bus-tickets/verify/:token does. `booking` here
+        // (not ticketProjection) is passed — created_by_user_id is on the
+        // raw booking row selected above, never on the client-facing
+        // projection.
+        //
+        // subscriptionModelActive/canSubscribe follow the same two-flag
+        // split as routes/busTickets.js: subscriptionModelActive never
+        // depends on trip status, and a failure evaluating subscribability
+        // collapses to canSubscribe=false without ever surfacing internal
+        // detail to the client or flipping subscriptionModelActive.
+        const isManual = isManualBooking(booking);
+        const subscriptionModelActive = process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true' && isManual;
+
+        let canSubscribe = false;
+        if (subscriptionModelActive) {
+            try {
+                const { isBookingSubscribable } = require('../utils/bookingSubscriptionHelper');
+                // Second argument must be the trip (bus_tickets row, `ticket`
+                // here), matching isBookingSubscribable's (booking, trip)
+                // contract — NOT ticketProjection, which is a differently
+                // shaped passenger-facing projection.
+                canSubscribe = Boolean(isBookingSubscribable(booking, ticket));
+            } catch (subscribabilityErr) {
+                console.error('[BusAdmin Single Ticket] subscribability check failed:', subscribabilityErr.message);
+                canSubscribe = false;
+            }
+        }
+
+        res.json({ ...ticketProjection, isManual, subscriptionModelActive, canSubscribe });
     } catch (err) {
         console.error('[BusAdmin Single Ticket] Error:', err.message);
         res.status(500).json({ error: 'Ошибка формирования билета' });
