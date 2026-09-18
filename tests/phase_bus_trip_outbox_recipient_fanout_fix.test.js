@@ -2,7 +2,7 @@
  * tests/phase_bus_trip_outbox_recipient_fanout_fix.test.js
  *
  * POPUTKI.ONLINE — corrective migration
- * supabase/migrations/20260918173649_fix_bus_trip_notification_outbox_recipient_key.sql
+ * supabase/migrations/20260918184834_fix_bus_trip_notification_outbox_recipient_key.sql
  * for docs/migrations/20260906_bus_trip_change_outbox.sql (applied to
  * production as version 20260906200433 — see supabase/migrations/, which
  * is missing a copy of that file; tracked separately for reconciliation).

@@ -1,5 +1,5 @@
 -- ==============================================================================
--- Migration: 20260918173649_fix_bus_trip_notification_outbox_recipient_key.sql
+-- Migration: 20260918184834_fix_bus_trip_notification_outbox_recipient_key.sql
 -- Description: Corrective migration for 20260906_bus_trip_change_outbox.sql.
 --              Does NOT modify that migration.
 --
