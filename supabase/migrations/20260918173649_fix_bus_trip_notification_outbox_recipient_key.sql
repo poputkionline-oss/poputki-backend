@@ -1,16 +1,25 @@
 -- ==============================================================================
--- Migration: 20260918143630_fix_bus_trip_notification_outbox_recipient_key.sql
+-- Migration: 20260918173649_fix_bus_trip_notification_outbox_recipient_key.sql
 -- Description: Corrective migration for 20260906_bus_trip_change_outbox.sql.
 --              Does NOT modify that migration.
 --
--- NOT APPLIED TO PRODUCTION. Prepared and verified locally only, per
+-- NOT YET APPLIED TO PRODUCTION. Prepared and verified locally only, per
 -- instructions: "Production, Supabase, флаги, push и deploy не трогать."
--- (The base migration this corrects, 20260906_bus_trip_change_outbox.sql,
--- is itself still marked "NOT APPLIED TO PRODUCTION" and does not appear
--- in supabase/migrations/ — so as of this file, the affected table and
--- function do not exist in production either. This corrective migration
--- must still be applied strictly after 20260906_bus_trip_change_outbox.sql,
--- in the same order, whenever that pair is eventually promoted.)
+--
+-- Correction (read-only preflight, 2026-09-18): an earlier draft of this
+-- file's header claimed the base migration, 20260906_bus_trip_change_
+-- outbox.sql, was itself unapplied to production. That was wrong — a
+-- read-only preflight against the live Supabase project confirmed the base
+-- migration IS applied (tracked in supabase_migrations.schema_migrations
+-- as version 20260906200433) and bus_ticket_notification_outbox,
+-- bus_ticket_change_events, fn_atomic_bus_trip_update and
+-- fn_claim_bus_trip_notification_batch are all live in production,
+-- byte-identical to that migration file (see docs/migrations/
+-- 20260906_bus_trip_change_outbox.sql, whose own "NOT APPLIED TO
+-- PRODUCTION" header is itself stale and separately tracked for
+-- correction). This file was confirmed absent from production's
+-- schema_migrations before this preflight — it depends on the base
+-- migration already existing, which it does.
 --
 -- Finding (read-only audit, prior turn): bus_ticket_notification_outbox's
 -- original uniqueness key was UNIQUE (event_id, booking_id, channel) — it
