@@ -125,6 +125,11 @@ function renderTripChangeMessage({ language = 'ru', trip, booking, changes }) {
             lines.push('');
         }
 
+        if (changedFields.includes('bus_id') || changedFields.includes('bus_type')) {
+            lines.push('🚌 <b>Автобус иваз карда шуд.</b>');
+            lines.push('');
+        }
+
         if (seatChange) {
             lines.push(formatSeatChangeText(seatChange, 'tj'));
             lines.push('');
@@ -157,6 +162,11 @@ function renderTripChangeMessage({ language = 'ru', trip, booking, changes }) {
             lines.push('');
         }
 
+        if (changedFields.includes('bus_id') || changedFields.includes('bus_type')) {
+            lines.push('🚌 <b>Avtobus almashtirildi.</b>');
+            lines.push('');
+        }
+
         if (seatChange) {
             lines.push(formatSeatChangeText(seatChange, 'uz'));
             lines.push('');
@@ -186,6 +196,11 @@ function renderTripChangeMessage({ language = 'ru', trip, booking, changes }) {
 
         if (changedFields.includes('from_address')) {
             lines.push(`📍 <b>Адрес отправления:</b> ${newV.from_address || trip.from_address}`);
+            lines.push('');
+        }
+
+        if (changedFields.includes('bus_id') || changedFields.includes('bus_type')) {
+            lines.push('🚌 <b>Автобус на рейсе заменён.</b>');
             lines.push('');
         }
 
