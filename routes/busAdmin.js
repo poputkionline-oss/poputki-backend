@@ -24,6 +24,7 @@ const {
     checkDuplicatePlate,
     verifyBusAccess,
     getBusActiveTickets,
+    checkBusScheduleConflict,
     validateBusReplacement
 } = require('../utils/busHelper');
 const {

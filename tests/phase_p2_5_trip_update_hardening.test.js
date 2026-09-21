@@ -26,22 +26,17 @@
  * tests/phase_p2_notification_suppression.test.js — nothing here is a
  * reimplementation of the route's logic.
  *
- * IMPORTANT — a pre-existing, UNRELATED bug found while building scenario
- * G below: routes/busAdmin.js calls checkBusScheduleConflict(...) at its
- * bus-replacement call site but never imports it (only validateBusPayload,
- * checkDuplicatePlate, verifyBusAccess, getBusActiveTickets and
- * validateBusReplacement are destructured from '../utils/busHelper' at the
- * top of the file). Any request that changes bus_id to a real, available,
- * capacity-valid bus reaches that line and throws a synchronous
- * ReferenceError, which was already reaching the outer catch as an opaque
- * 500 before this phase. This phase does NOT fix that reference error (it
- * is out of this phase's explicitly authorized scope: guard the
- * service-role call and add correlation-id logging, nothing else) — but it
- * does mean that failure is now safely fail-closed and observable (503/500
- * with a correlation_id and a sanitized log line) instead of an anonymous
- * crash. Scenario G below documents this honestly rather than asserting a
- * success this code cannot currently produce. Flagged in the final P.2.5
- * report as a candidate for a follow-up phase.
+ * NOTE (historical, resolved in P.2.6) — while building scenario G below, a
+ * pre-existing, UNRELATED bug was found: routes/busAdmin.js called
+ * checkBusScheduleConflict(...) at its bus-replacement call site but never
+ * imported it. Any request that changed bus_id to a real, available,
+ * capacity-valid bus reached that line and threw a synchronous
+ * ReferenceError, reaching the outer catch as a 500 — this phase (P.2.5)
+ * made that failure observable (correlation_id, sanitized log) without
+ * fixing it, out of its explicitly authorized scope. P.2.6
+ * (tests/phase_p2_6_fleet_bus_assignment_reference_error.test.js) added the
+ * missing one-line import; scenario G below was updated accordingly to
+ * assert the now-real success path instead of the historical crash.
  */
 
 'use strict';
@@ -347,26 +342,25 @@ describe('Phase P.2.5 — Trip update 500 hardening + observability', () => {
         await stopServer();
     });
 
-    it('G: NULL -> valid, available, capacity-valid fleet bus with active bookings hits a PRE-EXISTING, unrelated reference error (checkBusScheduleConflict not imported) — P.2.5 does not fix it, but now fails safely with a correlation_id instead of an opaque crash', async () => {
-        const originalConsoleError = console.error;
-        const captured = [];
-        console.error = (...args) => { captured.push(args); };
+    // UPDATE (P.2.6): at the time this P.2.5 suite was first written, this
+    // exact scenario hit a SEPARATE, pre-existing, unrelated bug —
+    // checkBusScheduleConflict was called by routes/busAdmin.js's
+    // bus-replacement path but never imported, so it threw a
+    // ReferenceError. P.2.5 made that failure observable (correlation_id,
+    // sanitized log) without fixing it, and flagged it in its final report
+    // as a candidate follow-up. P.2.6 (tests/phase_p2_6_fleet_bus_assignment_
+    // reference_error.test.js) added the missing import — the one-line fix
+    // — so this path is now reachable to a real 200 as intended. Kept here,
+    // updated rather than deleted, so this suite continues to prove the
+    // NULL -> valid-bus path stays healthy after the P.2.6 fix lands.
+    it('G: NULL -> valid, available, capacity-valid fleet bus with active bookings now succeeds (the pre-existing checkBusScheduleConflict reference error was fixed in P.2.6)', async () => {
+        await startServer();
         try {
-            await startServer();
             const res = await makeRequest(baseUrl, 'PUT', '/api/bus-admin/tickets/1', authHeaders(), { bus_id: 55 });
-            await stopServer();
-
-            assert.equal(res.status, 500, 'documents current (pre-existing, out-of-scope) behavior: this path is not reachable to a 200/409 today');
-            assert.equal(res.body.error, 'SERVER_ERROR');
-            assert.ok(res.body.correlation_id, 'even this pre-existing unrelated crash is now observable/correlated, thanks to P.2.5');
-            assert.equal(tables.bus_tickets.find(t => t.id === 1).bus_id, null, 'no partial mutation despite the crash');
-            assert.equal(tables.bus_ticket_change_events.length, 0);
-
-            const logCall = captured.find(args => args[1] && args[1].event === 'bus_trip_update_failed');
-            assert.ok(logCall);
-            assert.equal(logCall[1].error_name, 'ReferenceError');
+            assert.equal(res.status, 200, JSON.stringify(res.body));
+            assert.equal(tables.bus_tickets.find(t => t.id === 1).bus_id, 55);
         } finally {
-            console.error = originalConsoleError;
+            await stopServer();
         }
     });
 

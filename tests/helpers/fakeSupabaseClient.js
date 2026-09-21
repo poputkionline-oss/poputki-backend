@@ -30,6 +30,7 @@ function matchesFilters(row, filters) {
         if (op === 'gte') return row[col] >= val;
         if (op === 'lte') return row[col] <= val;
         if (op === 'gt') return row[col] > val;
+        if (op === 'neq') return String(row[col]) !== String(val);
         if (op === 'in') return Array.isArray(val) && val.some(v => String(v) === String(row[col]));
         return String(row[col]) === String(val);
     });
@@ -83,6 +84,10 @@ function createFakeSupabaseClient(tables = {}) {
                 select() { return builder; },
                 eq(col, val) {
                     filters.push([col, val, 'eq']);
+                    return builder;
+                },
+                neq(col, val) {
+                    filters.push([col, val, 'neq']);
                     return builder;
                 },
                 gte(col, val) {
