@@ -686,8 +686,23 @@ router.put('/tickets/:id', async (req, res) => {
             }
         }
 
+        // Price-only edits get their own change_type AND skip the passenger
+        // trip-change notification entirely: bus_tickets.price/premium_price
+        // are current-price-for-NEW-bookings fields, never a term of any
+        // EXISTING booking (bus_ticket_bookings.total_price is an immutable
+        // snapshot — see Phase P.2 audit). Telling an already-booked
+        // passenger "the trip changed" over a price move that does not
+        // affect their own booking is actively misleading, so this is a
+        // point exception, not a relaxation of notification semantics: the
+        // moment ANY other changed field is present alongside price, this is
+        // false and the existing schedule/bus notification flow below runs
+        // completely unchanged, price fields and all (they still appear in
+        // payload.changes for that case, exactly as before).
+        const PRICE_FIELDS = ['price', 'premium_price'];
+        const isPriceOnlyChange = changedFields.length > 0 && changedFields.every(f => PRICE_FIELDS.includes(f));
+
         // 6. Gather passenger Telegram IDs & language preferences
-        const userIds = [...new Set(activeBookings.map(b => b.claimed_by_user_id || b.passenger_id).filter(Boolean))];
+        const userIds = isPriceOnlyChange ? [] : [...new Set(activeBookings.map(b => b.claimed_by_user_id || b.passenger_id).filter(Boolean))];
 
         // Manual Booking Telegram Subscription Model (additive, feature-
         // flagged): active booking_followers for these bookings are folded
@@ -697,7 +712,7 @@ router.put('/tickets/:id', async (req, res) => {
         // When the flag is off, followersByBookingId stays empty and every
         // line below behaves exactly as before this change.
         const followersByBookingId = {};
-        if (process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true') {
+        if (!isPriceOnlyChange && process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true') {
             try {
                 const bookingIds = activeBookings.map(b => b.id);
                 const { data: followerRows } = await supabase
@@ -740,7 +755,7 @@ router.put('/tickets/:id', async (req, res) => {
         let unreachableCount = 0;
         let seatsRemappedCount = 0;
 
-        for (const b of activeBookings) {
+        for (const b of (isPriceOnlyChange ? [] : activeBookings)) {
             const effectiveUserId = b.claimed_by_user_id || b.passenger_id;
             const tgId = effectiveUserId ? userTelegramMap[effectiveUserId] : null;
             const userLang = (effectiveUserId && userLangMap[effectiveUserId]) || 'ru';
@@ -834,7 +849,7 @@ router.put('/tickets/:id', async (req, res) => {
             changed_by: req.carrier.user_id,
             actor_role: req.carrier.role || req.carrier.memberRole || 'owner',
             actor_name: req.carrier.name || 'Сотрудник',
-            change_type: busReplaced ? 'bus_replacement' : 'schedule_update',
+            change_type: busReplaced ? 'bus_replacement' : (isPriceOnlyChange ? 'price_update' : 'schedule_update'),
             old_values: oldValues,
             new_values: newValues,
             changed_fields: changedFields,

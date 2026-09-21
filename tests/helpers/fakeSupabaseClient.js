@@ -29,6 +29,8 @@ function matchesFilters(row, filters) {
     return filters.every(([col, val, op]) => {
         if (op === 'gte') return row[col] >= val;
         if (op === 'lte') return row[col] <= val;
+        if (op === 'gt') return row[col] > val;
+        if (op === 'in') return Array.isArray(val) && val.some(v => String(v) === String(row[col]));
         return String(row[col]) === String(val);
     });
 }
@@ -89,6 +91,14 @@ function createFakeSupabaseClient(tables = {}) {
                 },
                 lte(col, val) {
                     filters.push([col, val, 'lte']);
+                    return builder;
+                },
+                gt(col, val) {
+                    filters.push([col, val, 'gt']);
+                    return builder;
+                },
+                in(col, vals) {
+                    filters.push([col, vals, 'in']);
                     return builder;
                 },
                 order() { return builder; },

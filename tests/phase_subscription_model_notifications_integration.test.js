@@ -131,7 +131,12 @@ describe('Feature flag = false — trip-edit notification fan-out fully reverts 
             busAdminSource.indexOf('const uniqueUserIds')
         );
         assert.match(block, /const followersByBookingId = \{\};/);
-        assert.match(block, /if\s*\(process\.env\.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true'\)\s*\{/);
+        // Phase P.2 added a leading `!isPriceOnlyChange &&` to this same `if`
+        // (a price-only trip edit skips follower resolution entirely, same as
+        // the flag being off) — the flag check itself must still be present
+        // and still gate the query; the pattern tolerates any conjunction
+        // prefix rather than pinning the exact pre-P.2 source text.
+        assert.match(block, /if\s*\([^)]*process\.env\.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true'\)\s*\{/);
     });
 
     it('buildNotificationCandidates called with an empty followers array reproduces the exact pre-existing single-recipient behavior', () => {
