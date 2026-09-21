@@ -6,17 +6,26 @@
 --              Does NOT modify that migration.
 --
 -- NOT YET APPLIED TO PRODUCTION. Prepared and verified locally only
--- (real Postgres 16, production-shaped fixture reproducing trip id=75 —
--- see tests/phase_p2_7_atomic_update_time_type_fix.test.js), per
--- Phase P.2.7's explicit read-only/no-deploy constraints.
+-- (real Postgres 16, production-shaped fixtures) per Phase P.2.7's and
+-- Phase P.2.8's explicit read-only/no-deploy constraints. This file was
+-- first created in Phase P.2.7 (time/jsonb type-mismatch fix only) and
+-- was UPDATED in place by Phase P.2.8 to add the seat-remap storage-
+-- format and atomicity fixes below, per P.2.8's explicit instruction to
+-- extend this not-yet-released migration rather than create a second,
+-- competing one. See git history for the P.2.7-only version if needed —
+-- nothing here was force-rewritten, a new P.2.8 commit sits on top of
+-- the P.2.7 commit that first introduced this file.
 --
--- ROOT CAUSE (Phase P.2.7 diagnostic): a production smoke test on trip
--- id=75 (bus_id NULL -> Fleet bus id=1, price 840 -> 700, 5 confirmed
--- bookings) returned the controlled frontend error "Не удалось атомарно
--- обновить рейс." — routes/busAdmin.js's PUT /tickets/:id surfaces this
--- exact message whenever fn_atomic_bus_trip_update's RPC call returns an
--- error (see routes/busAdmin.js, `if (rpcError) { ... TRIP_UPDATE_ATOMIC_
--- FAILED ... }`).
+-- ==============================================================================
+-- PART 1 (Phase P.2.7) — text/time/jsonb COALESCE/CASE type mismatches
+-- ==============================================================================
+--
+-- ROOT CAUSE: a production smoke test on trip id=75 (bus_id NULL -> Fleet
+-- bus id=1, price 840 -> 700, 5 confirmed bookings) returned the
+-- controlled frontend error "Не удалось атомарно обновить рейс." —
+-- routes/busAdmin.js's PUT /tickets/:id surfaces this exact message
+-- whenever fn_atomic_bus_trip_update's RPC call returns an error (see
+-- routes/busAdmin.js, `if (rpcError) { ... TRIP_UPDATE_ATOMIC_FAILED ... }`).
 --
 -- Read-only production Postgres logs (postgres_logs, 2026-09-21 20:32:06
 -- UTC, exact request window) captured the real underlying error:
@@ -42,7 +51,7 @@
 -- time and immediately surfaced.
 --
 -- The identical COALESCE(text, time)/CASE(jsonb, integer[]) type-mismatch
--- pattern exists at two more places in the SAME function body, both of
+-- pattern existed at two more places in the SAME function body, both of
 -- which would abort the SAME request (Postgres validates a PL/pgSQL
 -- statement's expression types when that statement first executes,
 -- independent of which runtime branch/value is actually used):
@@ -65,18 +74,63 @@
 -- change: same values, same precision (`time::text` renders "HH:MI:SS",
 -- unchanged by the existing `substring(...,1,8)`), same seat numbers.
 --
--- OUT OF SCOPE for this migration (separate, real, not-yet-reached bug,
--- flagged for a follow-up phase): bus_ticket_bookings.seat_numbers is
--- `character varying` holding JSON-bracket-style strings (e.g. "[1]"),
--- but the seat-remap branch of this SAME function does
--- `SELECT seat_numbers INTO v_current_seats FROM bus_ticket_bookings ...`
+-- ==============================================================================
+-- PART 2 (Phase P.2.8) — seat-remap storage format + atomicity
+-- ==============================================================================
+--
+-- Flagged by P.2.7 as a separate, out-of-scope, not-yet-reached bug and
+-- fully diagnosed and fixed here. Production read-only audit
+-- (information_schema + a sample of live rows) confirmed:
+--   - bus_ticket_bookings.seat_numbers is `character varying(100) NOT
+--     NULL`, holding a JSON-bracket-style string ("[1]", "[1,2]", ...) —
+--     never a native Postgres array (which uses "{1,2}" syntax).
+--   - All 164 production rows at audit time matched that JSON-array
+--     shape exactly (no malformed/empty/legacy values currently exist).
+--
+-- BUG 1 (storage format): the seat-remap branch did
+--   SELECT seat_numbers INTO v_current_seats FROM bus_ticket_bookings ...
 -- where v_current_seats is declared INTEGER[] — Postgres's native array
--- input parser expects `{1}` syntax, not `[1]`, and throws "malformed
+-- input parser expects "{1}" syntax, not "[1]", and throws "malformed
 -- array literal" the moment any real BUS_SEAT_REMAP_REQUIRED submission
--- reaches this function (confirmed locally). Phase P.2.7's reported
--- production failure never reached this line (the replacement bus had
--- enough capacity, so p_seat_remap was empty) — this migration does NOT
--- touch it, to keep this fix minimal and scoped to the proven root cause.
+-- reaches this function. Reproduced locally against a trip-75-shaped
+-- fixture (bus A -> bus B requiring remap, 5 confirmed bookings, seats
+-- 1/2/3/4/30). The write-back (`SET seat_numbers = v_new_seats`, an
+-- INTEGER[] assigned to the varchar column) and the reserved_seats sync
+-- (`unnest(seat_numbers)`, calling unnest() on a varchar) have the exact
+-- same problem and would each independently abort the same request.
+--
+-- FIX: every read of seat_numbers now parses it explicitly through jsonb
+-- (jsonb_array_elements_text), and every write converts back to the same
+-- JSON-bracket text format (matching how routes/busAdmin.js's own
+-- JSON.parse(seat_numbers) already reads this column) — never a native
+-- array cast in either direction. A value that is not valid JSON, or not
+-- a JSON array of integers, fails closed with a new controlled
+-- MALFORMED_SEAT_DATA error (booking_id included) — never silently
+-- guessed, coerced, or dropped from the reserved-seats sync.
+--
+-- BUG 2 (atomicity — found while fixing bug 1, not present in the
+-- reported failure, but real and definitely in scope): the original
+-- remap loop validated ONE booking's seat mappings and immediately
+-- issued that booking's UPDATE before moving to the next remap_item. An
+-- invalid or duplicate seat on a LATER booking triggered a controlled
+-- RETURN of an error payload — but a RETURN is not an exception, so it
+-- does not roll back the UPDATEs earlier loop iterations already issued
+-- within the same top-level call. Proven locally: a 5-booking remap with
+-- an invalid seat on the 4th booking left the first three genuinely
+-- remapped in the database (and reported unaffected, but un-audited)
+-- despite the RPC reporting overall failure. This was unreachable in
+-- production only because BUG 1's "malformed array literal" exception
+-- aborted every remap attempt before any booking's mapping could ever be
+-- validated — fixing BUG 1 alone, without this, would have exposed BUG 2
+-- as a new, silent partial-mutation failure mode.
+--
+-- FIX: the remap loop is now two passes. PASS 1 validates every
+-- remap_item (booking exists, seat count matches, every seat in-capacity
+-- and non-duplicate) and only accumulates the planned new seat arrays —
+-- it writes nothing. PASS 2 applies every write, and only runs once
+-- every item in PASS 1 has validated successfully. Any failure during
+-- PASS 1 now returns before a single row has been touched, restoring the
+-- atomicity the function's name promises.
 -- ==============================================================================
 
 BEGIN;
@@ -84,8 +138,8 @@ BEGIN;
 CREATE OR REPLACE FUNCTION public.fn_atomic_bus_trip_update(
     p_ticket_id INTEGER,
     p_operator_id INTEGER,
-    p_update_data JSONB,
-    p_seat_remap JSONB, -- [{"booking_id": 10, "seat_mappings": [{"old_seat": 5, "new_seat": 15}]}]
+    p_update_data JSONB, -- [{"booking_id": 10, "seat_mappings": [{"old_seat": 5, "new_seat": 15}]}]
+    p_seat_remap JSONB,
     p_event_data JSONB,
     p_outbox_entries JSONB
 )
@@ -102,6 +156,11 @@ DECLARE
     v_mapping_item JSONB;
     v_new_seats INTEGER[];
     v_current_seats INTEGER[];
+    v_current_seats_raw VARCHAR;
+    v_sync_seats_raw VARCHAR;
+    v_sync_booking_id INTEGER;
+    v_planned_updates JSONB := '[]'::jsonb;
+    v_planned_item JSONB;
     v_old_seat INTEGER;
     v_new_seat INTEGER;
     v_event_id UUID;
@@ -178,7 +237,7 @@ BEGIN
     v_departure_date := COALESCE((p_update_data->>'departure_date')::date, v_ticket.departure_date);
     -- P.2.7 FIX: v_ticket.departure_time is `time without time zone`; cast
     -- it to text so it unifies with the other two (already-text) COALESCE
-    -- arguments. See migration header for the full root-cause writeup.
+    -- arguments.
     v_departure_time := COALESCE(p_update_data->>'departure_time', v_ticket.departure_time::text, '00:00:00');
     v_departure_instant := (v_departure_date || ' ' || substring(v_departure_time from 1 for 8) || '+05:00')::timestamptz;
 
@@ -208,22 +267,43 @@ BEGIN
     v_total_seats := COALESCE((p_update_data->>'total_seats')::integer, v_ticket.total_seats);
 
     -- 6. Apply group seat remapping if provided
+    --
+    -- P.2.8 FIX (storage format + atomicity) — see migration header PART 2
+    -- for the full writeup. seat_numbers is `character varying` holding a
+    -- JSON-bracket string, never a native Postgres array; every read goes
+    -- through jsonb_array_elements_text and every write through a proper
+    -- jsonb array cast to text, failing closed with MALFORMED_SEAT_DATA on
+    -- anything that isn't valid JSON. All writes are deferred to a second
+    -- pass so a failure anywhere in validation leaves every booking
+    -- untouched.
     IF p_seat_remap IS NOT NULL AND jsonb_array_length(p_seat_remap) > 0 THEN
+        -- PASS 1: validate everything, write nothing yet.
         FOR v_remap_item IN SELECT * FROM jsonb_array_elements(p_seat_remap)
         LOOP
             v_b_id := (v_remap_item->>'booking_id')::integer;
             v_seat_mappings := v_remap_item->'seat_mappings';
             v_new_seats := '{}';
 
-            -- Lock booking
-            SELECT seat_numbers INTO v_current_seats
+            -- Lock booking now (even though its write is deferred) so a
+            -- concurrent remap on the same booking can't interleave
+            -- between this validation pass and PASS 2's apply.
+            SELECT seat_numbers INTO v_current_seats_raw
             FROM public.bus_ticket_bookings
             WHERE id = v_b_id AND bus_ticket_id = p_ticket_id
             FOR UPDATE;
 
-            IF v_current_seats IS NULL THEN
+            IF v_current_seats_raw IS NULL THEN
                 RETURN jsonb_build_object('success', false, 'error', 'BOOKING_NOT_FOUND', 'booking_id', v_b_id);
             END IF;
+
+            BEGIN
+                v_current_seats := ARRAY(
+                    SELECT (elem)::integer
+                    FROM jsonb_array_elements_text(v_current_seats_raw::jsonb) AS elem
+                );
+            EXCEPTION WHEN OTHERS THEN
+                RETURN jsonb_build_object('success', false, 'error', 'MALFORMED_SEAT_DATA', 'booking_id', v_b_id);
+            END;
 
             IF jsonb_array_length(v_seat_mappings) != cardinality(v_current_seats) THEN
                 RETURN jsonb_build_object('success', false, 'error', 'SEAT_COUNT_MISMATCH', 'booking_id', v_b_id);
@@ -246,22 +326,52 @@ BEGIN
                 v_new_seats := array_append(v_new_seats, v_new_seat);
             END LOOP;
 
-            UPDATE public.bus_ticket_bookings
-            SET seat_numbers = v_new_seats
-            WHERE id = v_b_id AND bus_ticket_id = p_ticket_id;
+            -- Record the planned write; do NOT apply it yet.
+            v_planned_updates := v_planned_updates || jsonb_build_array(
+                jsonb_build_object('booking_id', v_b_id, 'new_seats', to_jsonb(v_new_seats))
+            );
         END LOOP;
 
-        -- Synchronize reserved_seats from all active bookings after remap
-        SELECT COALESCE(ARRAY(
-            SELECT DISTINCT unnest(seat_numbers)
+        -- PASS 2: every remap_item validated — now, and only now, apply
+        -- every write. new_seats is already a proper JSON array
+        -- (to_jsonb of an INTEGER[] renders "[1,2]"), so casting it to
+        -- text writes back in the exact same JSON-bracket format the
+        -- column already stores, never the native array literal syntax
+        -- "{1,2}".
+        FOR v_planned_item IN SELECT * FROM jsonb_array_elements(v_planned_updates)
+        LOOP
+            UPDATE public.bus_ticket_bookings
+            SET seat_numbers = (v_planned_item->'new_seats')::text
+            WHERE id = (v_planned_item->>'booking_id')::integer AND bus_ticket_id = p_ticket_id;
+        END LOOP;
+
+        -- Synchronize reserved_seats from all active bookings after remap.
+        -- Iterate and parse each booking's JSON-text seat_numbers
+        -- explicitly (the original `unnest(seat_numbers)` treated the
+        -- varchar column as a native array and would itself fail with
+        -- "function unnest(character varying) does not exist"). Fails
+        -- closed with the offending booking_id on any malformed value —
+        -- never silently drops a booking's seats from the sync.
+        v_sync_reserved_seats := '{}';
+        FOR v_sync_booking_id, v_sync_seats_raw IN
+            SELECT id, seat_numbers
             FROM public.bus_ticket_bookings
             WHERE bus_ticket_id = p_ticket_id
               AND (
                   status = 'confirmed'
                   OR (status = 'pending_payment' AND (hold_expires_at IS NULL OR hold_expires_at > v_now_instant))
               )
-            ORDER BY 1
-        ), '{}') INTO v_sync_reserved_seats;
+        LOOP
+            BEGIN
+                v_sync_reserved_seats := v_sync_reserved_seats || ARRAY(
+                    SELECT (elem)::integer
+                    FROM jsonb_array_elements_text(v_sync_seats_raw::jsonb) AS elem
+                );
+            EXCEPTION WHEN OTHERS THEN
+                RETURN jsonb_build_object('success', false, 'error', 'MALFORMED_SEAT_DATA', 'booking_id', v_sync_booking_id);
+            END;
+        END LOOP;
+        SELECT COALESCE(ARRAY(SELECT DISTINCT unnest(v_sync_reserved_seats) ORDER BY 1), '{}') INTO v_sync_reserved_seats;
     END IF;
 
     -- 7. Update bus_tickets fields
@@ -418,10 +528,12 @@ COMMIT;
 -- Rollback Instructions:
 -- BEGIN;
 --
--- -- Restore fn_atomic_bus_trip_update to its pre-P.2.7 body (re-introduces
--- -- the three text/time/jsonb type mismatches documented above — this
--- -- function would then fail 42804 on every trip update again). Full
--- -- original body preserved verbatim in
+-- -- Restore fn_atomic_bus_trip_update to its pre-P.2.7/P.2.8 body
+-- -- (re-introduces the three text/time/jsonb type mismatches AND the
+-- -- seat-remap storage-format/atomicity bugs documented above — this
+-- -- function would then fail 42804 on every trip update, and
+-- -- "malformed array literal" on every seat remap, again). Full original
+-- -- body preserved verbatim in
 -- -- supabase/migrations/20260918184834_fix_bus_trip_notification_outbox_recipient_key.sql
 -- -- — copy its CREATE OR REPLACE FUNCTION block back in.
 --
