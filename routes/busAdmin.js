@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const supabase = require('../db');
 const { uploadToCloudinary, deleteFromCloudinary } = require('../utils/cloudinaryUtils');
@@ -47,6 +48,22 @@ function getRequiredServiceClient() {
     } catch (_) {
         return null;
     }
+}
+
+// Bugfix P.2.5: sanitizes an unexpected-exception message before it is
+// written to server logs — strips JWT-shaped tokens, Bearer headers, and
+// any other long opaque-token-shaped substring, and caps length, so a
+// stray secret ending up inside an error message (e.g. a lower-level
+// client library echoing its own auth header back in an error) never
+// reaches the log. Never logs the original, unsanitized message.
+function sanitizeErrorMessage(message) {
+    if (!message) return 'Unknown error';
+    let msg = String(message);
+    msg = msg.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
+    msg = msg.replace(/eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,}){1,2}/g, '[REDACTED_JWT]');
+    msg = msg.replace(/[A-Za-z0-9_-]{24,}/g, (m) => (/^\d+$/.test(m) ? m : '[REDACTED]'));
+    if (msg.length > 300) msg = msg.slice(0, 300) + '…';
+    return msg;
 }
 
 
@@ -871,8 +888,22 @@ router.put('/tickets/:id', async (req, res) => {
         };
 
         // 8. ATOMIC DATABASE RPC EXECUTION (P0-01)
-        // Resolves service-role client to execute the security-definer function
-        const serviceClient = getServiceRoleClient() || supabase;
+        // Resolves service-role client to execute the security-definer function.
+        // Bugfix P.2.5: fn_atomic_bus_trip_update is GRANTed to service_role
+        // only (REVOKEd from anon/authenticated) — a bare `|| supabase` fallback
+        // here was never a real fallback (the anon/authenticated client would
+        // just get a permission-denied rpcError), and getServiceRoleClient()
+        // itself throws (not returns null/undefined) when service-role config
+        // is unavailable, which fell all the way through to the generic outer
+        // catch as an opaque 500. Use the same guarded helper (and the same
+        // controlled 503) already used earlier in this handler for bus
+        // replacement — fail closed, never silently degrade to an
+        // underprivileged client for an operation that requires service-role
+        // semantics.
+        const serviceClient = getRequiredServiceClient();
+        if (!serviceClient) {
+            return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+        }
         const { data: rpcResult, error: rpcError } = await serviceClient.rpc('fn_atomic_bus_trip_update', {
             p_ticket_id: Number(id),
             p_operator_id: Number(req.carrier.carrier_id),
@@ -963,8 +994,25 @@ router.put('/tickets/:id', async (req, res) => {
             event_id: rpcResult.event_id
         });
     } catch (err) {
-        console.error('[BusAdmin] Error in PUT /tickets/:id:', err);
-        res.status(500).json({ error: 'SERVER_ERROR', message: 'Внутренняя ошибка сервера' });
+        // Bugfix P.2.5: structured, sanitized diagnostics for an unexpected
+        // exception. Never logs req.body, headers, passenger data, or any
+        // secret — only route/actor identifiers and a sanitized error
+        // summary — and returns a correlation_id so the carrier can report
+        // exactly which failure this was without exposing anything sensitive
+        // to them either.
+        const correlationId = crypto.randomUUID();
+        console.error('[BusAdmin] bus_trip_update_failed', {
+            event: 'bus_trip_update_failed',
+            correlation_id: correlationId,
+            route: 'PUT /api/bus-admin/tickets/:id',
+            method: 'PUT',
+            trip_id: id,
+            carrier_id: req.carrier?.carrier_id ?? null,
+            error_name: err?.name || 'Error',
+            error_code: err?.code || null,
+            error_message: sanitizeErrorMessage(err?.message)
+        });
+        res.status(500).json({ error: 'SERVER_ERROR', message: 'Внутренняя ошибка сервера', correlation_id: correlationId });
     }
 });
 
@@ -4092,3 +4140,5 @@ router.delete('/buses/:id', (req, res) => {
 });
 
 module.exports = router;
+module.exports.sanitizeErrorMessage = sanitizeErrorMessage;
+module.exports.getRequiredServiceClient = getRequiredServiceClient;
