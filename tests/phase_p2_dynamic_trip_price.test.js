@@ -622,7 +622,11 @@ describe('Phase P.2 — Static contract checks against poputki-front Edit Trip U
 
     it('a separate, additive price-change confirmation exists and does NOT merge price into SUBSTANTIAL_FIELDS', { skip: !hasFrontRepo }, () => {
         const src = fs.readFileSync(frontFile, 'utf8');
-        assert.ok(src.includes("const PRICE_FIELDS = ['price', 'premium_price'];"));
+        // Phase P.2.1 extracted the price-fields list into the exported,
+        // independently-unit-tested computeChangedPriceFields() helper (see
+        // poputki-front/tests/phase_p2_1_price_confirmation_ui.test.js) —
+        // check for that function instead of the old inline const.
+        assert.ok(src.includes("export function computeChangedPriceFields(editingTicket, updateData, priceFields = ['price', 'premium_price'])"));
         assert.ok(src.includes('showPriceChangeConfirmModal'));
         assert.ok(src.includes('Новая цена будет применяться только к новым бронированиям'));
     });

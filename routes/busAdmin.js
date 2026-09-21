@@ -215,7 +215,20 @@ router.get('/tickets', async (req, res) => {
             const ticketBookings = (allBookings || []).filter(b => b.bus_ticket_id === t.id);
             const actuallyReserved = [];
             const seatGenders = {};
-            
+
+            // Bugfix P.2.1: the carrier UI's "does this trip have active
+            // bookings" check previously relied solely on reserved_seats.length
+            // (a seat-array proxy). A confirmed/active booking is not required
+            // to have seat_numbers assigned (POST /bookings/manual never
+            // validates seat_numbers as required), so a booking with no seats
+            // yet contributed nothing to reserved_seats — silently undercounting
+            // real active bookings and suppressing both the pre-existing
+            // trip-change confirmation modal and the new price-change warning.
+            // This is the same isSeatLockedByBooking-based definition PUT
+            // /tickets/:id itself uses for its own active-bookings guard,
+            // exposed directly so the frontend never has to infer it from seats.
+            const activeBookingsCount = ticketBookings.filter(b => isSeatLockedByBooking(b)).length;
+
             ticketBookings.forEach(b => {
                 if (isSeatLockedByBooking(b)) {
                     try {
@@ -249,6 +262,7 @@ router.get('/tickets', async (req, res) => {
             return {
                 ...t,
                 reserved_seats: [...new Set(actuallyReserved)], // Unique seats
+                active_bookings_count: activeBookingsCount,
                 seat_genders: seatGenders,
                 seatGenders: seatGenders,
                 intermediate_stops: (typeof t.intermediate_stops === 'string' ? JSON.parse(t.intermediate_stops || '[]') : (t.intermediate_stops || [])).map(s => ({
