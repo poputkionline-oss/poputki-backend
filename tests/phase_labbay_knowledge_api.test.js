@@ -4,7 +4,10 @@
  * Labbay Dynamic Knowledge Base integration — POST /api/labbay/knowledge.
  * Covers: valid international trip, no trips on date, missing city/date,
  * domestic-only route (excluded), sold-out trip, invalid/missing API key,
- * and absence of personal data in the response.
+ * absence of personal data in the response and in the bookings SELECT,
+ * reverse-direction and partial-city-match exclusion, the four TJ/foreign
+ * classification pairings, the Asia/Dushanbe day-boundary "already
+ * departed" check, and real cancellation of a slow in-flight query.
  */
 
 'use strict';
@@ -30,12 +33,14 @@ const DATE_INTL_OK = isoDaysFromNow(30);      // scenario: valid international t
 const DATE_NO_TRIPS = isoDaysFromNow(31);     // scenario: no trips at all on this date
 const DATE_DOMESTIC_ONLY = isoDaysFromNow(32); // scenario: only a domestic route exists
 const DATE_SOLD_OUT = isoDaysFromNow(33);     // scenario: international trip, 0 free seats
+const DATE_DIRECTION = isoDaysFromNow(34);    // scenario: direction/partial-match exclusion
 
 const mockDb = {
     cities: [
         { name: 'Душанбе', type: 'bus' },
         { name: 'Худжанд', type: 'bus' },
-        { name: 'Москва', type: 'bus' }
+        { name: 'Москва', type: 'bus' },
+        { name: 'Бишкек', type: 'bus' }
     ],
     bus_tickets: [
         {
@@ -52,6 +57,24 @@ const mockDb = {
             id: 3, from_city: 'Худжанд', to_city: 'Москва',
             departure_date: DATE_SOLD_OUT, departure_time: '07:00:00',
             price: 1600, status: 'active', total_seats: 1
+        },
+        // Direction / partial-match scenario: a query for "из Худжанда в
+        // Москву" must return ONLY id 4 — never the reverse (id 5) and
+        // never a trip that matches just one of the two named cities (id 6).
+        {
+            id: 4, from_city: 'Худжанд', to_city: 'Москва',
+            departure_date: DATE_DIRECTION, departure_time: '06:00:00',
+            price: 1550, status: 'active', total_seats: 40
+        },
+        {
+            id: 5, from_city: 'Москва', to_city: 'Худжанд',
+            departure_date: DATE_DIRECTION, departure_time: '10:00:00',
+            price: 1550, status: 'active', total_seats: 40
+        },
+        {
+            id: 6, from_city: 'Худжанд', to_city: 'Бишкек',
+            departure_date: DATE_DIRECTION, departure_time: '12:00:00',
+            price: 900, status: 'active', total_seats: 40
         }
     ],
     bus_ticket_bookings: [
@@ -78,11 +101,19 @@ const mockDb = {
 // cannot and does not prove SQL-level cancellation inside Postgres.
 const abortTracking = { fired: false };
 
+// Captures the column list of the most recent .select() call per table, so
+// tests can assert the route never requests sensitive columns it doesn't
+// use (e.g. bus_ticket_bookings.passengers_data) — a real Postgres/PostgREST
+// projection isn't available here, but the requested column string is
+// exactly what determines what such a backend would actually return.
+const lastSelectColumns = {};
+
 function makeMockSupabase(db) {
     return {
         from(table) {
             return {
-                select() {
+                select(columns) {
+                    lastSelectColumns[table] = columns;
                     const filters = [];
                     let signal = null;
                     const builder = {
@@ -149,6 +180,12 @@ require.cache[dbPath] = {
 
 const express = require('express');
 const labbayRouter = require('../routes/labbay');
+const {
+    classifyCity,
+    isConfidentInternationalRoute,
+    hasTicketAlreadyDeparted
+} = require('../utils/labbayKnowledgeHelper');
+const { getBusinessLocalDate, getBusinessLocalTime } = require('../utils/dashboardHelper');
 
 const app = express();
 app.use(express.json());
@@ -241,6 +278,25 @@ test('LABBAY DYNAMIC KNOWLEDGE BASE — POST /api/labbay/knowledge', async (t) =
         assert.doesNotMatch(res.body.content, /120/);
     });
 
+    await t.test('reverse direction is excluded: "из Худжанда в Москву" never returns the Москва -> Худжанд trip', async () => {
+        const res = await makeRequest('POST', '/api/labbay/knowledge', AUTH, {
+            query: `из Худжанда в Москву ${DATE_DIRECTION}`
+        });
+        assert.equal(res.status, 200);
+        assert.match(res.body.content, /Худжанд → Москва/);
+        assert.doesNotMatch(res.body.content, /Москва → Худжанд/);
+        assert.doesNotMatch(res.body.content, /bus-ticket\/5/);
+    });
+
+    await t.test('partial match is excluded: a trip matching only one of the two named cities is not returned', async () => {
+        const res = await makeRequest('POST', '/api/labbay/knowledge', AUTH, {
+            query: `из Худжанда в Москву ${DATE_DIRECTION}`
+        });
+        assert.equal(res.status, 200);
+        assert.doesNotMatch(res.body.content, /Бишкек/);
+        assert.doesNotMatch(res.body.content, /bus-ticket\/6/);
+    });
+
     await t.test('sold-out international trip: reports no free seats, omits booking link', async () => {
         const res = await makeRequest('POST', '/api/labbay/knowledge', AUTH, {
             query: `Худжанд Москва ${DATE_SOLD_OUT}`
@@ -271,6 +327,21 @@ test('LABBAY DYNAMIC KNOWLEDGE BASE — POST /api/labbay/knowledge', async (t) =
         assert.equal(res.status, 200);
         assert.doesNotMatch(res.body.content, /Секретный Пассажир/);
         assert.doesNotMatch(res.body.content, /\+9929377777/);
+    });
+
+    await t.test('bookings SELECT never requests passengers_data', async () => {
+        // calculateTripFillStats()'s free_seats — the only stat this
+        // endpoint reads — never touches passengers_data (only
+        // seat_numbers/status/hold_expires_at/created_at). Asserts the
+        // route doesn't fetch that PII-bearing column from the DB at all,
+        // not just that it doesn't echo it back.
+        delete lastSelectColumns.bus_ticket_bookings;
+        const res = await makeRequest('POST', '/api/labbay/knowledge', AUTH, {
+            query: `Душанбе Москва ${DATE_INTL_OK}`
+        });
+        assert.equal(res.status, 200);
+        assert.equal(typeof lastSelectColumns.bus_ticket_bookings, 'string');
+        assert.doesNotMatch(lastSelectColumns.bus_ticket_bookings, /passengers_data/);
     });
 
     await t.test('query too long: rejected with 400', async () => {
@@ -341,4 +412,78 @@ test('LABBAY DYNAMIC KNOWLEDGE BASE — POST /api/labbay/knowledge', async (t) =
     });
 
     server.close();
+});
+
+// ---------------------------------------------------------------------
+// Pure-function unit tests (no HTTP server, no mock DB) — the exact
+// classification and day-boundary logic the route above depends on.
+// ---------------------------------------------------------------------
+
+test('isConfidentInternationalRoute — requires exactly one TJ side and one foreign side', () => {
+    // TJ -> foreign: international.
+    assert.equal(isConfidentInternationalRoute('Душанбе', 'Москва'), true);
+    // foreign -> TJ: international.
+    assert.equal(isConfidentInternationalRoute('Москва', 'Душанбе'), true);
+    // TJ -> TJ: domestic, never international.
+    assert.equal(isConfidentInternationalRoute('Душанбе', 'Худжанд'), false);
+    // foreign -> foreign: NOT international — a single foreign endpoint is
+    // not sufficient on its own; this is the pairing bug that was fixed.
+    assert.equal(isConfidentInternationalRoute('Москва', 'Бишкек'), false);
+
+    // Sanity on the underlying classifier for the same four cities.
+    assert.equal(classifyCity('Душанбе'), 'tj');
+    assert.equal(classifyCity('Худжанд'), 'tj');
+    assert.equal(classifyCity('Москва'), 'foreign');
+    assert.equal(classifyCity('Бишкек'), 'foreign');
+});
+
+test('hasTicketAlreadyDeparted — Asia/Dushanbe day boundary, not UTC or server-local time', () => {
+    // A trip dated for a day strictly before "today" (business-local) has
+    // always departed, regardless of time.
+    assert.equal(
+        hasTicketAlreadyDeparted({ departure_date: '2026-10-04', departure_time: '23:59' }, '2026-10-05', '00:05'),
+        true
+    );
+    // A trip dated for a day strictly after "today" has never departed,
+    // regardless of the current time-of-day.
+    assert.equal(
+        hasTicketAlreadyDeparted({ departure_date: '2026-10-06', departure_time: '00:01' }, '2026-10-05', '23:55'),
+        false
+    );
+
+    // The boundary that actually matters: Asia/Dushanbe (UTC+5) rolls over
+    // to a new business-local day ~5 hours before UTC does. A trip departing
+    // at 00:10 on the NEW business-local day must already be considered
+    // departed once business-local time has passed 00:10 on that day, even
+    // though a UTC-date-based check would still think it's "yesterday" and
+    // never even compare the time — that mismatch was the bug.
+    assert.equal(
+        hasTicketAlreadyDeparted({ departure_date: '2026-10-06', departure_time: '00:10' }, '2026-10-06', '00:30'),
+        true,
+        'a trip 20 minutes into the new business-local day should already be considered departed'
+    );
+    // Same day, but the current business-local time is still before
+    // departure: not yet departed.
+    assert.equal(
+        hasTicketAlreadyDeparted({ departure_date: '2026-10-06', departure_time: '23:50' }, '2026-10-06', '00:30'),
+        false
+    );
+});
+
+test('getBusinessLocalDate/getBusinessLocalTime — correct across the UTC/Asia-Dushanbe day boundary', () => {
+    // 2026-10-05T20:30:00Z is 2026-10-06T01:30:00+05:00 in Asia/Dushanbe —
+    // already the next business-local day and well past midnight there,
+    // while a naive `now.toISOString().split('T')[0]` (UTC date) would
+    // still say "2026-10-05". This is exactly the class of bug the route
+    // fix removes by using these functions everywhere instead of mixing in
+    // a UTC calendar date.
+    const straddlingInstant = new Date('2026-10-05T20:30:00.000Z');
+
+    assert.equal(getBusinessLocalDate('Asia/Dushanbe', straddlingInstant), '2026-10-06');
+    assert.equal(getBusinessLocalTime('Asia/Dushanbe', straddlingInstant), '01:30');
+
+    // A naive UTC-date read of the same instant would disagree — this is
+    // the mismatch that used to exist between todayIso (business-local,
+    // already correct) and the old currentDate/currentTime (UTC-based).
+    assert.equal(straddlingInstant.toISOString().split('T')[0], '2026-10-05');
 });

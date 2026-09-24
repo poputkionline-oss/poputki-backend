@@ -15,31 +15,36 @@
 const { isPendingHoldActive } = require('./paymentExpirationHelper');
 
 /**
- * Calculates current business local date in YYYY-MM-DD format and local time HH:mm (Asia/Dushanbe UTC+5).
+ * Calculates current business local date in YYYY-MM-DD format (Asia/Dushanbe UTC+5).
+ *
+ * @param {string} timeZone
+ * @param {Date} now defaults to the real current instant; overridable so
+ *   callers (and tests) can deterministically exercise a specific moment —
+ *   in particular the UTC/Asia-Dushanbe day-boundary window (UTC 19:00–23:59
+ *   is already "tomorrow" in Dushanbe) without depending on wall-clock time.
  */
-function getBusinessLocalDate(timeZone = 'Asia/Dushanbe') {
+function getBusinessLocalDate(timeZone = 'Asia/Dushanbe', now = new Date()) {
     try {
-        const d = new Date();
-        const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
+        const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
         const y = parts.find(p => p.type === 'year').value;
         const m = parts.find(p => p.type === 'month').value;
         const day = parts.find(p => p.type === 'day').value;
         return `${y}-${m}-${day}`;
     } catch (e) {
-        const d = new Date(Date.now() + 5 * 3600 * 1000);
+        const d = new Date(now.getTime() + 5 * 3600 * 1000);
         return d.toISOString().slice(0, 10);
     }
 }
 
 /**
  * Calculates current business local time in HH:mm format (Asia/Dushanbe UTC+5).
+ * Same `now` override as getBusinessLocalDate(), for the same reason.
  */
-function getBusinessLocalTime(timeZone = 'Asia/Dushanbe') {
+function getBusinessLocalTime(timeZone = 'Asia/Dushanbe', now = new Date()) {
     try {
-        const d = new Date();
-        return new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+        return new Intl.DateTimeFormat('en-GB', { timeZone, hour: '2-digit', minute: '2-digit', hour12: false }).format(now);
     } catch (e) {
-        const d = new Date(Date.now() + 5 * 3600 * 1000);
+        const d = new Date(now.getTime() + 5 * 3600 * 1000);
         return d.toISOString().slice(11, 16);
     }
 }

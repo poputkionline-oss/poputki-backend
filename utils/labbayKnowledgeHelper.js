@@ -101,24 +101,22 @@ function classifyCity(cityRaw) {
 }
 
 /**
- * Returns true only when the route is confidently international: at least
- * one endpoint is a recognized foreign city and no endpoint is unrecognized
- * as "definitely foreign" while contradicting the other. Unrecognized
- * endpoints never get classified as international by assumption.
+ * Returns true only when the route is confidently international: one
+ * endpoint recognized as Tajikistan and the other recognized as foreign.
+ *
+ * A single foreign-classified endpoint is NOT sufficient on its own — a
+ * foreign→foreign pair (e.g. two Russian cities) is not evidence of a real
+ * Poputki international route touching Tajikistan; it is at best a data
+ * entry anomaly, and reporting it as "international" would be exactly the
+ * kind of guess this endpoint must not make. Domestic (tj/tj) and any pair
+ * involving an unrecognized endpoint are likewise excluded.
  */
 function isConfidentInternationalRoute(fromCity, toCity) {
     const fromClass = classifyCity(fromCity);
     const toClass = classifyCity(toCity);
 
-    if (fromClass === 'foreign' || toClass === 'foreign') {
-        // At least one side confidently foreign. Reject only if the other
-        // side is confidently foreign from the SAME country pairing check
-        // isn't needed here — Poputki has no purely-foreign-to-foreign
-        // routes, so one confident foreign endpoint is sufficient.
-        return true;
-    }
-
-    return false;
+    return (fromClass === 'tj' && toClass === 'foreign') ||
+        (fromClass === 'foreign' && toClass === 'tj');
 }
 
 // -------------------------------------------------------------------------
@@ -139,15 +137,33 @@ function cityStem(cityName) {
     return clean.slice(0, clean.length - 2);
 }
 
+const FROM_PREPOSITIONS = new Set(['из', 'от']);
+const TO_PREPOSITIONS = new Set(['в', 'до', 'на']);
+
+/**
+ * The word immediately preceding a match at `index` in the normalized
+ * query, used to detect a directional preposition ("из", "в", ...).
+ */
+function precedingWord(nq, index) {
+    const before = nq.slice(0, index).trimEnd();
+    const parts = before.split(' ');
+    return parts[parts.length - 1] || '';
+}
+
 /**
  * Finds which known cities (from the `cities` table, type='bus') are
- * mentioned in the customer's free-text query.
+ * mentioned in the customer's free-text query, in the order they first
+ * appear (NOT the order they happen to appear in `knownCities`, which is
+ * unrelated to what the customer actually said and previously produced a
+ * meaningless "first"/"second" for direction fallback). Each match also
+ * carries a direction guess from a preposition immediately before it, if
+ * any ("из"/"от" -> from, "в"/"до"/"на" -> to).
  *
  * @param {string} query
  * @param {Array<{name: string}>} knownCities
- * @returns {string[]} matched canonical city names (as stored), deduped
+ * @returns {{name: string, index: number, direction: 'from'|'to'|null}[]}
  */
-function findMentionedCities(query, knownCities) {
+function findCityMentions(query, knownCities) {
     const nq = normalizeQuery(query);
     if (!nq) return [];
 
@@ -155,16 +171,66 @@ function findMentionedCities(query, knownCities) {
     const seen = new Set();
 
     for (const city of knownCities || []) {
-        if (!city || !city.name) continue;
+        if (!city || !city.name || seen.has(city.name)) continue;
         const stem = cityStem(city.name);
         if (stem.length < 3) continue;
-        if (nq.includes(stem) && !seen.has(city.name)) {
-            seen.add(city.name);
-            matches.push(city.name);
-        }
+        const index = nq.indexOf(stem);
+        if (index === -1) continue;
+
+        seen.add(city.name);
+        const word = precedingWord(nq, index);
+        const direction = FROM_PREPOSITIONS.has(word) ? 'from' : (TO_PREPOSITIONS.has(word) ? 'to' : null);
+        matches.push({ name: city.name, index, direction });
     }
 
+    matches.sort((a, b) => a.index - b.index);
     return matches;
+}
+
+/**
+ * Resolves the customer's query into a route intent: which city (if any) is
+ * the origin, which is the destination, and the full set of mentioned
+ * cities. Direction is taken from an explicit preposition where present;
+ * with two or more cities and no preposition, the first-mentioned city is
+ * assumed to be the origin (matches how routes are written everywhere else
+ * in this codebase, "{from} -> {to}"). With only one recognized city and no
+ * preposition, neither side is pinned — the caller matches either side.
+ *
+ * @returns {{from: string|null, to: string|null, cities: string[]}}
+ */
+function resolveRouteCities(query, knownCities) {
+    const mentions = findCityMentions(query, knownCities);
+    if (mentions.length === 0) return { from: null, to: null, cities: [] };
+
+    const cities = mentions.map(m => m.name);
+
+    if (mentions.length === 1) {
+        const m = mentions[0];
+        return {
+            from: m.direction === 'from' ? m.name : null,
+            to: m.direction === 'to' ? m.name : null,
+            cities
+        };
+    }
+
+    const fromMention = mentions.find(m => m.direction === 'from');
+    const toMention = mentions.find(m => m.direction === 'to' && m !== fromMention);
+
+    let from = fromMention ? fromMention.name : null;
+    let to = toMention ? toMention.name : null;
+
+    if (!from && !to) {
+        from = mentions[0].name;
+        to = mentions[1].name;
+    } else if (from && !to) {
+        const other = mentions.find(m => m.name !== from);
+        to = other ? other.name : null;
+    } else if (to && !from) {
+        const other = mentions.find(m => m.name !== to);
+        from = other ? other.name : null;
+    }
+
+    return { from, to, cities };
 }
 
 const MONTHS_RU = {
@@ -248,17 +314,17 @@ function extractDate(query, todayIso) {
 /**
  * Parses a customer query into a route intent.
  *
- * @returns {{cities: string[], date: string|null, missing: string[]}}
+ * @returns {{from: string|null, to: string|null, cities: string[], date: string|null, missing: string[]}}
  */
 function parseIntent(query, knownCities, todayIso) {
-    const cities = findMentionedCities(query, knownCities);
+    const { from, to, cities } = resolveRouteCities(query, knownCities);
     const date = extractDate(query, todayIso);
 
     const missing = [];
     if (cities.length === 0) missing.push('направление (город отправления или назначения)');
     if (!date) missing.push('дата поездки');
 
-    return { cities, date, missing };
+    return { from, to, cities, date, missing };
 }
 
 // -------------------------------------------------------------------------
@@ -309,25 +375,68 @@ function truncateToByteLimit(text, maxBytes) {
     return buf.toString('utf8');
 }
 
+function sideMatchesCity(sideText, cityName) {
+    if (!cityName) return false;
+    const stem = cityStem(cityName);
+    return stem.length >= 3 && sideText.includes(stem);
+}
+
 /**
- * Whether a bus_tickets row's from_city/to_city plausibly corresponds to
- * any of the cities the customer mentioned (same lax stem-matching used to
- * parse the query in the first place, so results stay consistent with what
- * triggered the search).
+ * Whether a bus_tickets row matches the customer's resolved route intent.
+ *
+ * When a direction was resolved (from and/or to pinned — see
+ * resolveRouteCities()), BOTH known sides must match their respective side
+ * of the ticket: a query for "из Худжанда в Москву" must reject a reverse
+ * Москва -> Худжанд ticket, and must reject a ticket that only matches one
+ * of the two named cities (e.g. Худжанд -> Бишкек) — matching "any
+ * mentioned city on any side" was the bug this replaces.
+ *
+ * Only when no direction could be resolved at all (a single, unprefixed
+ * city mention) does this fall back to matching either side, since there
+ * is genuinely only one known endpoint and no second city to be strict
+ * against.
  *
  * @param {{from_city: string, to_city: string}} ticket
- * @param {string[]} mentionedCities canonical city names from parseIntent()
+ * @param {{from: string|null, to: string|null, cities: string[]}} intent
  */
-function routeMatchesCities(ticket, mentionedCities) {
-    if (!mentionedCities || mentionedCities.length === 0) return false;
-    const from = normalizeQuery(ticket.from_city || '');
-    const to = normalizeQuery(ticket.to_city || '');
+function routeMatchesIntent(ticket, intent) {
+    const fromCity = normalizeQuery(ticket.from_city || '');
+    const toCity = normalizeQuery(ticket.to_city || '');
 
-    return mentionedCities.some(city => {
-        const stem = cityStem(city);
-        if (stem.length < 3) return false;
-        return from.includes(stem) || to.includes(stem);
-    });
+    if (intent.from || intent.to) {
+        const fromOk = intent.from ? sideMatchesCity(fromCity, intent.from) : true;
+        const toOk = intent.to ? sideMatchesCity(toCity, intent.to) : true;
+        return fromOk && toOk;
+    }
+
+    if (!intent.cities || intent.cities.length === 0) return false;
+    return intent.cities.some(city =>
+        sideMatchesCity(fromCity, city) || sideMatchesCity(toCity, city)
+    );
+}
+
+/**
+ * Whether a ticket's departure has already passed, given the platform's
+ * single business-local ("today") reference — the same Asia/Dushanbe clock
+ * used everywhere else (getBusinessLocalDate/getBusinessLocalTime in
+ * utils/dashboardHelper.js), never a UTC calendar date or the server
+ * process's own local timezone. Takes todayIso/nowLocalTime as plain
+ * strings (not a Date) specifically so the day-boundary case — Asia/Dushanbe
+ * is UTC+5, so it is already "tomorrow" there for roughly 5 hours before UTC
+ * agrees — is deterministically testable without mocking wall-clock time.
+ *
+ * @param {{departure_date: string, departure_time: string}} ticket
+ * @param {string} todayIso business-local "today", YYYY-MM-DD
+ * @param {string} nowLocalTime business-local time-of-day, HH:mm
+ */
+function hasTicketAlreadyDeparted(ticket, todayIso, nowLocalTime) {
+    if (!ticket.departure_date) return false;
+    if (ticket.departure_date < todayIso) return true;
+    if (ticket.departure_date > todayIso) return false;
+
+    const depTime = String(ticket.departure_time || '').slice(0, 5);
+    if (!depTime) return false;
+    return depTime < nowLocalTime;
 }
 
 module.exports = {
@@ -337,10 +446,12 @@ module.exports = {
     CURRENCY_LABEL,
     classifyCity,
     isConfidentInternationalRoute,
-    findMentionedCities,
+    findCityMentions,
+    resolveRouteCities,
     extractDate,
     parseIntent,
-    routeMatchesCities,
+    routeMatchesIntent,
+    hasTicketAlreadyDeparted,
     formatTripLine,
     formatDateHuman,
     buildClarifyingQuestion,

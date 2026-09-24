@@ -23,14 +23,15 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../db');
 const { constantTimeEqual } = require('../utils/adminTokenAuth');
-const { calculateTripFillStats, getBusinessLocalDate } = require('../utils/dashboardHelper');
+const { calculateTripFillStats, getBusinessLocalDate, getBusinessLocalTime } = require('../utils/dashboardHelper');
 const {
     MAX_QUERY_LENGTH,
     MAX_CONTENT_BYTES,
     MAX_RESULTS,
     isConfidentInternationalRoute,
     parseIntent,
-    routeMatchesCities,
+    routeMatchesIntent,
+    hasTicketAlreadyDeparted,
     formatTripLine,
     buildClarifyingQuestion,
     buildNoResultsMessage,
@@ -79,10 +80,18 @@ async function handleKnowledgeQuery(req, res, signal) {
         return send(400, { error: `Field "query" must be at most ${MAX_QUERY_LENGTH} characters` });
     }
 
+    // "Today" and "already departed" are always measured in the single
+    // Asia/Dushanbe business-local clock (utils/dashboardHelper.js), never
+    // a UTC calendar date or the server process's own local timezone. Using
+    // two different notions of "now" in the same handler was exactly the
+    // bug: Asia/Dushanbe is UTC+5, so it is already "tomorrow" there for
+    // roughly 5 hours (UTC ~19:00-23:59) before a UTC-based check agrees —
+    // a window in which trips could wrongly show as bookable after they'd
+    // actually departed, or a same-day trip could be silently skipped from
+    // "already departed" filtering entirely.
     const now = new Date();
-    const currentDate = now.toISOString().split('T')[0];
-    const currentTime = now.toTimeString().split(' ')[0];
     const todayIso = getBusinessLocalDate();
+    const nowLocalTime = getBusinessLocalTime();
 
     const { data: knownCities, error: citiesError } = await supabase
         .from('cities')
@@ -99,8 +108,9 @@ async function handleKnowledgeQuery(req, res, signal) {
         return send(200, { content: buildClarifyingQuestion(intent.missing) });
     }
 
-    // A date strictly in the past can never have an active, bookable trip.
-    if (intent.date < currentDate) {
+    // A date strictly in the past (business-local) can never have an
+    // active, bookable trip.
+    if (intent.date < todayIso) {
         return send(200, { content: buildNoResultsMessage(intent.cities, intent.date) });
     }
 
@@ -114,14 +124,10 @@ async function handleKnowledgeQuery(req, res, signal) {
     if (ticketsError) throw ticketsError;
 
     let candidates = (tickets || []).filter(t =>
-        routeMatchesCities(t, intent.cities) &&
-        isConfidentInternationalRoute(t.from_city, t.to_city)
+        routeMatchesIntent(t, intent) &&
+        isConfidentInternationalRoute(t.from_city, t.to_city) &&
+        !hasTicketAlreadyDeparted(t, todayIso, nowLocalTime)
     );
-
-    // Same-day trips that have already departed are not bookable.
-    if (intent.date === currentDate) {
-        candidates = candidates.filter(t => !t.departure_time || t.departure_time >= currentTime);
-    }
 
     candidates.sort((a, b) => String(a.departure_time || '').localeCompare(String(b.departure_time || '')));
     candidates = candidates.slice(0, MAX_RESULTS);
@@ -130,10 +136,19 @@ async function handleKnowledgeQuery(req, res, signal) {
         return send(200, { content: buildNoResultsMessage(intent.cities, intent.date) });
     }
 
+    // passengers_data (names, gender, document numbers — see
+    // routes/busBookings.js insert) is deliberately NOT selected here.
+    // calculateTripFillStats()'s free_seats — the only stat this endpoint
+    // reads — comes entirely from seat_numbers/status/hold_expires_at/
+    // created_at; passengers_data only ever feeds its passenger-count
+    // aggregates (getBookingPassengerCount(), which itself prefers
+    // booking.passenger_count first, always set at insert), none of which
+    // this endpoint surfaces. Selecting it would pull passenger PII into
+    // memory for zero benefit.
     const ticketIds = candidates.map(t => t.id);
     const { data: bookings, error: bookingsError } = await supabase
         .from('bus_ticket_bookings')
-        .select('id, bus_ticket_id, status, seat_numbers, passengers_data, hold_expires_at, created_at, boarding_status')
+        .select('id, bus_ticket_id, status, seat_numbers, hold_expires_at, created_at, boarding_status')
         .in('bus_ticket_id', ticketIds)
         .abortSignal(signal);
     if (bookingsError) throw bookingsError;
