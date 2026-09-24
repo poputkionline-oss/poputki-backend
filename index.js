@@ -174,6 +174,7 @@ const consentRoutes = require('./routes/consents');
 const referralRoutes = require('./routes/referrals');
 const internalAcquisitionRoutes = require('./routes/internalAcquisition');
 const adminAcquisitionRoutes = require('./routes/adminAcquisitionFunnel');
+const labbayRoutes = require('./routes/labbay');
 
 // Use Routes
 app.use('/api/auth', authRoutes);
@@ -199,6 +200,9 @@ app.use('/api/marketing-consents', consentRoutes);
 app.use('/api/referrals', referralRoutes);
 app.use('/api/internal/acquisition', internalAcquisitionRoutes);
 app.use('/', acquisitionRoutes); // For GET /l/:rawToken and GET /r/:rawCode redirect routes
+
+// Labbay Dynamic Knowledge Base integration (international bus trips only)
+app.use('/api/labbay', labbayRoutes);
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
