@@ -3,39 +3,16 @@
  * Phase: P1.4 Owner Dashboard (Hardened & Performance-Optimized)
  */
 
-const PAYMENT_HOLD_TTL_MS = 30 * 60 * 1000;
-
-function isPendingHoldActive(booking, now = new Date()) {
-    if (!booking || booking.status !== 'pending_payment') {
-        return false;
-    }
-
-    let expiresAt = null;
-
-    if (booking.hold_expires_at) {
-        const parsed = new Date(booking.hold_expires_at);
-        if (!Number.isNaN(parsed.getTime())) {
-            expiresAt = parsed;
-        }
-    }
-
-    // Legacy bookings: SmartPay invoice lifetime = 30 minutes.
-    if (!expiresAt && booking.created_at) {
-        const createdAt = new Date(booking.created_at);
-        if (!Number.isNaN(createdAt.getTime())) {
-            expiresAt = new Date(createdAt.getTime() + PAYMENT_HOLD_TTL_MS);
-        }
-    }
-
-    if (!expiresAt) {
-        return false;
-    }
-
-    const currentTime =
-        now instanceof Date ? now.getTime() : new Date(now).getTime();
-
-    return expiresAt.getTime() > currentTime;
-}
+// Seat-hold expiration is the single most consequence-bearing rule this
+// module shares with the actual booking-creation path (routes/busBookings.js
+// consults paymentExpirationHelper.isSeatLockedByBooking() directly to
+// decide whether a seat can be booked). This module used to carry its own,
+// independently-written copy of the same 30-minute-hold rule; that duplicate
+// happened to match today, but nothing enforced that it always would. Every
+// caller of "is this seat actually taken" — including the Labbay Dynamic
+// Knowledge Base endpoint via calculateTripFillStats() — now goes through
+// the one canonical implementation instead.
+const { isPendingHoldActive } = require('./paymentExpirationHelper');
 
 /**
  * Calculates current business local date in YYYY-MM-DD format and local time HH:mm (Asia/Dushanbe UTC+5).

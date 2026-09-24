@@ -37,7 +37,15 @@ const {
     truncateToByteLimit
 } = require('../utils/labbayKnowledgeHelper');
 
-const REQUEST_BUDGET_MS = 4500; // stay under Labbay's 5s timeout
+const DEFAULT_REQUEST_BUDGET_MS = 4500; // stay under Labbay's 5s timeout
+
+// Read fresh per-request (not a module-level constant) so tests can exercise
+// the abort path deterministically via LABBAY_REQUEST_BUDGET_MS without a
+// multi-second real sleep; production always gets the 4500ms default.
+function getRequestBudgetMs() {
+    const override = Number(process.env.LABBAY_REQUEST_BUDGET_MS);
+    return Number.isFinite(override) && override > 0 ? override : DEFAULT_REQUEST_BUDGET_MS;
+}
 
 function requireLabbayApiKey(req, res, next) {
     const configured = process.env.LABBAY_API_KEY;
@@ -54,7 +62,7 @@ function requireLabbayApiKey(req, res, next) {
     return next();
 }
 
-async function handleKnowledgeQuery(req, res) {
+async function handleKnowledgeQuery(req, res, signal) {
     // Guards every response write against the sibling timeout handler in the
     // route below already having sent a response first.
     const send = (status, body) => {
@@ -79,7 +87,8 @@ async function handleKnowledgeQuery(req, res) {
     const { data: knownCities, error: citiesError } = await supabase
         .from('cities')
         .select('name')
-        .eq('type', 'bus');
+        .eq('type', 'bus')
+        .abortSignal(signal);
     if (citiesError) {
         console.error('[Labbay] Failed to load cities reference list:', citiesError.message);
     }
@@ -99,7 +108,8 @@ async function handleKnowledgeQuery(req, res) {
         .from('bus_tickets')
         .select('id, from_city, to_city, departure_date, departure_time, price, status, total_seats')
         .eq('status', 'active')
-        .eq('departure_date', intent.date);
+        .eq('departure_date', intent.date)
+        .abortSignal(signal);
 
     if (ticketsError) throw ticketsError;
 
@@ -124,7 +134,8 @@ async function handleKnowledgeQuery(req, res) {
     const { data: bookings, error: bookingsError } = await supabase
         .from('bus_ticket_bookings')
         .select('id, bus_ticket_id, status, seat_numbers, passengers_data, hold_expires_at, created_at, boarding_status')
-        .in('bus_ticket_id', ticketIds);
+        .in('bus_ticket_id', ticketIds)
+        .abortSignal(signal);
     if (bookingsError) throw bookingsError;
 
     const bookingsByTicket = new Map();
@@ -172,19 +183,33 @@ async function handleKnowledgeQuery(req, res) {
  *         description: Answer for Labbay's AI bot
  */
 router.post('/knowledge', requireLabbayApiKey, async (req, res) => {
+    // A plain setTimeout that only sends a 504 does NOT stop the Supabase
+    // queries still running underneath it — they keep occupying a DB
+    // connection and CPU after Labbay has already given up. The
+    // AbortController is threaded into every query below via
+    // .abortSignal(), so timing out here actually cancels the in-flight
+    // request to Postgres instead of merely abandoning the response.
+    const controller = new AbortController();
     let settled = false;
+
     const timeoutTimer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        controller.abort();
         res.status(504).json({ error: 'Internal processing timeout' });
-    }, REQUEST_BUDGET_MS);
+    }, getRequestBudgetMs());
 
     try {
-        await handleKnowledgeQuery(req, res);
+        await handleKnowledgeQuery(req, res, controller.signal);
     } catch (err) {
-        console.error('[Labbay] Knowledge query error:', err.message);
-        if (!settled && !res.headersSent) {
-            res.status(500).json({ error: 'Internal server error' });
+        if (err.name === 'AbortError' || controller.signal.aborted) {
+            // Expected: the timeout above already aborted the query and
+            // responded 504. Nothing left to do.
+        } else {
+            console.error('[Labbay] Knowledge query error:', err.message);
+            if (!settled && !res.headersSent) {
+                res.status(500).json({ error: 'Internal server error' });
+            }
         }
     } finally {
         settled = true;

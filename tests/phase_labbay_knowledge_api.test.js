@@ -70,12 +70,18 @@ const mockDb = {
     ]
 };
 
+// Tracks whether a query's AbortSignal was actually observed firing while a
+// (simulated slow) request was still in flight — proof the DB request was
+// really cancelled, not just that the HTTP response timed out independently.
+const abortTracking = { fired: false };
+
 function makeMockSupabase(db) {
     return {
         from(table) {
             return {
                 select() {
                     const filters = [];
+                    let signal = null;
                     const builder = {
                         eq(col, val) {
                             filters.push(row => String(row[col]) === String(val));
@@ -86,12 +92,40 @@ function makeMockSupabase(db) {
                             filters.push(row => set.has(String(row[col])));
                             return builder;
                         },
+                        abortSignal(sig) {
+                            signal = sig;
+                            return builder;
+                        },
                         then(resolve, reject) {
-                            try {
-                                const rows = (db[table] || []).filter(row => filters.every(f => f(row)));
-                                resolve({ data: JSON.parse(JSON.stringify(rows)), error: null });
-                            } catch (e) {
-                                reject(e);
+                            const run = () => {
+                                try {
+                                    const rows = (db[table] || []).filter(row => filters.every(f => f(row)));
+                                    resolve({ data: JSON.parse(JSON.stringify(rows)), error: null });
+                                } catch (e) {
+                                    reject(e);
+                                }
+                            };
+
+                            const delayMs = db.__delays && db.__delays[table];
+                            if (!delayMs) {
+                                run();
+                                return;
+                            }
+
+                            // Simulates a slow Postgres round-trip so the
+                            // route's own timeout fires first, then proves
+                            // aborting the signal really cancels this
+                            // in-flight "request" instead of leaving it to
+                            // resolve into the void after the fact.
+                            const timer = setTimeout(run, delayMs);
+                            if (signal) {
+                                signal.addEventListener('abort', () => {
+                                    abortTracking.fired = true;
+                                    clearTimeout(timer);
+                                    const abortErr = new Error('The operation was aborted');
+                                    abortErr.name = 'AbortError';
+                                    reject(abortErr);
+                                });
                             }
                         }
                     };
@@ -253,6 +287,40 @@ test('LABBAY DYNAMIC KNOWLEDGE BASE — POST /api/labbay/knowledge', async (t) =
             assert.equal(res.status, 500);
         } finally {
             process.env.LABBAY_API_KEY = saved;
+        }
+    });
+
+    await t.test('slow DB query: responds 504 within budget AND actually cancels the in-flight query', async () => {
+        // Simulates Postgres taking far longer than Labbay's 5s budget.
+        // A correct implementation must (a) respond before the slow query
+        // would have finished, and (b) really abort that query — not just
+        // walk away from an unawaited promise still running server-side.
+        mockDb.__delays = { bus_tickets: 300 };
+        abortTracking.fired = false;
+        const savedBudget = process.env.LABBAY_REQUEST_BUDGET_MS;
+        process.env.LABBAY_REQUEST_BUDGET_MS = '50';
+
+        try {
+            const startedAt = Date.now();
+            const res = await makeRequest('POST', '/api/labbay/knowledge', AUTH, {
+                query: `Душанбе Москва ${DATE_INTL_OK}`
+            });
+            const elapsedMs = Date.now() - startedAt;
+
+            assert.equal(res.status, 504);
+            assert.ok(elapsedMs < 300, `expected the 50ms budget to win the race, took ${elapsedMs}ms`);
+
+            // Give the aborted listener a tick to run, then confirm the
+            // slow query was actually cancelled rather than left dangling.
+            await new Promise(resolve => setTimeout(resolve, 10));
+            assert.equal(abortTracking.fired, true, 'expected the in-flight DB query to be aborted, not merely outraced');
+        } finally {
+            delete mockDb.__delays;
+            if (savedBudget === undefined) {
+                delete process.env.LABBAY_REQUEST_BUDGET_MS;
+            } else {
+                process.env.LABBAY_REQUEST_BUDGET_MS = savedBudget;
+            }
         }
     });
 
