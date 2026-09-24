@@ -184,11 +184,17 @@ async function handleKnowledgeQuery(req, res, signal) {
  */
 router.post('/knowledge', requireLabbayApiKey, async (req, res) => {
     // A plain setTimeout that only sends a 504 does NOT stop the Supabase
-    // queries still running underneath it — they keep occupying a DB
-    // connection and CPU after Labbay has already given up. The
-    // AbortController is threaded into every query below via
-    // .abortSignal(), so timing out here actually cancels the in-flight
-    // request to Postgres instead of merely abandoning the response.
+    // query still in flight underneath it — the outbound HTTP request to
+    // PostgREST (and the Node-side work of waiting on it) keeps running
+    // after Labbay has already given up. The AbortController below is
+    // threaded into every query via .abortSignal(), so timing out here
+    // aborts that in-flight HTTP request at the Node/fetch level instead of
+    // merely abandoning an unawaited promise. This does NOT, by itself,
+    // prove the underlying SQL statement is killed inside Postgres — that
+    // depends on PostgREST/Postgres propagating the client disconnect to a
+    // server-side query cancellation (standard Postgres behavior on
+    // connection abort, but outside what this process controls or a unit
+    // test can observe).
     const controller = new AbortController();
     let settled = false;
 

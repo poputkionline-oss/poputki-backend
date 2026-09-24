@@ -71,8 +71,11 @@ const mockDb = {
 };
 
 // Tracks whether a query's AbortSignal was actually observed firing while a
-// (simulated slow) request was still in flight — proof the DB request was
-// really cancelled, not just that the HTTP response timed out independently.
+// (simulated slow) request was still pending — proof the route aborts the
+// signal it hands to the Supabase client, not just that the HTTP response
+// timed out independently while the query kept running unobserved. This
+// mock stands in for the Supabase query builder, not Postgres itself, so it
+// cannot and does not prove SQL-level cancellation inside Postgres.
 const abortTracking = { fired: false };
 
 function makeMockSupabase(db) {
@@ -290,11 +293,24 @@ test('LABBAY DYNAMIC KNOWLEDGE BASE — POST /api/labbay/knowledge', async (t) =
         }
     });
 
-    await t.test('slow DB query: responds 504 within budget AND actually cancels the in-flight query', async () => {
-        // Simulates Postgres taking far longer than Labbay's 5s budget.
-        // A correct implementation must (a) respond before the slow query
-        // would have finished, and (b) really abort that query — not just
-        // walk away from an unawaited promise still running server-side.
+    await t.test('slow DB query: responds 504 within budget AND actually fires the AbortSignal on the still-pending query', async () => {
+        // Simulates a Supabase query taking far longer than Labbay's 5s
+        // budget. Proves two things at the route's own boundary: (a) it
+        // responds before the slow query would have finished, and (b) the
+        // AbortSignal it hands to the Supabase client actually fires while
+        // that query is still pending, rather than the request handler just
+        // walking away from an unawaited promise.
+        //
+        // Scope: this mocks the Supabase query builder itself, so it does
+        // NOT exercise postgrest-js's real fetch() call or prove Postgres
+        // cancels the underlying SQL statement server-side — abortSignal()
+        // forwarding it to fetch() is verified by reading postgrest-js's
+        // source (PostgrestBuilder passes `signal` straight into its fetch
+        // options), and SQL-level cancellation on client disconnect is
+        // standard Postgres behavior outside this process's control. What
+        // this test guarantees is that OUR code reliably triggers that
+        // abort instead of silently leaving a promise to resolve into the
+        // void after the response has already gone out.
         mockDb.__delays = { bus_tickets: 300 };
         abortTracking.fired = false;
         const savedBudget = process.env.LABBAY_REQUEST_BUDGET_MS;
