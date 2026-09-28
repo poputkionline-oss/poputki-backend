@@ -98,16 +98,40 @@ describe('routes/busAdmin.js trip-edit — integration wiring (source-level)', (
         assert.ok(tripEditSection.includes('non-fatal'));
     });
 
-    it('the existing claimed_by_user_id || passenger_id recipient line is untouched', () => {
-        assert.match(tripEditSection, /const effectiveUserId = b\.claimed_by_user_id \|\| b\.passenger_id;/);
-    });
-
-    it('dedup: a follower candidate matching effectiveUserId is skipped before pushing an outbox row', () => {
+    it('the legacy claimed_by_user_id/passenger_id recipient is resolved via buildNotificationCandidates, not a local reimplementation', () => {
         const loopSection = busAdminSource.slice(
             busAdminSource.indexOf('const bookingFollowers = followersByBookingId'),
             busAdminSource.indexOf('const finalIdempotencyKey')
         );
-        assert.match(loopSection, /if\s*\(String\(candidate\.userId\)\s*===\s*String\(effectiveUserId\)\)\s*continue;/);
+        assert.match(loopSection, /buildNotificationCandidates\(\s*\{\s*claimed_by_user_id:\s*b\.claimed_by_user_id,\s*passenger_id:\s*b\.passenger_id\s*\}/);
+    });
+
+    it('dedup: candidates sharing the same resolved Telegram ID are skipped before pushing a second outbox row for this booking', () => {
+        const loopSection = busAdminSource.slice(
+            busAdminSource.indexOf('const bookingFollowers = followersByBookingId'),
+            busAdminSource.indexOf('const finalIdempotencyKey')
+        );
+        assert.match(loopSection, /usedTelegramIds/);
+        assert.match(loopSection, /if\s*\(tgId\s*&&\s*usedTelegramIds\.has\(tgId\)\)\s*continue;/);
+    });
+
+    it('booking_followers and users are queried via serviceClient, never the anon-key supabase client', () => {
+        const followersToUsersSection = busAdminSource.slice(
+            busAdminSource.indexOf("from('booking_followers')") - 200,
+            busAdminSource.indexOf("from('users')") + 100
+        );
+        assert.match(followersToUsersSection, /serviceClient\s*\n?\s*\.from\('booking_followers'\)/);
+        assert.match(followersToUsersSection, /serviceClient\s*\n?\s*\.from\('users'\)/);
+        assert.ok(!/(?<!service)Client\s*\n?\s*\.from\('users'\)\s*\n?\s*\.select\('id,\s*telegram_id,\s*language'\)/.test(followersToUsersSection));
+    });
+
+    it('the users query no longer selects the nonexistent language column', () => {
+        const followersToUsersSection = busAdminSource.slice(
+            busAdminSource.indexOf('// 6. Gather passenger Telegram IDs'),
+            busAdminSource.indexOf('const finalIdempotencyKey')
+        );
+        assert.match(followersToUsersSection, /\.select\('id,\s*telegram_id'\)/);
+        assert.ok(!followersToUsersSection.includes("select('id, telegram_id, language')"));
     });
 
     it('uses the real buildNotificationCandidates helper, not a local reimplementation', () => {
@@ -128,7 +152,7 @@ describe('Feature flag = false — trip-edit notification fan-out fully reverts 
     it('followersByBookingId is initialized empty and never populated when the flag check fails', () => {
         const block = busAdminSource.slice(
             busAdminSource.indexOf('const followersByBookingId = {};'),
-            busAdminSource.indexOf('const uniqueUserIds')
+            busAdminSource.indexOf('const userIds')
         );
         assert.match(block, /const followersByBookingId = \{\};/);
         // Phase P.2 added a leading `!isPriceOnlyChange &&` to this same `if`

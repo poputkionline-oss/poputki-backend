@@ -40,6 +40,8 @@ const {
     processTripChangeOutbox
 } = require('../utils/tripChangeNotificationService');
 const { getServiceRoleClient } = require('../dbServiceRole');
+const { computeChangedFields } = require('../utils/changedFieldsNormalization');
+const { buildNotificationCandidates } = require('../utils/notificationRecipientDedup');
 
 function getRequiredServiceClient() {
     try {
@@ -703,19 +705,26 @@ router.put('/tickets/:id', async (req, res) => {
             updateData.photos = newPhotoResults;
         }
 
-        // Detect changed fields and old/new diff
-        const oldValues = {};
-        const newValues = {};
-        const changedFields = [];
+        // Detect changed fields and old/new diff (normalized — see
+        // utils/changedFieldsNormalization.js for why a raw JSON.stringify
+        // comparison alone produces false positives for time-format and
+        // nullable-text fields).
+        const { oldValues, newValues, changedFields } = computeChangedFields(oldTicket, updateData);
 
-        for (const [key, val] of Object.entries(updateData)) {
-            const oldVal = oldTicket[key];
-            const isDifferent = JSON.stringify(oldVal) !== JSON.stringify(val);
-            if (isDifferent) {
-                changedFields.push(key);
-                oldValues[key] = oldVal;
-                newValues[key] = val;
-            }
+        // No-op protection: if, after normalization, nothing actually
+        // changed, this save must not fabricate a change event, outbox
+        // rows, or a worker wake-up — an edit that merely round-trips
+        // "06:35:00" -> "06:35" or "" -> null is not a real change.
+        if (changedFields.length === 0) {
+            return res.json({
+                success: true,
+                noChanges: true,
+                bus_replaced: false,
+                notificationsQueued: 0,
+                unreachableCount: 0,
+                manualContactRequired: 0,
+                seatsRemapped: 0
+            });
         }
 
         // Price-only edits get their own change_type AND skip the passenger
@@ -733,8 +742,21 @@ router.put('/tickets/:id', async (req, res) => {
         const PRICE_FIELDS = ['price', 'premium_price'];
         const isPriceOnlyChange = changedFields.length > 0 && changedFields.every(f => PRICE_FIELDS.includes(f));
 
-        // 6. Gather passenger Telegram IDs & language preferences
-        const userIds = isPriceOnlyChange ? [] : [...new Set(activeBookings.map(b => b.claimed_by_user_id || b.passenger_id).filter(Boolean))];
+        // 6. Gather passenger Telegram IDs.
+        //
+        // Resolves the service-role client here (once, hoisted) and reuses
+        // it for the booking_followers query, the users query, and the
+        // fn_atomic_bus_trip_update RPC below — never a new GRANT or RLS
+        // policy for anon/authenticated. This is safe specifically at this
+        // point in the handler because: carrierAuth already authenticated
+        // req.carrier; the trip itself was already verified against
+        // req.carrier's operator_id (verifyTicketAccess, above); and
+        // bookingIds are drawn only from activeBookings, which were
+        // queried scoped to this same trip.
+        const serviceClient = getRequiredServiceClient();
+        if (!serviceClient) {
+            return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
+        }
 
         // Manual Booking Telegram Subscription Model (additive, feature-
         // flagged): active booking_followers for these bookings are folded
@@ -742,42 +764,73 @@ router.put('/tickets/:id', async (req, res) => {
         // existing claimed_by_user_id/passenger_id recipient for the online
         // claim flow, only additional independent recipients per booking.
         // When the flag is off, followersByBookingId stays empty and every
-        // line below behaves exactly as before this change.
+        // booking's candidate list below is exactly the single legacy
+        // recipient, as before this change.
+        //
+        // Bugfix (trip-78/booking-487 audit): booking_followers has RLS
+        // enabled with zero policies and no anon/authenticated GRANT — the
+        // anon-key `supabase` client always got "permission denied", which
+        // the previous catch swallowed silently. Reading via serviceClient
+        // (see above) fixes this without touching RLS/GRANTs at all.
         const followersByBookingId = {};
         if (!isPriceOnlyChange && process.env.MANUAL_BOOKING_SUBSCRIPTION_MODEL_ENABLED === 'true') {
             try {
                 const bookingIds = activeBookings.map(b => b.id);
-                const { data: followerRows } = await supabase
+                const { data: followerRows, error: followerErr } = await serviceClient
                     .from('booking_followers')
-                    .select('booking_id, user_id, notifications_enabled')
+                    .select('booking_id, user_id, notifications_enabled, unsubscribed_at')
                     .in('booking_id', bookingIds)
+                    .eq('notifications_enabled', true)
                     .is('unsubscribed_at', null);
 
+                if (followerErr) throw followerErr;
+
                 (followerRows || []).forEach(row => {
-                    if (!row.notifications_enabled) return;
                     if (!followersByBookingId[row.booking_id]) followersByBookingId[row.booking_id] = [];
                     followersByBookingId[row.booking_id].push({ user_id: row.user_id, notifications_enabled: true });
-                    userIds.push(row.user_id);
                 });
             } catch (followerErr) {
-                console.warn('[BusAdmin TripEdit] Failed to load booking_followers (non-fatal, online-claim recipients unaffected):', followerErr.message);
+                // Non-fatal: legacy (claimed_by_user_id/passenger_id)
+                // recipients are unaffected. Never log the raw error object
+                // or any row contents — only identifiers and error shape.
+                console.warn('[BusAdmin TripEdit] Failed to load booking_followers (non-fatal, legacy recipients unaffected):', {
+                    trip_id: id,
+                    error_name: followerErr?.name || 'Error',
+                    error_code: followerErr?.code || null
+                });
             }
         }
-        const uniqueUserIds = [...new Set(userIds)];
+
+        // Bugfix (trip-78/booking-487 audit): the users query used to
+        // select a nonexistent `language` column, which failed the WHOLE
+        // query (not just the language part) for every recipient. Selects
+        // only columns that exist; language is hardcoded to 'ru' below
+        // (there is no per-user language preference stored today).
+        const userIds = isPriceOnlyChange ? [] : [...new Set(
+            activeBookings.flatMap(b => buildNotificationCandidates(
+                { claimed_by_user_id: b.claimed_by_user_id, passenger_id: b.passenger_id },
+                followersByBookingId[b.id] || []
+            ).map(c => c.userId))
+        )];
+
         let userTelegramMap = {};
-        let userLangMap = {};
-        if (uniqueUserIds.length > 0) {
+        if (userIds.length > 0) {
             try {
-                const { data: usersData } = await supabase
+                const { data: usersData, error: usersErr } = await serviceClient
                     .from('users')
-                    .select('id, telegram_id, language')
-                    .in('id', uniqueUserIds);
+                    .select('id, telegram_id')
+                    .in('id', userIds);
+                if (usersErr) throw usersErr;
                 (usersData || []).forEach(u => {
                     userTelegramMap[u.id] = u.telegram_id || null;
-                    userLangMap[u.id] = u.language || 'ru';
                 });
             } catch (e) {
-                console.warn('[BusAdmin] Error fetching passenger user profiles:', e);
+                // Never log telegram_id values.
+                console.warn('[BusAdmin] Error fetching passenger telegram ids:', {
+                    trip_id: id,
+                    error_name: e?.name || 'Error',
+                    error_code: e?.code || null
+                });
             }
         }
 
@@ -788,10 +841,6 @@ router.put('/tickets/:id', async (req, res) => {
         let seatsRemappedCount = 0;
 
         for (const b of (isPriceOnlyChange ? [] : activeBookings)) {
-            const effectiveUserId = b.claimed_by_user_id || b.passenger_id;
-            const tgId = effectiveUserId ? userTelegramMap[effectiveUserId] : null;
-            const userLang = (effectiveUserId && userLangMap[effectiveUserId]) || 'ru';
-
             let seatChange = null;
             if (seatRemap) {
                 const remap = seatRemap.find(r => r.booking_id === b.id);
@@ -823,56 +872,48 @@ router.put('/tickets/:id', async (req, res) => {
                 changes: { oldValues, newValues, changedFields, seatChange }
             };
 
-            const outboxStatus = tgId ? 'pending' : 'unreachable';
-            if (!tgId) {
-                unreachableCount++;
-            } else {
-                notificationsQueued++;
-            }
-
-            outboxEntries.push({
-                booking_id: b.id,
-                recipient_user_id: effectiveUserId || null,
-                recipient_telegram_id: tgId || null,
-                channel: 'telegram',
-                language: userLang,
-                payload: msgPayload,
-                status: outboxStatus
-            });
-
-            // Manual Booking Telegram Subscription Model: additional,
-            // independent outbox rows for this booking's active followers —
-            // deduplicated against the recipient above (and against each
-            // other) by user_id, so the same person is never queued twice
-            // for the same trip-change event regardless of how many of
-            // passenger_id/claimed_by_user_id/booking_followers they appear
-            // under. Each follower gets their OWN outbox row, so a delivery
-            // failure for one (handled by the existing per-row try/catch in
-            // processTripChangeOutbox) can never block any other recipient.
+            // Recipient formation: one candidate per distinct user_id —
+            // the legacy claimed_by_user_id/passenger_id slot plus this
+            // booking's active followers, deduped by user_id via
+            // buildNotificationCandidates (first-seen source wins; a user
+            // who is simultaneously the legacy recipient AND a follower
+            // gets exactly one candidate). Each candidate gets its OWN
+            // outbox row, so a delivery failure for one (handled by the
+            // existing per-row try/catch in processTripChangeOutbox) can
+            // never block any other recipient, and a legacy recipient
+            // without Telegram never removes or blocks follower deliveries.
+            //
+            // Additionally dedup by Telegram ID within this booking: the
+            // outbox's own UNIQUE constraint is keyed by
+            // recipient_user_id/recipient_key, not by Telegram ID, so two
+            // distinct platform accounts sharing one Telegram account
+            // would otherwise still receive two copies of the same
+            // message. Two followers with DIFFERENT Telegram IDs are
+            // unaffected and both get their own delivery.
             const bookingFollowers = followersByBookingId[b.id] || [];
-            if (bookingFollowers.length > 0) {
-                const { buildNotificationCandidates } = require('../utils/notificationRecipientDedup');
-                const candidates = buildNotificationCandidates(
-                    { claimed_by_user_id: b.claimed_by_user_id, passenger_id: b.passenger_id },
-                    bookingFollowers
-                );
-                for (const candidate of candidates) {
-                    if (String(candidate.userId) === String(effectiveUserId)) continue; // already queued above
-                    const followerTgId = userTelegramMap[candidate.userId];
-                    const followerLang = userLangMap[candidate.userId] || 'ru';
-                    const followerStatus = followerTgId ? 'pending' : 'unreachable';
-                    if (!followerTgId) unreachableCount++; else notificationsQueued++;
+            const candidates = buildNotificationCandidates(
+                { claimed_by_user_id: b.claimed_by_user_id, passenger_id: b.passenger_id },
+                bookingFollowers
+            );
 
-                    outboxEntries.push({
-                        booking_id: b.id,
-                        recipient_user_id: candidate.userId,
-                        recipient_telegram_id: followerTgId || null,
-                        channel: 'telegram',
-                        language: followerLang,
-                        payload: msgPayload,
-                        status: followerStatus
-                    });
-                }
+            const usedTelegramIds = new Set();
+            for (const candidate of candidates) {
+                const tgId = userTelegramMap[candidate.userId] || null;
+                if (tgId && usedTelegramIds.has(tgId)) continue;
+                if (tgId) usedTelegramIds.add(tgId);
+
+                const status = tgId ? 'pending' : 'unreachable';
+                if (tgId) notificationsQueued++; else unreachableCount++;
+
+                outboxEntries.push({
+                    booking_id: b.id,
+                    recipient_user_id: candidate.userId,
+                    recipient_telegram_id: tgId,
+                    channel: 'telegram',
+                    language: 'ru',
+                    payload: msgPayload,
+                    status
+                });
             }
         }
 
@@ -889,22 +930,14 @@ router.put('/tickets/:id', async (req, res) => {
         };
 
         // 8. ATOMIC DATABASE RPC EXECUTION (P0-01)
-        // Resolves service-role client to execute the security-definer function.
-        // Bugfix P.2.5: fn_atomic_bus_trip_update is GRANTed to service_role
-        // only (REVOKEd from anon/authenticated) — a bare `|| supabase` fallback
-        // here was never a real fallback (the anon/authenticated client would
-        // just get a permission-denied rpcError), and getServiceRoleClient()
-        // itself throws (not returns null/undefined) when service-role config
-        // is unavailable, which fell all the way through to the generic outer
-        // catch as an opaque 500. Use the same guarded helper (and the same
-        // controlled 503) already used earlier in this handler for bus
-        // replacement — fail closed, never silently degrade to an
-        // underprivileged client for an operation that requires service-role
-        // semantics.
-        const serviceClient = getRequiredServiceClient();
-        if (!serviceClient) {
-            return res.status(503).json({ error: 'Сервис временно недоступен. Повторите попытку позже.' });
-        }
+        // Reuses the service-role client already resolved above (step 6)
+        // for the security-definer function. Bugfix P.2.5: fn_atomic_bus_
+        // trip_update is GRANTed to service_role only (REVOKEd from anon/
+        // authenticated) — a bare `|| supabase` fallback here was never a
+        // real fallback (the anon/authenticated client would just get a
+        // permission-denied rpcError). Fail closed, never silently degrade
+        // to an underprivileged client for an operation that requires
+        // service-role semantics.
         const { data: rpcResult, error: rpcError } = await serviceClient.rpc('fn_atomic_bus_trip_update', {
             p_ticket_id: Number(id),
             p_operator_id: Number(req.carrier.carrier_id),
@@ -950,6 +983,7 @@ router.put('/tickets/:id', async (req, res) => {
                 event_id: rpcResult.event_id,
                 notificationsQueued: 0,
                 unreachableCount: 0,
+                manualContactRequired: 0,
                 seatsRemapped: 0
             });
         }
@@ -991,6 +1025,7 @@ router.put('/tickets/:id', async (req, res) => {
             bus_replaced: busReplaced,
             notificationsQueued,
             unreachableCount,
+            manualContactRequired: unreachableCount,
             seatsRemapped: seatsRemappedCount,
             event_id: rpcResult.event_id
         });

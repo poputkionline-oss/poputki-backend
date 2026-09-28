@@ -32,6 +32,7 @@ function matchesFilters(row, filters) {
         if (op === 'gt') return row[col] > val;
         if (op === 'neq') return String(row[col]) !== String(val);
         if (op === 'in') return Array.isArray(val) && val.some(v => String(v) === String(row[col]));
+        if (op === 'is') return val === null ? (row[col] === null || row[col] === undefined) : row[col] === val;
         return String(row[col]) === String(val);
     });
 }
@@ -104,6 +105,10 @@ function createFakeSupabaseClient(tables = {}) {
                 },
                 in(col, vals) {
                     filters.push([col, vals, 'in']);
+                    return builder;
+                },
+                is(col, val) {
+                    filters.push([col, val, 'is']);
                     return builder;
                 },
                 order() { return builder; },
