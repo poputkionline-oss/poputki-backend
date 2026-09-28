@@ -612,6 +612,134 @@ describe('AI Passport Scanner — Backend Unit & Integration Tests', () => {
         assert.equal(resTd3.format, 'TD3');
         assert.equal(resTd3.status, 'MRZ_VALID');
     });
+
+    // ------------------------------------------------------------------------
+    // CITIZENSHIP VS ETHNIC NATIONALITY REGRESSION TEST MATRIX
+    // ------------------------------------------------------------------------
+
+    const { resolveCitizenship } = require('../services/aiDocumentRecognitionService');
+
+    // 25. UZB Citizenship + RUS Ethnicity
+    it('[AI-OCR-25] resolves UZB citizenship + RUS ethnic nationality to "Узбекистан" (NOT "Россия")', () => {
+        const res = resolveCitizenship({
+            issuing_country: 'UZB',
+            citizenship_country: 'UZB',
+            ethnic_nationality: 'RUS',
+            document_type: 'passport'
+        }, null);
+
+        assert.equal(res, 'Узбекистан', 'UZB citizen with Russian ethnicity must resolve to Узбекистан');
+    });
+
+    // 26. Ethnicity Cross-Matrix (UZB+TAJIK, TJK+UZBEK, RUS+TAJIK)
+    it('[AI-OCR-26] never infers citizenship from ethnic nationality across cross-border combinations', () => {
+        // UZB + TAJIK ethnicity
+        const res1 = resolveCitizenship({
+            issuing_country: 'UZB',
+            ethnic_nationality: 'TAJIK',
+            document_type: 'id_card'
+        }, null);
+        assert.equal(res1, 'Узбекистан');
+
+        // TJK + UZBEK ethnicity
+        const res2 = resolveCitizenship({
+            issuing_country: 'TJK',
+            ethnic_nationality: 'UZBEK',
+            document_type: 'id_card'
+        }, null);
+        assert.equal(res2, 'Таджикистан');
+
+        // RUS + TAJIK ethnicity
+        const res3 = resolveCitizenship({
+            issuing_country: 'RUS',
+            ethnic_nationality: 'TAJIK',
+            document_type: 'passport'
+        }, null);
+        assert.equal(res3, 'Россия');
+    });
+
+    // 27. Valid MRZ Nationality Resolution
+    it('[AI-OCR-27] resolves citizenship using valid MRZ nationality code', () => {
+        assert.equal(resolveCitizenship({}, { valid: true, nationality: 'Узбекистан' }), 'Узбекистан');
+        assert.equal(resolveCitizenship({}, { valid: true, nationality: 'Таджикистан' }), 'Таджикистан');
+        assert.equal(resolveCitizenship({}, { valid: true, nationality: 'Россия' }), 'Россия');
+    });
+
+    // 28. Ethnicity RUS + No Reliable Citizenship Evidence
+    it('[AI-OCR-28] returns null (UNRESOLVED) when only ethnicity is RUS without reliable citizenship evidence', () => {
+        const res = resolveCitizenship({
+            ethnic_nationality: 'RUS',
+            citizenship_country: null,
+            issuing_country: null,
+            document_type: null
+        }, null);
+
+        assert.equal(res, null, 'Must return null (UNRESOLVED)');
+        assert.notEqual(res, 'Россия', 'Must NOT return Россия automatically based solely on ethnic_nationality');
+    });
+
+    // 29. Residence Permit Issued by RUS (Does not infer Russian citizenship)
+    it('[AI-OCR-29] returns null (UNRESOLVED) for Residence Permit issued by RUS without citizenship evidence', () => {
+        const res = resolveCitizenship({
+            issuing_country: 'RUS',
+            document_type: 'residence_permit',
+            citizenship_country: null
+        }, null);
+
+        assert.equal(res, null, 'Residence Permit issuing country MUST NOT automatically become citizenship');
+        assert.notEqual(res, 'Россия');
+    });
+
+    // 30. Incomplete MRZ + Ethnicity RUS
+    it('[AI-OCR-30] returns null (UNRESOLVED) when MRZ is incomplete and only ethnicity is RUS', () => {
+        const invalidMrz = { valid: false, nationality: 'RUS' };
+        const res = resolveCitizenship({
+            ethnic_nationality: 'RUS',
+            citizenship_country: null,
+            issuing_country: null,
+            document_type: 'residence_permit'
+        }, invalidMrz);
+
+        assert.equal(res, null, 'Incomplete MRZ + ethnicity RUS must return null (UNRESOLVED)');
+        assert.notEqual(res, 'Россия');
+    });
+
+    // 31. Ethnicity TJK + No Reliable Citizenship Evidence
+    it('[AI-OCR-31] returns null (UNRESOLVED) when ethnicity is TJK without reliable citizenship evidence', () => {
+        const res = resolveCitizenship({
+            ethnic_nationality: 'TJK',
+            citizenship_country: null,
+            issuing_country: null,
+            document_type: null
+        }, null);
+
+        assert.equal(res, null, 'Must return null (UNRESOLVED), NOT Таджикистан');
+        assert.notEqual(res, 'Таджикистан');
+    });
+
+    // 32. No Citizenship + No Valid MRZ + Unknown Issuing Country
+    it('[AI-OCR-32] returns null (UNRESOLVED) for document with no citizenship, no valid MRZ, and unknown issuing country', () => {
+        const res = resolveCitizenship({
+            citizenship_country: null,
+            issuing_country: 'UNKNOWN',
+            document_type: 'passport'
+        }, { valid: false });
+
+        assert.equal(res, null, 'Must return null (UNRESOLVED)');
+    });
+
+    // 33. Unknown / Unsupported Document Type
+    it('[AI-OCR-33] returns null (UNRESOLVED) for unknown/unsupported document type without explicit citizenship', () => {
+        const res = resolveCitizenship({
+            citizenship_country: null,
+            issuing_country: 'TJK',
+            document_type: 'unknown_custom_card'
+        }, null);
+
+        assert.equal(res, null, 'Unknown document type must return null (UNRESOLVED)');
+    });
 });
+
+
 
 

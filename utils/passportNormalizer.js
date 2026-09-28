@@ -114,10 +114,10 @@ function normalizeDocumentNumber(docStr) {
  * @returns {string} Canonical country string
  */
 function normalizeCountry(countryStr) {
-    if (!countryStr || typeof countryStr !== 'string') return 'Таджикистан';
+    if (!countryStr || typeof countryStr !== 'string') return 'Другое';
 
     const clean = countryStr.trim().toUpperCase();
-    if (!clean) return 'Таджикистан';
+    if (!clean || clean === 'ДРУГОЕ') return 'Другое';
 
     // Tajikistan variations
     if (
@@ -243,20 +243,25 @@ function normalizeDocumentType(typeStr) {
     const clean = typeStr.trim().toLowerCase();
     if (!clean) return 'passport';
 
-    if (clean.includes('id') || clean.includes('карта') || clean.includes('card')) {
-        return 'id_card';
+    if (clean.includes('residence') || clean.includes('permit') || clean.includes('вид на жительство')) {
+        return 'residence_permit';
     }
 
     if (clean.includes('внутренний') || clean.includes('internal')) {
         return 'internal_passport';
     }
 
-    if (clean.includes('residence') || clean.includes('вид на жительство')) {
-        return 'residence_permit';
+    if (clean === 'id_card' || clean === 'id' || clean.includes('id_card') || clean.includes('id card') || clean.includes('удостоверение личности')) {
+        return 'id_card';
     }
 
-    return 'passport';
+    if (clean.includes('passport') || clean.includes('паспорт')) {
+        return 'passport';
+    }
+
+    return 'unknown';
 }
+
 
 /**
  * Detects if a string contains Cyrillic characters.
