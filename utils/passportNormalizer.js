@@ -258,10 +258,67 @@ function normalizeDocumentType(typeStr) {
     return 'passport';
 }
 
+/**
+ * Detects if a string contains Cyrillic characters.
+ * @param {string} str
+ * @returns {boolean}
+ */
+function isCyrillicScript(str) {
+    if (!str || typeof str !== 'string') return false;
+    return /[А-ЯЁа-яё]/.test(str);
+}
+
+/**
+ * Detects if a string contains Latin characters.
+ * @param {string} str
+ * @returns {boolean}
+ */
+function isLatinScript(str) {
+    if (!str || typeof str !== 'string') return false;
+    return /[A-Za-z]/.test(str);
+}
+
+/**
+ * Compares two surnames handling cross-script transliteration (Cyrillic vs Latin).
+ * Returns 'MATCH', 'MISMATCH', or 'NOT_COMPARABLE'.
+ * @param {string|null} surname1
+ * @param {string|null} surname2
+ * @returns {'MATCH'|'MISMATCH'|'NOT_COMPARABLE'}
+ */
+function compareSurnames(surname1, surname2) {
+    if (!surname1 || !surname2) return 'NOT_COMPARABLE';
+
+    const s1 = surname1.replace(/[^A-ZА-ЯЁa-zа-яё]/g, '').toUpperCase();
+    const s2 = surname2.replace(/[^A-ZА-ЯЁa-zа-яё]/g, '').toUpperCase();
+
+    if (!s1 || !s2) return 'NOT_COMPARABLE';
+
+    const s1Cyr = isCyrillicScript(s1);
+    const s1Lat = isLatinScript(s1);
+    const s2Cyr = isCyrillicScript(s2);
+    const s2Lat = isLatinScript(s2);
+
+    // If one is Cyrillic and the other is Latin, they are cross-script -> NOT_COMPARABLE
+    if ((s1Cyr && s2Lat && !s1Lat && !s2Cyr) || (s1Lat && s2Cyr && !s1Cyr && !s2Lat)) {
+        return 'NOT_COMPARABLE';
+    }
+
+    // Same script comparison
+    if (s1 === s2) {
+        return 'MATCH';
+    }
+
+    return 'MISMATCH';
+}
+
 module.exports = {
     normalizeDate,
     normalizeSex,
     normalizeDocumentNumber,
     normalizeCountry,
-    normalizeDocumentType
+    normalizeDocumentType,
+    isCyrillicScript,
+    isLatinScript,
+    compareSurnames
 };
+

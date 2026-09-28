@@ -15,7 +15,8 @@ const {
     normalizeDate,
     normalizeSex,
     normalizeDocumentNumber,
-    normalizeCountry
+    normalizeCountry,
+    compareSurnames
 } = require('./passportNormalizer');
 
 /**
@@ -206,64 +207,87 @@ function parseTD1(l1, l2, l3) {
 
 /**
  * Validates array of MRZ lines and extracts structured MRZ data.
+ * Does NOT artificially pad truncated lines into valid-looking MRZ.
  * @param {string[]} rawLines
  * @returns {Object|null}
  */
 function validateMrz(rawLines) {
     if (!Array.isArray(rawLines)) return null;
 
-    const lines = rawLines.map(sanitizeMrzLine).filter(l => l.length >= 15);
+    const lines = rawLines.map(sanitizeMrzLine).filter(l => l.length > 0);
     if (lines.length === 0) return null;
 
-    // Check TD1 (3 lines, length ~30)
+    // Check TD1 (3 lines, expected length 30 per line)
     if (lines.length >= 3) {
-        const l0 = lines[0].padEnd(30, '<');
-        const l1 = lines[1].padEnd(30, '<');
-        const l2 = lines[2].padEnd(30, '<');
+        const l0 = lines[0];
+        const l1 = lines[1];
+        const l2 = lines[2];
+
+        // Strict length check: do NOT use padEnd to fake missing characters
+        if (l0.length < 28 || l1.length < 28 || l2.length < 28) {
+            return {
+                format: 'TD1',
+                valid: false,
+                status: 'MRZ_INCOMPLETE',
+                error_class: 'MRZ_LINE_LENGTH_ERROR',
+                message: 'Машиночитаемая строка (MRZ) неполная или обрезана'
+            };
+        }
+
+        const p0 = l0.padEnd(30, '<');
+        const p1 = l1.padEnd(30, '<');
+        const p2 = l2.padEnd(30, '<');
         try {
-            const td1 = parseTD1(l0, l1, l2);
-            if (td1 && td1.valid) {
+            const td1 = parseTD1(p0, p1, p2);
+            if (td1) {
+                td1.status = td1.valid ? 'MRZ_VALID' : 'MRZ_CHECKSUM_FAILED';
+                td1.error_class = td1.valid ? null : 'CHECKSUM_IMPLEMENTATION_ERROR';
                 return td1;
             }
-        } catch (e) {
-            // Continue to fallback
-        }
-    }
-
-    // Check TD3 (2 lines, length ~44)
-    if (lines.length >= 2) {
-        const l0 = lines[0].padEnd(44, '<');
-        const l1 = lines[1].padEnd(44, '<');
-        try {
-            const td3 = parseTD3(l0, l1);
-            if (td3 && td3.valid) {
-                return td3;
-            }
-            if (lines.length === 2) {
-                return td3;
-            }
-        } catch (e) {
-            // Continue
-        }
-    }
-
-    // Fallback for 3 lines if TD1 valid wasn't true but lines format is 3 lines
-    if (lines.length >= 3) {
-        const l0 = lines[0].padEnd(30, '<');
-        const l1 = lines[1].padEnd(30, '<');
-        const l2 = lines[2].padEnd(30, '<');
-        try {
-            return parseTD1(l0, l1, l2);
         } catch (e) {}
     }
 
-    return null;
+    // Check TD3 (2 lines, expected length 44 per line)
+    if (lines.length >= 2) {
+        const l0 = lines[0];
+        const l1 = lines[1];
+
+        // Strict length check: do NOT use padEnd to fake missing characters
+        if (l0.length < 40 || l1.length < 40) {
+            return {
+                format: 'TD3',
+                valid: false,
+                status: 'MRZ_INCOMPLETE',
+                error_class: 'MRZ_LINE_LENGTH_ERROR',
+                message: 'Машиночитаемая строка (MRZ) неполная или обрезана'
+            };
+        }
+
+        const p0 = l0.padEnd(44, '<');
+        const p1 = l1.padEnd(44, '<');
+        try {
+            const td3 = parseTD3(p0, p1);
+            if (td3) {
+                td3.status = td3.valid ? 'MRZ_VALID' : 'MRZ_CHECKSUM_FAILED';
+                td3.error_class = td3.valid ? null : 'CHECKSUM_IMPLEMENTATION_ERROR';
+                return td3;
+            }
+        } catch (e) {}
+    }
+
+    return {
+        format: 'UNKNOWN',
+        valid: false,
+        status: 'MRZ_FORMAT_DETECTION_ERROR',
+        error_class: 'MRZ_FORMAT_DETECTION_ERROR',
+        message: 'Неизвестный формат или длина строк MRZ'
+    };
 }
 
 /**
  * Compares Visual Zone data extracted by AI with MRZ validated data.
- * Compares CANONICAL normalized values (YYYY-MM-DD dates, canonical sex, normalized doc numbers).
- * Returns array of user-friendly Russian conflict descriptions if discrepancies exist.
+ * Emits derived field conflicts ONLY when MRZ itself is valid (prevents warning cascade).
+ * Handles cross-script surname comparisons (Cyrillic vs Latin).
  * @param {Object} visualZone
  * @param {Object} mrzParsed
  * @returns {string[]} conflicts
@@ -271,6 +295,12 @@ function validateMrz(rawLines) {
 function crossCheckVisualAndMrz(visualZone, mrzParsed) {
     const conflicts = [];
     if (!visualZone || !mrzParsed) return conflicts;
+
+    // PREVENT WARNING CASCADE:
+    // If MRZ is explicitly invalid or incomplete (valid === false), DO NOT perform derived field comparisons
+    if (mrzParsed.valid === false) {
+        return conflicts;
+    }
 
     // Compare Document Number (Normalized)
     if (visualZone.document_number && mrzParsed.document_number) {
@@ -299,17 +329,25 @@ function crossCheckVisualAndMrz(visualZone, mrzParsed) {
         }
     }
 
-    // Compare Surname (Fuzzy letter match)
+    // Compare Surname (Cross-script transliteration aware)
     if (visualZone.surname && mrzParsed.surname) {
-        const vSur = visualZone.surname.replace(/[^A-ZА-ЯЁ]/gi, '').toUpperCase();
-        const mSur = mrzParsed.surname.replace(/[^A-ZА-ЯЁ]/gi, '').toUpperCase();
-        if (vSur && mSur && vSur !== mSur) {
+        const surnameMatch = compareSurnames(visualZone.surname, mrzParsed.surname);
+        if (surnameMatch === 'MISMATCH') {
             conflicts.push('Написание фамилии в тексте документа и в строке MRZ отличается.');
         }
     }
 
     return conflicts;
 }
+
+module.exports = {
+    calculateCheckDigit,
+    sanitizeMrzLine,
+    parseMrzDate,
+    parseMrzName,
+    validateMrz,
+    crossCheckVisualAndMrz
+};
 
 module.exports = {
     calculateCheckDigit,

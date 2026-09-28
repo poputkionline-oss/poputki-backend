@@ -445,5 +445,173 @@ describe('AI Passport Scanner — Backend Unit & Integration Tests', () => {
         assert.equal(updatedPassenger.birthDate, '2010-09-18');
         assert.equal(updatedPassenger.citizenship, 'Таджикистан');
     });
+
+    // ------------------------------------------------------------------------
+    // V2 AUDIT REGRESSION TESTS (TD1/TD3 MRZ ROBUSTNESS, SCRIPT & CASCADE FIXES)
+    // ------------------------------------------------------------------------
+
+    // 19. Incomplete MRZ Line Length Detection (No artificial padding)
+    it('[AI-OCR-19] detects truncated/incomplete MRZ lines without artificially padding into valid MRZ', () => {
+        const truncatedTd1 = [
+            'I<UTOD231458907', // Truncated to 15 chars
+            '7401019M1203015UTO',
+            'ERIKSSON<<ANNA'
+        ];
+        const resTd1 = validateMrz(truncatedTd1);
+        assert.ok(resTd1);
+        assert.equal(resTd1.valid, false);
+        assert.equal(resTd1.status, 'MRZ_INCOMPLETE');
+        assert.equal(resTd1.error_class, 'MRZ_LINE_LENGTH_ERROR');
+
+        const truncatedTd3 = [
+            'P<TJKSHOMIRSAIDOV<<ABUBAKR', // Truncated line 1
+            '4050936980TJK9805149M2805140' // Truncated line 2
+        ];
+        const resTd3 = validateMrz(truncatedTd3);
+        assert.ok(resTd3);
+        assert.equal(resTd3.valid, false);
+        assert.equal(resTd3.status, 'MRZ_INCOMPLETE');
+    });
+
+    // 20. Warning Cascade Prevention (Invalid MRZ suppresses derived field mismatches)
+    it('[AI-OCR-20] suppresses derived field mismatches when MRZ itself is invalid (prevents warning cascade)', () => {
+        const visualZone = {
+            document_number: '405093698',
+            birth_date: '1998-05-14',
+            sex: 'M',
+            surname: 'SHOMIRSAIDOV'
+        };
+
+        const invalidMrzParsed = {
+            valid: false,
+            document_number: '999999999', // Different doc number
+            birth_date: '1990-01-01',   // Different birth date
+            sex: 'F',                   // Different sex
+            surname: 'OTHER'            // Different surname
+        };
+
+        const conflicts = crossCheckVisualAndMrz(visualZone, invalidMrzParsed);
+        assert.equal(conflicts.length, 0, 'Must emit 0 derived conflicts when MRZ is invalid to prevent warning cascade');
+    });
+
+    // 21. Cross-Script Surname Comparison (Cyrillic vs Latin)
+    it('[AI-OCR-21] handles Cyrillic Visual surname vs Latin MRZ surname as NOT_COMPARABLE without false mismatch', () => {
+        const { compareSurnames } = require('../utils/passportNormalizer');
+
+        // Cyrillic vs Latin -> NOT_COMPARABLE
+        assert.equal(compareSurnames('ШОМИРСАИДОВ', 'SHOMIRSAIDOV'), 'NOT_COMPARABLE');
+        assert.equal(compareSurnames('ИВАНОВ', 'IVANOV'), 'NOT_COMPARABLE');
+
+        // Same script match / mismatch
+        assert.equal(compareSurnames('SHOMIRSAIDOV', 'SHOMIRSAIDOV'), 'MATCH');
+        assert.equal(compareSurnames('PETROV', 'IVANOV'), 'MISMATCH');
+
+        // Cross-check test
+        const validMrz = {
+            valid: true,
+            surname: 'SHOMIRSAIDOV',
+            document_number: '405093698',
+            birth_date: '1998-05-14',
+            sex: 'M'
+        };
+
+        const cyrillicVisual = {
+            surname: 'ШОМИРСАИДОВ', // Cyrillic
+            document_number: '405093698',
+            birth_date: '1998-05-14',
+            sex: 'M'
+        };
+
+        const conflicts = crossCheckVisualAndMrz(cyrillicVisual, validMrz);
+        assert.equal(conflicts.length, 0, 'Cyrillic Visual vs Latin MRZ surname must yield 0 conflicts');
+    });
+
+    // 22. Multi-source Country Resolution (TJK / RUS variations)
+    it('[AI-OCR-22] resolves country across visual zone and MRZ candidates cleanly', async () => {
+        const mockAiResponseTjk = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'Другое', // Visual zone fallback
+                nationality: 'TJK', // MRZ nationality candidate
+                surname: 'SHOMIRSAIDOV',
+                given_name: 'ABUBAKR',
+                document_number: '405093698',
+                mrz_present: true,
+                mrz_lines: [
+                    'P<TJKSHOMIRSAIDOV<<ABUBAKR<<<<<<<<<<<<<<<<<',
+                    '4050936980TJK9805149M2805140<<<<<<<<<<<<<<08'
+                ]
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const resTjk = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], { mockAiResponse: mockAiResponseTjk });
+        assert.equal(resTjk.document.country, 'Таджикистан', 'TJK candidate must resolve to Таджикистан, not Другое');
+        assert.equal(resTjk.document.nationality, 'Таджикистан');
+
+        const mockAiResponseRus = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'RUS',
+                surname: 'IVANOV',
+                given_name: 'IVAN',
+                document_number: '751234567',
+                mrz_present: false,
+                mrz_lines: []
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const resRus = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], { mockAiResponse: mockAiResponseRus });
+        assert.equal(resRus.document.country, 'Россия');
+    });
+
+    // 23. Sex Fallback from Valid MRZ when Visual Zone sex is missing
+    it('[AI-OCR-23] supplies sex from valid MRZ when visual zone sex is missing/null', async () => {
+        const mockAiResponse = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'TJK',
+                surname: 'SHOMIRSAIDOV',
+                given_name: 'ABUBAKR',
+                sex: null, // Visual zone sex missing
+                document_number: '405093698',
+                mrz_present: true,
+                mrz_lines: [
+                    'P<TJKSHOMIRSAIDOV<<ABUBAKR<<<<<<<<<<<<<<<<<',
+                    '4050936980TJK9805149M2805140<<<<<<<<<<<<<<08' // Sex is M
+                ]
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], { mockAiResponse });
+        assert.equal(res.document.sex, 'M', 'Valid MRZ sex M must populate missing visual zone sex');
+    });
+
+    // 24. Synthetic Fixture Matrix: TJK TD1 & RUS TD3
+    it('[AI-OCR-24] evaluates synthetic TJK TD1 and RUS TD3 fixtures accurately', () => {
+        // TJK TD1 valid
+        const tjkTd1Lines = [
+            'I<UTOD231458907<<<<<<<<<<<<<<<',
+            '7401019M1203015UTO<<<<<<<<<<<6',
+            'ERIKSSON<<ANNA<MARIA<<<<<<<<<<'
+        ];
+        const resTd1 = validateMrz(tjkTd1Lines);
+        assert.equal(resTd1.valid, true);
+        assert.equal(resTd1.format, 'TD1');
+        assert.equal(resTd1.status, 'MRZ_VALID');
+
+        // RUS TD3 valid
+        const rusTd3Lines = [
+            'P<RUSIVANOV<<IVAN<<<<<<<<<<<<<<<<<<<<<<<<<<',
+            '7512345672RUS8001014M2501017<<<<<<<<<<<<<<03'
+        ];
+        const resTd3 = validateMrz(rusTd3Lines);
+        assert.equal(resTd3.valid, true);
+        assert.equal(resTd3.format, 'TD3');
+        assert.equal(resTd3.status, 'MRZ_VALID');
+    });
 });
+
 

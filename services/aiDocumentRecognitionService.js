@@ -297,7 +297,6 @@ async function recognizePassportDocument(images, options = {}) {
     const conflicts = [];
 
     // 4. Apply UNIFIED NORMALIZATION LAYER to Visual Zone values
-    const normalizedCountry = normalizeCountry(doc.nationality || doc.country);
     const normalizedDocType = normalizeDocumentType(doc.document_type);
     const normalizedSurname = doc.surname ? doc.surname.trim() : null;
     const normalizedGivenName = doc.given_name ? doc.given_name.trim() : null;
@@ -305,18 +304,18 @@ async function recognizePassportDocument(images, options = {}) {
     const normalizedBirthDate = normalizeDate(doc.birth_date);
     const normalizedIssueDate = normalizeDate(doc.issue_date);
     const normalizedExpiryDate = normalizeDate(doc.expiry_date);
-    const normalizedSex = normalizeSex(doc.sex);
+    let normalizedSex = normalizeSex(doc.sex);
     const normalizedDocNumber = normalizeDocumentNumber(doc.document_number);
 
     const normalizedVisualZone = {
-        country: normalizedCountry,
+        country: 'Таджикистан',
         document_type: normalizedDocType,
         surname: normalizedSurname,
         given_name: normalizedGivenName,
         patronymic: normalizedPatronymic,
         birth_date: normalizedBirthDate,
         sex: normalizedSex,
-        nationality: normalizedCountry,
+        nationality: 'Таджикистан',
         document_number: normalizedDocNumber,
         issue_date: normalizedIssueDate,
         expiry_date: normalizedExpiryDate,
@@ -332,27 +331,56 @@ async function recognizePassportDocument(images, options = {}) {
         mrzAnalysis = validateMrz(normalizedVisualZone.mrz_lines);
 
         if (mrzAnalysis) {
-            // Check MRZ check digits
             if (!mrzAnalysis.valid) {
-                warnings.push('Не удалось подтвердить контрольные данные MRZ. Проверьте введённые данные.');
-            }
-
-            // Cross check Visual Zone vs MRZ values using canonical normalized values
-            const mrzConflicts = crossCheckVisualAndMrz(normalizedVisualZone, mrzAnalysis);
-            if (mrzConflicts.length > 0) {
-                conflicts.push(...mrzConflicts);
-                warnings.push('Обнаружено расхождение между текстом документа и машиночитаемой строкой (MRZ).');
+                // Primary warning for invalid/incomplete MRZ (prevents warning cascade)
+                warnings.push('Не удалось подтвердить данные по машиночитаемой строке (MRZ). Пожалуйста, проверьте данные документа.');
+            } else {
+                // Cross check Visual Zone vs MRZ values ONLY when MRZ is valid
+                const mrzConflicts = crossCheckVisualAndMrz(normalizedVisualZone, mrzAnalysis);
+                if (mrzConflicts.length > 0) {
+                    conflicts.push(...mrzConflicts);
+                }
             }
         }
     }
 
-    // 6. Evaluate confidence against threshold
+    // 6. Multi-source Country Resolution: doc.nationality -> doc.country -> mrzAnalysis.nationality -> mrzAnalysis.issuing_country
+    const countryCandidates = [
+        doc.nationality,
+        doc.country,
+        mrzAnalysis?.nationality,
+        mrzAnalysis?.issuing_country
+    ];
+
+    let resolvedCountry = 'Другое';
+    for (const cand of countryCandidates) {
+        if (cand && cand !== 'Другое') {
+            const norm = normalizeCountry(cand);
+            if (norm && norm !== 'Другое') {
+                resolvedCountry = norm;
+                break;
+            }
+        }
+    }
+    if (resolvedCountry === 'Другое') {
+        resolvedCountry = normalizeCountry(doc.country || doc.nationality);
+    }
+
+    normalizedVisualZone.country = resolvedCountry;
+    normalizedVisualZone.nationality = resolvedCountry;
+
+    // 7. Sex Resolution Fallback from Valid MRZ if Visual Zone sex is empty
+    if (!normalizedVisualZone.sex && mrzAnalysis && mrzAnalysis.valid && mrzAnalysis.sex) {
+        normalizedVisualZone.sex = normalizeSex(mrzAnalysis.sex);
+    }
+
+    // 8. Evaluate confidence against threshold
     const reviewThreshold = parseFloat(options.reviewThreshold || process.env.AI_PASSPORT_REVIEW_THRESHOLD || '0.85');
     if (confidence.overall && confidence.overall < reviewThreshold) {
         warnings.push(`Низкая точность автоматического чтения (${Math.round(confidence.overall * 100)}%). Пожалуйста, проверьте данные.`);
     }
 
-    // 7. Quality warnings (User-friendly Russian)
+    // 9. Quality warnings (User-friendly Russian)
     if (!quality.acceptable) {
         if (quality.blur_detected) warnings.push('Изображение размыто');
         if (quality.glare_detected) warnings.push('На фотографии обнаружен блик');
