@@ -11,6 +11,13 @@
 
 'use strict';
 
+const {
+    normalizeDate,
+    normalizeSex,
+    normalizeDocumentNumber,
+    normalizeCountry
+} = require('./passportNormalizer');
+
 /**
  * Calculates ICAO 9303 check digit for a given alphanumeric string.
  * Character values: '0'-'9' -> 0-9, 'A'-'Z' -> 10-35, '<' -> 0.
@@ -53,7 +60,7 @@ function sanitizeMrzLine(line) {
 }
 
 /**
- * Converts YYMMDD MRZ date to YYYY-MM-DD.
+ * Converts YYMMDD MRZ date to YYYY-MM-DD using canonical normalizer.
  * Pivot year: 50 -> 1950..2049.
  * @param {string} yymmdd
  * @returns {string|null} YYYY-MM-DD or null if invalid
@@ -74,7 +81,7 @@ function parseMrzDate(yymmdd) {
     const century = (yy > (currentYear % 100) + 20) ? (currentCentury - 100) : currentCentury;
     const fullYear = century + yy;
 
-    return `${fullYear}-${mm}-${dd}`;
+    return normalizeDate(`${fullYear}-${mm}-${dd}`);
 }
 
 /**
@@ -102,9 +109,9 @@ function parseTD3(l1, l2) {
     const docNumRaw = l2.slice(0, 9);
     const docNumCheckDigit = parseInt(l2.slice(9, 10), 10);
     const docNumValid = !isNaN(docNumCheckDigit) && calculateCheckDigit(docNumRaw) === docNumCheckDigit;
-    const docNumber = docNumRaw.replace(/</g, '');
+    const docNumber = normalizeDocumentNumber(docNumRaw);
 
-    const nationality = l2.slice(10, 13).replace(/</g, '');
+    const nationality = normalizeCountry(l2.slice(10, 13).replace(/</g, ''));
 
     const birthDateRaw = l2.slice(13, 19);
     const birthDateCheckDigit = parseInt(l2.slice(19, 20), 10);
@@ -112,7 +119,7 @@ function parseTD3(l1, l2) {
     const birthDate = parseMrzDate(birthDateRaw);
 
     const sexRaw = l2.slice(20, 21);
-    const sex = (sexRaw === 'M') ? 'M' : (sexRaw === 'F') ? 'F' : null;
+    const sex = normalizeSex(sexRaw);
 
     const expiryDateRaw = l2.slice(21, 27);
     const expiryDateCheckDigit = parseInt(l2.slice(27, 28), 10);
@@ -121,7 +128,7 @@ function parseTD3(l1, l2) {
 
     const optionalDataRaw = l2.slice(28, 42);
 
-    // Composite check digit over docNum + check + birthDate + check + expiryDate + check + optional
+    // Composite check digit over positions 0..9 + 13..20 + 21..43
     const compositeStr = l2.slice(0, 10) + l2.slice(13, 20) + l2.slice(21, 43);
     const compositeCheckDigit = parseInt(l2.slice(43, 44), 10);
     const compositeValid = !isNaN(compositeCheckDigit) && calculateCheckDigit(compositeStr) === compositeCheckDigit;
@@ -155,7 +162,7 @@ function parseTD1(l1, l2, l3) {
     const docNumRaw = l1.slice(5, 14);
     const docNumCheckDigit = parseInt(l1.slice(14, 15), 10);
     const docNumValid = !isNaN(docNumCheckDigit) && calculateCheckDigit(docNumRaw) === docNumCheckDigit;
-    const docNumber = docNumRaw.replace(/</g, '');
+    const docNumber = normalizeDocumentNumber(docNumRaw);
 
     const birthDateRaw = l2.slice(0, 6);
     const birthDateCheckDigit = parseInt(l2.slice(6, 7), 10);
@@ -163,14 +170,14 @@ function parseTD1(l1, l2, l3) {
     const birthDate = parseMrzDate(birthDateRaw);
 
     const sexRaw = l2.slice(7, 8);
-    const sex = (sexRaw === 'M') ? 'M' : (sexRaw === 'F') ? 'F' : null;
+    const sex = normalizeSex(sexRaw);
 
     const expiryDateRaw = l2.slice(8, 14);
     const expiryDateCheckDigit = parseInt(l2.slice(14, 15), 10);
     const expiryDateValid = !isNaN(expiryDateCheckDigit) && calculateCheckDigit(expiryDateRaw) === expiryDateCheckDigit;
     const expiryDate = parseMrzDate(expiryDateRaw);
 
-    const nationality = l2.slice(15, 18).replace(/</g, '');
+    const nationality = normalizeCountry(l2.slice(15, 18).replace(/</g, ''));
 
     const compositeCheckDigit = parseInt(l2.slice(29, 30), 10);
     const compositeStr = l1.slice(5, 30) + l2.slice(0, 7) + l2.slice(8, 15) + l2.slice(18, 29);
@@ -205,34 +212,49 @@ function parseTD1(l1, l2, l3) {
 function validateMrz(rawLines) {
     if (!Array.isArray(rawLines)) return null;
 
-    const lines = rawLines.map(sanitizeMrzLine).filter(l => l.length >= 20);
+    const lines = rawLines.map(sanitizeMrzLine).filter(l => l.length >= 15);
     if (lines.length === 0) return null;
 
-    // Check TD3 (2 lines x 44 chars)
-    if (lines.length >= 2) {
-        const l0 = lines[0].padEnd(44, '<');
-        const l1 = lines[1].padEnd(44, '<');
-        if (l0.length >= 44 && l1.length >= 44) {
-            try {
-                return parseTD3(l0, l1);
-            } catch (e) {
-                // Fall back
-            }
-        }
-    }
-
-    // Check TD1 (3 lines x 30 chars)
+    // Check TD1 (3 lines, length ~30)
     if (lines.length >= 3) {
         const l0 = lines[0].padEnd(30, '<');
         const l1 = lines[1].padEnd(30, '<');
         const l2 = lines[2].padEnd(30, '<');
-        if (l0.length >= 30 && l1.length >= 30 && l2.length >= 30) {
-            try {
-                return parseTD1(l0, l1, l2);
-            } catch (e) {
-                // Fall back
+        try {
+            const td1 = parseTD1(l0, l1, l2);
+            if (td1 && td1.valid) {
+                return td1;
             }
+        } catch (e) {
+            // Continue to fallback
         }
+    }
+
+    // Check TD3 (2 lines, length ~44)
+    if (lines.length >= 2) {
+        const l0 = lines[0].padEnd(44, '<');
+        const l1 = lines[1].padEnd(44, '<');
+        try {
+            const td3 = parseTD3(l0, l1);
+            if (td3 && td3.valid) {
+                return td3;
+            }
+            if (lines.length === 2) {
+                return td3;
+            }
+        } catch (e) {
+            // Continue
+        }
+    }
+
+    // Fallback for 3 lines if TD1 valid wasn't true but lines format is 3 lines
+    if (lines.length >= 3) {
+        const l0 = lines[0].padEnd(30, '<');
+        const l1 = lines[1].padEnd(30, '<');
+        const l2 = lines[2].padEnd(30, '<');
+        try {
+            return parseTD1(l0, l1, l2);
+        } catch (e) {}
     }
 
     return null;
@@ -240,7 +262,8 @@ function validateMrz(rawLines) {
 
 /**
  * Compares Visual Zone data extracted by AI with MRZ validated data.
- * Returns array of conflict descriptions if discrepancies are found.
+ * Compares CANONICAL normalized values (YYYY-MM-DD dates, canonical sex, normalized doc numbers).
+ * Returns array of user-friendly Russian conflict descriptions if discrepancies exist.
  * @param {Object} visualZone
  * @param {Object} mrzParsed
  * @returns {string[]} conflicts
@@ -249,35 +272,39 @@ function crossCheckVisualAndMrz(visualZone, mrzParsed) {
     const conflicts = [];
     if (!visualZone || !mrzParsed) return conflicts;
 
-    // Compare Document Number
+    // Compare Document Number (Normalized)
     if (visualZone.document_number && mrzParsed.document_number) {
-        const vDoc = visualZone.document_number.replace(/\s+/g, '').toUpperCase();
-        const mDoc = mrzParsed.document_number.replace(/\s+/g, '').toUpperCase();
-        if (vDoc !== mDoc) {
-            conflicts.push(`Document Number mismatch: Visual zone="${visualZone.document_number}", MRZ="${mrzParsed.document_number}"`);
+        const vDoc = normalizeDocumentNumber(visualZone.document_number);
+        const mDoc = normalizeDocumentNumber(mrzParsed.document_number);
+        if (vDoc && mDoc && vDoc !== mDoc) {
+            conflicts.push('Номер документа в паспорте и в строке MRZ отличается. Проверьте номер.');
         }
     }
 
-    // Compare Birth Date
+    // Compare Birth Date (Canonical YYYY-MM-DD)
     if (visualZone.birth_date && mrzParsed.birth_date) {
-        if (visualZone.birth_date !== mrzParsed.birth_date) {
-            conflicts.push(`Birth Date mismatch: Visual zone="${visualZone.birth_date}", MRZ="${mrzParsed.birth_date}"`);
+        const vDate = normalizeDate(visualZone.birth_date);
+        const mDate = normalizeDate(mrzParsed.birth_date);
+        if (vDate && mDate && vDate !== mDate) {
+            conflicts.push('Дата рождения в документе и в строке MRZ отличается. Проверьте дату рождения.');
         }
     }
 
-    // Compare Sex
+    // Compare Sex (Canonical 'M' / 'F')
     if (visualZone.sex && mrzParsed.sex) {
-        if (visualZone.sex.toUpperCase() !== mrzParsed.sex.toUpperCase()) {
-            conflicts.push(`Sex mismatch: Visual zone="${visualZone.sex}", MRZ="${mrzParsed.sex}"`);
+        const vSex = normalizeSex(visualZone.sex);
+        const mSex = normalizeSex(mrzParsed.sex);
+        if (vSex && mSex && vSex !== mSex) {
+            conflicts.push('Указание пола в документе и в строке MRZ отличается. Проверьте выбранный пол.');
         }
     }
 
-    // Compare Surname (fuzzy string match for spaces/transliteration differences)
+    // Compare Surname (Fuzzy letter match)
     if (visualZone.surname && mrzParsed.surname) {
-        const vSur = visualZone.surname.replace(/[^A-Z]/gi, '').toUpperCase();
-        const mSur = mrzParsed.surname.replace(/[^A-Z]/gi, '').toUpperCase();
+        const vSur = visualZone.surname.replace(/[^A-ZА-ЯЁ]/gi, '').toUpperCase();
+        const mSur = mrzParsed.surname.replace(/[^A-ZА-ЯЁ]/gi, '').toUpperCase();
         if (vSur && mSur && vSur !== mSur) {
-            conflicts.push(`Surname mismatch: Visual zone="${visualZone.surname}", MRZ="${mrzParsed.surname}"`);
+            conflicts.push('Написание фамилии в тексте документа и в строке MRZ отличается.');
         }
     }
 

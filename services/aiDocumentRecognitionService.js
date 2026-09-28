@@ -5,12 +5,20 @@
  * Powered by OpenAI Multimodal Vision API & Structured Output
  *
  * Implements strict system instructions against prompt injection,
- * JSON Schema enforcement, image validation, and MRZ cross-checking.
+ * JSON Schema enforcement, image validation, unified normalization,
+ * and MRZ cross-checking.
  */
 
 'use strict';
 
 const { validateMrz, crossCheckVisualAndMrz } = require('../utils/mrzValidator');
+const {
+    normalizeDate,
+    normalizeSex,
+    normalizeDocumentNumber,
+    normalizeCountry,
+    normalizeDocumentType
+} = require('../utils/passportNormalizer');
 
 const SYSTEM_INSTRUCTION = `You are an automated document recognition system for identity documents (passports, ID cards, residence permits).
 
@@ -165,7 +173,6 @@ async function processPassportWithOpenAI(images, options = {}) {
 
     const model = options.model || process.env.OPENAI_PASSPORT_MODEL || 'gpt-4o-mini';
 
-    // Format user message content with text prompt and images
     const userContent = [
         {
             type: 'text',
@@ -257,6 +264,7 @@ async function processPassportWithOpenAI(images, options = {}) {
 
 /**
  * Main AI Document Recognition Pipeline
+ * Normalizes all output fields to canonical forms.
  * @param {string[]} images Array of Base64 images
  * @param {Object} options Options / Mocking parameters
  * @returns {Promise<Object>} Processed Passport Output
@@ -285,63 +293,77 @@ async function recognizePassportDocument(images, options = {}) {
 
     const doc = aiResult.document || {};
     const confidence = aiResult.confidence || {};
-    const warnings = Array.isArray(aiResult.warnings) ? [...aiResult.warnings] : [];
+    const warnings = [];
     const conflicts = [];
 
-    // 4. Execute deterministic MRZ validation if MRZ lines were extracted
+    // 4. Apply UNIFIED NORMALIZATION LAYER to Visual Zone values
+    const normalizedCountry = normalizeCountry(doc.nationality || doc.country);
+    const normalizedDocType = normalizeDocumentType(doc.document_type);
+    const normalizedSurname = doc.surname ? doc.surname.trim() : null;
+    const normalizedGivenName = doc.given_name ? doc.given_name.trim() : null;
+    const normalizedPatronymic = doc.patronymic ? doc.patronymic.trim() : null;
+    const normalizedBirthDate = normalizeDate(doc.birth_date);
+    const normalizedIssueDate = normalizeDate(doc.issue_date);
+    const normalizedExpiryDate = normalizeDate(doc.expiry_date);
+    const normalizedSex = normalizeSex(doc.sex);
+    const normalizedDocNumber = normalizeDocumentNumber(doc.document_number);
+
+    const normalizedVisualZone = {
+        country: normalizedCountry,
+        document_type: normalizedDocType,
+        surname: normalizedSurname,
+        given_name: normalizedGivenName,
+        patronymic: normalizedPatronymic,
+        birth_date: normalizedBirthDate,
+        sex: normalizedSex,
+        nationality: normalizedCountry,
+        document_number: normalizedDocNumber,
+        issue_date: normalizedIssueDate,
+        expiry_date: normalizedExpiryDate,
+        issuing_authority: doc.issuing_authority || null,
+        mrz_present: Boolean(doc.mrz_present),
+        mrz_lines: doc.mrz_lines || []
+    };
+
+    // 5. Execute deterministic MRZ validation if MRZ lines were extracted
     let mrzAnalysis = null;
-    if (doc.mrz_lines && Array.isArray(doc.mrz_lines) && doc.mrz_lines.length > 0) {
-        doc.mrz_present = true;
-        mrzAnalysis = validateMrz(doc.mrz_lines);
+    if (normalizedVisualZone.mrz_lines && Array.isArray(normalizedVisualZone.mrz_lines) && normalizedVisualZone.mrz_lines.length > 0) {
+        normalizedVisualZone.mrz_present = true;
+        mrzAnalysis = validateMrz(normalizedVisualZone.mrz_lines);
 
         if (mrzAnalysis) {
             // Check MRZ check digits
             if (!mrzAnalysis.valid) {
-                warnings.push('MRZ check digits failed validation');
+                warnings.push('Не удалось подтвердить контрольные данные MRZ. Проверьте введённые данные.');
             }
 
-            // Cross check Visual Zone vs MRZ values
-            const mrzConflicts = crossCheckVisualAndMrz(doc, mrzAnalysis);
+            // Cross check Visual Zone vs MRZ values using canonical normalized values
+            const mrzConflicts = crossCheckVisualAndMrz(normalizedVisualZone, mrzAnalysis);
             if (mrzConflicts.length > 0) {
                 conflicts.push(...mrzConflicts);
-                warnings.push('Discrepancy detected between document text and MRZ line');
+                warnings.push('Обнаружено расхождение между текстом документа и машиночитаемой строкой (MRZ).');
             }
         }
     }
 
-    // 5. Evaluate confidence against threshold
+    // 6. Evaluate confidence against threshold
     const reviewThreshold = parseFloat(options.reviewThreshold || process.env.AI_PASSPORT_REVIEW_THRESHOLD || '0.85');
     if (confidence.overall && confidence.overall < reviewThreshold) {
-        warnings.push(`Low confidence score (${Math.round(confidence.overall * 100)}%). Verification required.`);
+        warnings.push(`Низкая точность автоматического чтения (${Math.round(confidence.overall * 100)}%). Пожалуйста, проверьте данные.`);
     }
 
-    // 6. Quality warnings
+    // 7. Quality warnings (User-friendly Russian)
     if (!quality.acceptable) {
-        if (quality.blur_detected) warnings.push('Photo is blurry');
-        if (quality.glare_detected) warnings.push('Photo has strong glare');
-        if (quality.document_cut_off) warnings.push('Document edges are cut off');
-        if (quality.too_dark) warnings.push('Photo is too dark');
-        if (quality.fields_obscured) warnings.push('Some document fields are obscured');
+        if (quality.blur_detected) warnings.push('Изображение размыто');
+        if (quality.glare_detected) warnings.push('На фотографии обнаружен блик');
+        if (quality.document_cut_off) warnings.push('Края документа обрезаны');
+        if (quality.too_dark) warnings.push('Изображение слишком тёмное');
+        if (quality.fields_obscured) warnings.push('Часть полей документа перекрыта');
     }
 
     return {
         quality,
-        document: {
-            country: doc.country || null,
-            document_type: doc.document_type || 'unknown',
-            surname: doc.surname || null,
-            given_name: doc.given_name || null,
-            patronymic: doc.patronymic || null,
-            birth_date: doc.birth_date || null,
-            sex: doc.sex || null,
-            nationality: doc.nationality || doc.country || null,
-            document_number: doc.document_number || null,
-            issue_date: doc.issue_date || null,
-            expiry_date: doc.expiry_date || null,
-            issuing_authority: doc.issuing_authority || null,
-            mrz_present: Boolean(doc.mrz_present),
-            mrz_lines: doc.mrz_lines || []
-        },
+        document: normalizedVisualZone,
         mrz_analysis: mrzAnalysis,
         confidence: {
             surname: confidence.surname ?? 0.9,
