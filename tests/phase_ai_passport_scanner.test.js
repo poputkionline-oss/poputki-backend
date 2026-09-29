@@ -738,7 +738,182 @@ describe('AI Passport Scanner — Backend Unit & Integration Tests', () => {
 
         assert.equal(res, null, 'Unknown document type must return null (UNRESOLVED)');
     });
+
+    // ------------------------------------------------------------------------
+    // V3 MRZ EXTRACTION RELIABILITY & CONDITIONAL SECOND PASS TESTS
+    // ------------------------------------------------------------------------
+
+    // 34. System instructions enforce exact MRZ filler preservation
+    it('[AI-OCR-34] SYSTEM_INSTRUCTION contains strict MRZ transcription and filler preservation rules', () => {
+        assert.ok(SYSTEM_INSTRUCTION.includes('Transcribe raw MRZ (Machine Readable Zone) lines character-for-character exactly as printed'));
+        assert.ok(SYSTEM_INSTRUCTION.includes('Preserve every visible \'<\' filler character'));
+        assert.ok(SYSTEM_INSTRUCTION.includes('Never trim trailing \'<\' characters'));
+        assert.ok(SYSTEM_INSTRUCTION.includes('Never reconstruct missing characters or invent fillers'));
+    });
+
+    // 35. Second pass NOT triggered for MRZ_VALID
+    it('[AI-OCR-35] does NOT trigger second pass when first pass MRZ is already MRZ_VALID', async () => {
+        const mockAiResponse = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'TJK',
+                document_type: 'passport',
+                surname: 'SHOMIRSAIDOV',
+                given_name: 'ABUBAKR',
+                document_number: '405093698',
+                mrz_present: true,
+                mrz_lines: [
+                    'P<TJKSHOMIRSAIDOV<<ABUBAKR<<<<<<<<<<<<<<<<<',
+                    '4050936980TJK9805149M2805140<<<<<<<<<<<<<<08'
+                ]
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], { mockAiResponse });
+        assert.equal(res.diagnostics.second_pass_triggered, false, 'Second pass MUST NOT trigger when MRZ is valid');
+        assert.equal(res.diagnostics.final_mrz_status, 'MRZ_VALID');
+    });
+
+    // 36. Second pass IS triggered for MRZ_INCOMPLETE and re-validated deterministically
+    it('[AI-OCR-36] triggers second pass for MRZ_INCOMPLETE and re-validates deterministically if second pass succeeds', async () => {
+        const mockFirstPass = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'TJK',
+                document_type: 'passport',
+                surname: 'SHOMIRSAIDOV',
+                given_name: 'ABUBAKR',
+                document_number: '405093698',
+                mrz_present: true,
+                mrz_lines: [
+                    'P<TJKSHOMIRSAIDOV<<ABUBAKR', // Truncated first pass line 1
+                    '4050936980TJK9805149M2805140' // Truncated first pass line 2
+                ]
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const mockSecondPass = {
+            mrz_present: true,
+            mrz_format: 'TD3',
+            mrz_lines: [
+                'P<TJKSHOMIRSAIDOV<<ABUBAKR<<<<<<<<<<<<<<<<<',
+                '4050936980TJK9805149M2805140<<<<<<<<<<<<<<08'
+            ]
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], {
+            mockAiResponse: mockFirstPass,
+            mockSecondPassResponse: mockSecondPass
+        });
+
+        assert.equal(res.diagnostics.second_pass_triggered, true, 'Second pass MUST trigger for incomplete first-pass MRZ');
+        assert.equal(res.diagnostics.final_mrz_status, 'MRZ_VALID', 'Deterministic re-validation must upgrade status to MRZ_VALID');
+        assert.equal(res.document.surname, 'SHOMIRSAIDOV');
+    });
+
+    // 37. Second pass triggered for MRZ_INVALID / MRZ_CHECKSUM_FAILED
+    it('[AI-OCR-37] triggers second pass for MRZ_CHECKSUM_FAILED', async () => {
+        const mockFirstPass = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'RUS',
+                document_type: 'passport',
+                surname: 'IVANOV',
+                given_name: 'IVAN',
+                document_number: '751234567',
+                mrz_present: true,
+                mrz_lines: [
+                    'P<RUSIVANOV<<IVAN<<<<<<<<<<<<<<<<<<<<<<<<<<',
+                    '7512345679RUS8001014M2501017<<<<<<<<<<<<<<03' // Incorrect check digit 9 instead of 2
+                ]
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const mockSecondPass = {
+            mrz_present: true,
+            mrz_format: 'TD3',
+            mrz_lines: [
+                'P<RUSIVANOV<<IVAN<<<<<<<<<<<<<<<<<<<<<<<<<<',
+                '7512345672RUS8001014M2501017<<<<<<<<<<<<<<03' // Correct check digit 2
+            ]
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], {
+            mockAiResponse: mockFirstPass,
+            mockSecondPassResponse: mockSecondPass
+        });
+
+        assert.equal(res.diagnostics.second_pass_triggered, true);
+        assert.equal(res.diagnostics.final_mrz_status, 'MRZ_VALID');
+    });
+
+    // 38. Second pass failure preserves visual zone data without erasing fields
+    it('[AI-OCR-38] preserves visual zone passenger data intact even when second pass fails', async () => {
+        const mockFirstPass = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'TJK',
+                document_type: 'passport',
+                surname: 'SHOMIRSAIDOV',
+                given_name: 'ABUBAKR',
+                document_number: '405093698',
+                mrz_present: true,
+                mrz_lines: ['INVALID_LINE_1', 'INVALID_LINE_2']
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const mockSecondPass = {
+            mrz_present: false,
+            mrz_format: null,
+            mrz_lines: []
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], {
+            mockAiResponse: mockFirstPass,
+            mockSecondPassResponse: mockSecondPass
+        });
+
+        assert.equal(res.diagnostics.second_pass_triggered, true);
+        assert.equal(res.document.surname, 'SHOMIRSAIDOV', 'Visual zone surname MUST be preserved');
+        assert.equal(res.document.given_name, 'ABUBAKR', 'Visual zone given name MUST be preserved');
+        assert.equal(res.document.document_number, '405093698', 'Visual zone doc number MUST be preserved');
+    });
+
+    // 39. Deterministic parser does NOT artificially pad lines (no automatic repair)
+    it('[AI-OCR-39] mrzValidator does NOT artificially pad truncated lines to fake valid MRZ', () => {
+        const truncatedLines = [
+            'P<TJKSHOMIRSAIDOV<<ABUBAKR',
+            '4050936980TJK9805149M2805140'
+        ];
+        const res = validateMrz(truncatedLines);
+        assert.equal(res.valid, false, 'Truncated MRZ MUST NOT pass validation');
+        assert.equal(res.status, 'MRZ_INCOMPLETE');
+    });
+
+    // 40. Payload size limit enforcement
+    it('[AI-OCR-40] enforces 8MB max payload size limit', () => {
+        const hugeImage = 'data:image/jpeg;base64,' + 'A'.repeat(12 * 1024 * 1024); // ~9MB Base64
+        assert.throws(() => validateInputImages([hugeImage]), /PAYLOAD_TOO_LARGE/);
+    });
+
+    // 41. UZB Passport + Ethnic Nationality RUS Citizenship Semantics Regression
+    it('[AI-OCR-41] preserves UZB citizenship for UZB passport holder with Russian ethnicity', () => {
+        const res = resolveCitizenship({
+            issuing_country: 'UZB',
+            citizenship_country: 'UZB',
+            ethnic_nationality: 'RUS',
+            document_type: 'passport'
+        }, null);
+
+        assert.equal(res, 'Узбекистан', 'Must resolve citizenship to Узбекистан');
+        assert.notEqual(res, 'Россия');
+    });
 });
+
 
 
 
