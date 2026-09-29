@@ -330,4 +330,70 @@ function safeHmac(phone) {
     }
 }
 
-module.exports = { processManualBookingSmsOutbox };
+/**
+ * Fast-path trigger: fires the existing processManualBookingSmsOutbox()
+ * in-process, immediately after a new outbox row is enqueued, instead of
+ * waiting for the next GitHub Actions maintenance tick. This is NOT a
+ * second SMS pipeline — it is a scheduling shortcut for the exact same
+ * function GitHub Actions already calls, so every existing gate (kill
+ * switches, claim/lease, daily cap, allowlists, rollout cutoff,
+ * idempotency, retry/reconciliation) applies unchanged.
+ *
+ * Fail-closed: OSON_SMS_FAST_TRIGGER_ENABLED must be exactly 'true' or
+ * this is a no-op — absent, misspelled, or any other value means the
+ * fast path stays off and the GitHub Actions recovery tick remains the
+ * only trigger, i.e. today's behavior is unchanged by default.
+ *
+ * Always fire-and-forget from the caller's point of view: the returned
+ * promise NEVER rejects (errors are caught and logged internally), so a
+ * caller that never attaches .then()/.catch() — as the booking route
+ * intentionally does not — can never produce an unhandled rejection or
+ * have this function's failure affect its own control flow. The returned
+ * promise exists only so tests/observability can await completion; it is
+ * not part of the public contract callers are expected to use.
+ *
+ * @param {Object} params
+ * @param {number} params.bookingId - for logging only, never persisted here
+ * @param {Object} [params.supabaseClient] - reused service-role client from the caller (avoids a second client construction)
+ * @returns {Promise|null} resolves after the fast-triggered run finishes (or is skipped); null when the fast path is disabled
+ */
+function triggerManualBookingSmsOutboxFast({ bookingId, supabaseClient } = {}) {
+    if (process.env.OSON_SMS_FAST_TRIGGER_ENABLED !== 'true') {
+        return null;
+    }
+
+    console.log('[OsonSmsFastTrigger] SMS_FAST_TRIGGER_SCHEDULED', { booking_id: bookingId });
+
+    // setImmediate: defers to the next event-loop tick so this never runs
+    // synchronously inside the caller's own promise chain, and so it can
+    // never delay the HTTP response already in flight for this request.
+    return new Promise(resolve => setImmediate(resolve)).then(() => {
+        const startedAt = Date.now();
+        console.log('[OsonSmsFastTrigger] SMS_FAST_TRIGGER_STARTED', { booking_id: bookingId });
+
+        return processManualBookingSmsOutbox({ supabaseClient, workerToken: `fast-${bookingId}-${startedAt}` })
+            .then(result => {
+                console.log('[OsonSmsFastTrigger] SMS_FAST_TRIGGER_FINISHED', {
+                    booking_id: bookingId,
+                    duration_ms: Date.now() - startedAt,
+                    processed: result.processed,
+                    sent: result.sent,
+                    failed: result.failed,
+                    skipped: (result.cancelled || 0) + (result.dead_letter || 0)
+                });
+                return result;
+            })
+            .catch(err => {
+                console.error('[OsonSmsFastTrigger] SMS_FAST_TRIGGER_FAILED', {
+                    booking_id: bookingId,
+                    duration_ms: Date.now() - startedAt,
+                    error_code: (err && err.code) || (err && err.message) || 'UNKNOWN_ERROR'
+                });
+                // Swallowed on purpose — see function doc: this promise must
+                // never reject, so an ignoring caller never sees an
+                // unhandled rejection.
+            });
+    });
+}
+
+module.exports = { processManualBookingSmsOutbox, triggerManualBookingSmsOutboxFast };
