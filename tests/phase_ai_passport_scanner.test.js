@@ -13,13 +13,15 @@ const assert = require('node:assert/strict');
 const {
     calculateCheckDigit,
     validateMrz,
-    crossCheckVisualAndMrz
+    crossCheckVisualAndMrz,
+    parseMrzName
 } = require('../utils/mrzValidator');
 
 const {
     validateInputImages,
     recognizePassportDocument,
-    SYSTEM_INSTRUCTION
+    SYSTEM_INSTRUCTION,
+    resolveCitizenship
 } = require('../services/aiDocumentRecognitionService');
 
 const ocrRouter = require('../routes/ocr');
@@ -29,7 +31,8 @@ const {
     normalizeSex,
     normalizeDocumentNumber,
     normalizeCountry,
-    normalizeDocumentType
+    normalizeDocumentType,
+    cleanBilingualName
 } = require('../utils/passportNormalizer');
 
 // Mock req/res helper for testing router handlers
@@ -1129,9 +1132,152 @@ describe('AI Passport Scanner — Backend Unit & Integration Tests', () => {
         const conflicts = crossCheckVisualAndMrz(visualZone, validMrz);
         assert.equal(conflicts.length, 0, 'Symbol-prefixed document number must not trigger false mismatch');
     });
+
+    // 51. V6 Name Patronymic Separation
+    it('[AI-OCR-51] [V6-NAME] NAME_PATRONYMIC_SEPARATION: preserves explicit surname, given_name, patronymic fields', async () => {
+        const mockResponse = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                issuing_country: 'TJK',
+                citizenship_country: 'TJK',
+                document_type: 'passport',
+                surname: 'TESTOV',
+                given_name: 'DAVLAT',
+                patronymic: 'RAHMONOVICH',
+                document_number: 'A9876543'
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], { mockAiResponse: mockResponse });
+        assert.equal(res.document.surname, 'TESTOV');
+        assert.equal(res.document.given_name, 'DAVLAT');
+        assert.equal(res.document.patronymic, 'RAHMONOVICH');
+    });
+
+    // 52. V6 Compound Given Name Preservation
+    it('[AI-OCR-52] [V6-NAME] COMPOUND_GIVEN_NAME_PRESERVATION: preserves compound given name "ANNA MARIA" without guessing patronymic', async () => {
+        const mockResponse = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                issuing_country: 'RUS',
+                citizenship_country: 'RUS',
+                document_type: 'passport',
+                surname: 'IVANOVA',
+                given_name: 'ANNA MARIA',
+                patronymic: null,
+                document_number: '751234567'
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], { mockAiResponse: mockResponse });
+        assert.equal(res.document.given_name, 'ANNA MARIA');
+        assert.equal(res.document.patronymic, null);
+    });
+
+    // 53. V6 MRZ No Patronymic Guessing
+    it('[AI-OCR-53] [V6-NAME] MRZ_NO_PATRONYMIC_GUESS: MRZ given names "FIRST SECOND" do not force patronymic splitting without visual label', () => {
+        const { surname, givenNames } = parseMrzName('TESTOV<<DAVLAT<RAHMONOVICH');
+        assert.equal(surname, 'TESTOV');
+        assert.equal(givenNames, 'DAVLAT RAHMONOVICH');
+    });
+
+    // 54. V6 Bilingual Name Deduplication
+    it('[AI-OCR-54] [V6-NAME] BILINGUAL_NAME_DEDUPLICATION: cleans duplicate Cyrillic/Latin name strings into single representation', () => {
+        assert.equal(cleanBilingualName('АЛЕКСАНДР / ALEKSANDR'), 'АЛЕКСАНДР');
+        assert.equal(cleanBilingualName('АЛЕКСАНДР ALEKSANDR'), 'АЛЕКСАНДР');
+        assert.equal(cleanBilingualName('ANNA MARIA'), 'ANNA MARIA');
+        assert.equal(cleanBilingualName('ИВАНОВ'), 'ИВАНОВ');
+    });
+
+    // 55. V6 Citizenship No Default Tajikistan
+    it('[AI-OCR-55] [V6-CITIZENSHIP] CITIZENSHIP_NO_DEFAULT_TJK: unresolved document returns null (UNRESOLVED) without defaulting to Tajikistan', () => {
+        const doc = {
+            issuing_country: null,
+            citizenship_country: null,
+            document_type: 'residence_permit'
+        };
+        const res = resolveCitizenship(doc, null);
+        assert.equal(res, null);
+    });
+
+    // 56. V6 Invalid MRZ Not Authoritative
+    it('[AI-OCR-56] [V6-CITIZENSHIP] INVALID_MRZ_NOT_AUTHORITATIVE: invalid MRZ nationality code does not outrank reliable visual evidence', () => {
+        const doc = {
+            citizenship_country: 'RUS',
+            document_type: 'passport'
+        };
+        const mrzInvalid = {
+            valid: false,
+            nationality: 'Таджикистан'
+        };
+        const res = resolveCitizenship(doc, mrzInvalid);
+        assert.equal(res, 'Россия');
+    });
+
+    // 57. V6 Birth Country Not Citizenship
+    it('[AI-OCR-57] [V6-CITIZENSHIP] BIRTH_COUNTRY_NOT_CITIZENSHIP: explicit citizenship Russia is returned regardless of Tajikistan birth place text', () => {
+        const doc = {
+            citizenship_country: 'RUS',
+            issuing_country: 'RUS',
+            document_type: 'passport'
+        };
+        const res = resolveCitizenship(doc, null);
+        assert.equal(res, 'Россия');
+    });
+
+    // 58. V6 Ethnicity Not Citizenship
+    it('[AI-OCR-58] [V6-CITIZENSHIP] ETHNICITY_NOT_CITIZENSHIP: ethnic nationality does not overwrite true document citizenship', () => {
+        const doc = {
+            citizenship_country: 'UZB',
+            ethnic_nationality: 'РУС',
+            document_type: 'passport'
+        };
+        const res = resolveCitizenship(doc, null);
+        assert.equal(res, 'Узбекистан');
+    });
+
+    // 59. V6 Non-National Document Issuer Inference
+    it('[AI-OCR-59] [V6-CITIZENSHIP] NON_NATIONAL_DOC_NO_ISSUER_INFERENCE: residence permit issued by Russia returns null without setting citizenship = Россия', () => {
+        const doc = {
+            issuing_country: 'RUS',
+            citizenship_country: null,
+            document_type: 'residence_permit'
+        };
+        const res = resolveCitizenship(doc, null);
+        assert.equal(res, null);
+    });
+
+    // 60. V6 RUS Citizenship Test
+    it('[AI-OCR-60] [V6-CITIZENSHIP] RUS_CITIZENSHIP_TEST: Russian national passport resolves to Россия', () => {
+        const doc = { issuing_country: 'RUS', document_type: 'passport' };
+        assert.equal(resolveCitizenship(doc, null), 'Россия');
+    });
+
+    // 61. V6 TJK Citizenship Test
+    it('[AI-OCR-61] [V6-CITIZENSHIP] TJK_CITIZENSHIP_TEST: Tajik national passport resolves to Таджикистан', () => {
+        const doc = { issuing_country: 'TJK', document_type: 'passport' };
+        assert.equal(resolveCitizenship(doc, null), 'Таджикистан');
+    });
+
+    // 62. V6 UZB Citizenship Test
+    it('[AI-OCR-62] [V6-CITIZENSHIP] UZB_CITIZENSHIP_TEST: Uzbek national passport resolves to Узбекистан', () => {
+        const doc = { issuing_country: 'UZB', document_type: 'passport' };
+        assert.equal(resolveCitizenship(doc, null), 'Узбекистан');
+    });
+
+    // 63. V6 Residence Permit Test
+    it('[AI-OCR-63] [V6-CITIZENSHIP] RESIDENCE_PERMIT_TEST: foreign residence permit without explicit citizenship returns null', () => {
+        const doc = { issuing_country: 'RUS', document_type: 'residence_permit' };
+        assert.equal(resolveCitizenship(doc, null), null);
+    });
+
+    // 64. V6 Unresolved Test
+    it('[AI-OCR-64] [V6-CITIZENSHIP] UNRESOLVED_TEST: missing citizenship and invalid MRZ returns null', () => {
+        const doc = { document_type: 'unknown' };
+        assert.equal(resolveCitizenship(doc, null), null);
+    });
 });
-
-
-
 
 

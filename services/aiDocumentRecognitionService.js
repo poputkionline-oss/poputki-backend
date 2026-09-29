@@ -17,7 +17,8 @@ const {
     normalizeSex,
     normalizeDocumentNumber,
     normalizeCountry,
-    normalizeDocumentType
+    normalizeDocumentType,
+    cleanBilingualName
 } = require('../utils/passportNormalizer');
 
 const SYSTEM_INSTRUCTION = `You are an automated document recognition system for identity documents (passports, ID cards, residence permits).
@@ -36,10 +37,20 @@ MRZ TRANSCRIPTION RULES:
 - Never replace ambiguous characters (O/0, I/1, B/8) automatically to satisfy check digits.
 - If a character cannot be read reliably, report the MRZ as incomplete.
 
-Do not confuse citizenship with ethnicity or a printed ethnic nationality field.
-A value such as Russian/RUS or Tajik/TJK in a document's ethnic nationality field (e.g. 'Национальность') does not mean that the document holder is a citizen of Russia or Tajikistan.
-Extract issuing country, citizenship, MRZ nationality, and ethnic nationality as separate concepts.
-Never infer citizenship from ethnicity.
+NAME FIELD EXTRACTION RULES:
+- surname: Extract family name / фамилия.
+- given_name: Extract personal given name(s) ONLY. Do NOT include patronymic / father's name / middle name in given_name.
+- patronymic: Extract father-derived patronymic (Отчество / Насаб / Father's Name) ONLY when the document explicitly includes or labels it. If not present on the document, return null for patronymic.
+- Never merge given name and patronymic together into given_name.
+- Never split compound given names (e.g., "ANNA MARIA") into given_name and patronymic unless the second word is explicitly a patronymic on the document.
+- For multilingual/bilingual documents containing names in both Cyrillic and Latin (e.g., Russian and English), extract the single primary script version (or Cyrillic if present). Do NOT concatenate duplicate Cyrillic and Latin versions together into a single string (e.g., do NOT output "АЛЕКСАНДР ALEKSANDR").
+
+CITIZENSHIP AND COUNTRY EXTRACTION RULES:
+- Extract issuing_country, citizenship_country, mrz_nationality, and ethnic_nationality as strictly separate fields.
+- Do not confuse citizenship with ethnicity or a printed ethnic nationality field (e.g., 'Национальность'). Never infer citizenship from ethnicity.
+- Do not infer citizenship from place of birth (e.g. 'Место рождения'), holder name, document language, residence, or issuing authority text.
+- For non-national documents (residence permit, temporary residence permit, visa, refugee document), issuing_country is the issuing authority country, NOT holder citizenship. Leave citizenship_country null for non-national documents unless holder citizenship is explicitly printed.
+- If citizenship cannot be reliably established from explicit printed citizenship or valid MRZ, set citizenship_country to null.
 
 Never infer missing identity information. Never invent characters, names, dates, or numbers.
 
@@ -471,9 +482,9 @@ async function recognizePassportDocument(images, options = {}) {
 
     // 4. Apply UNIFIED NORMALIZATION LAYER to Visual Zone values
     const normalizedDocType = normalizeDocumentType(doc.document_type);
-    const normalizedSurname = doc.surname ? doc.surname.trim() : null;
-    const normalizedGivenName = doc.given_name ? doc.given_name.trim() : null;
-    const normalizedPatronymic = doc.patronymic ? doc.patronymic.trim() : null;
+    const normalizedSurname = cleanBilingualName(doc.surname);
+    const normalizedGivenName = cleanBilingualName(doc.given_name);
+    const normalizedPatronymic = cleanBilingualName(doc.patronymic);
     const normalizedBirthDate = normalizeDate(doc.birth_date);
     const normalizedIssueDate = normalizeDate(doc.issue_date);
     const normalizedExpiryDate = normalizeDate(doc.expiry_date);

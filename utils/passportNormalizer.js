@@ -340,6 +340,46 @@ function compareSurnames(surname1, surname2) {
     return 'NOT_COMPARABLE';
 }
 
+/**
+ * Cleans name strings that contain duplicate bilingual representations (e.g. Cyrillic + Latin).
+ * Extracts a single clean representation (preferring Cyrillic if present).
+ * Preserves compound given names (e.g. "ANNA MARIA") and single-script names.
+ * @param {string|null} nameStr
+ * @returns {string|null}
+ */
+function cleanBilingualName(nameStr) {
+    if (!nameStr || typeof nameStr !== 'string') return null;
+
+    const trimmed = nameStr.trim();
+    if (!trimmed) return null;
+
+    // Check if input contains both Cyrillic and Latin script
+    const hasCyrillic = /[А-ЯЁа-яё]/.test(trimmed);
+    const hasLatin = /[A-Za-z]/.test(trimmed);
+
+    if (hasCyrillic && hasLatin) {
+        // Delimited by /, (, ), [, ], or newline
+        const parts = trimmed.split(/[\/\(\)\[\]\n\r]+/).map(p => p.trim()).filter(Boolean);
+        if (parts.length > 1) {
+            const cyrillicPart = parts.find(p => /[А-ЯЁа-яё]/.test(p));
+            if (cyrillicPart) {
+                return cyrillicPart;
+            }
+        }
+
+        // Space separated bilingual concatenation (e.g. "АЛЕКСАНДР ALEKSANDR")
+        const words = trimmed.split(/\s+/);
+        const cyrillicWords = words.filter(w => /[А-ЯЁа-яё]/.test(w));
+        const latinWords = words.filter(w => /[A-Za-z]/.test(w));
+
+        if (cyrillicWords.length > 0 && latinWords.length > 0) {
+            return cyrillicWords.join(' ');
+        }
+    }
+
+    return trimmed;
+}
+
 module.exports = {
     normalizeDate,
     normalizeSex,
@@ -348,6 +388,6 @@ module.exports = {
     normalizeDocumentType,
     isCyrillicScript,
     isLatinScript,
-    compareSurnames
+    compareSurnames,
+    cleanBilingualName
 };
-
