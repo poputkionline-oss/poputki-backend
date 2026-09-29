@@ -1544,6 +1544,7 @@ router.post('/bookings/manual', async (req, res) => {
         // (manualBookingSmsOutboxService.js via maintenance tick).
         {
             const { shouldEnqueueOsonSms } = require('../utils/osonSmsRouting');
+            const { triggerManualBookingSmsOutboxFast } = require('../utils/manualBookingSmsOutboxService');
             const carrierId = req.carrier.user_id;
             // This request IS the booking's creation moment — comparing "now"
             // against the cutoff is equivalent to comparing the booking's
@@ -1569,7 +1570,16 @@ router.post('/bookings/manual', async (req, res) => {
                                 idempotency_key: idempotencyKey,
                                 status: 'pending'
                             }, { onConflict: 'idempotency_key', ignoreDuplicates: true })
-                            .then(() => {})
+                            .then(() => {
+                                // Fast path (Stage B): fire-and-forget, never
+                                // awaited — this booking's HTTP response above
+                                // does not wait on it either way. No-op unless
+                                // OSON_SMS_FAST_TRIGGER_ENABLED=true; when off
+                                // (default), behavior is identical to before
+                                // this change — the GitHub Actions maintenance
+                                // tick remains the only trigger.
+                                triggerManualBookingSmsOutboxFast({ bookingId: booking.id, supabaseClient: outboxClient });
+                            })
                             .catch(err => console.error('[OsonSmsOutbox] Enqueue failed:', err.message));
                     }
                 } catch (outboxErr) {
