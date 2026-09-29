@@ -103,7 +103,10 @@ function normalizeSex(sexStr) {
 function normalizeDocumentNumber(docStr) {
     if (!docStr || typeof docStr !== 'string') return null;
 
-    const clean = docStr.replace(/[\s\-<]+/g, '').toUpperCase();
+    // Remove document symbol prefixes like "Nº", "N°", "N.", "NO.", "№", "#"
+    let clean = docStr.replace(/^(N[º°\.]|NO\.|№|#)\s*/i, '');
+    // Remove spaces, hyphens, MRZ filler '<', dots, slashes, backslashes, hash, degrees, etc.
+    clean = clean.replace(/[\s\-<№#/\.\\°º]/g, '').toUpperCase();
     return clean || null;
 }
 
@@ -284,7 +287,8 @@ function isLatinScript(str) {
 }
 
 /**
- * Compares two surnames handling cross-script transliteration (Cyrillic vs Latin).
+ * Compares two surnames handling cross-script transliteration (Cyrillic vs Latin)
+ * and bilingual visual zone inputs (e.g., "ИВАНОВ / IVANOV").
  * Returns 'MATCH', 'MISMATCH', or 'NOT_COMPARABLE'.
  * @param {string|null} surname1
  * @param {string|null} surname2
@@ -293,27 +297,47 @@ function isLatinScript(str) {
 function compareSurnames(surname1, surname2) {
     if (!surname1 || !surname2) return 'NOT_COMPARABLE';
 
-    const s1 = surname1.replace(/[^A-ZА-ЯЁa-zа-яё]/g, '').toUpperCase();
-    const s2 = surname2.replace(/[^A-ZА-ЯЁa-zа-яё]/g, '').toUpperCase();
+    const tokenize = (str) => {
+        return str
+            .toUpperCase()
+            .split(/[\s/\-–—,\.\\]+/)
+            .map(t => t.replace(/[^A-ZА-ЯЁ]/g, ''))
+            .filter(Boolean);
+    };
 
-    if (!s1 || !s2) return 'NOT_COMPARABLE';
+    const tokens1 = tokenize(surname1);
+    const tokens2 = tokenize(surname2);
 
-    const s1Cyr = isCyrillicScript(s1);
-    const s1Lat = isLatinScript(s1);
-    const s2Cyr = isCyrillicScript(s2);
-    const s2Lat = isLatinScript(s2);
+    if (tokens1.length === 0 || tokens2.length === 0) return 'NOT_COMPARABLE';
 
-    // If one is Cyrillic and the other is Latin, they are cross-script -> NOT_COMPARABLE
-    if ((s1Cyr && s2Lat && !s1Lat && !s2Cyr) || (s1Lat && s2Cyr && !s1Cyr && !s2Lat)) {
-        return 'NOT_COMPARABLE';
+    const lat1 = tokens1.filter(t => isLatinScript(t) && !isCyrillicScript(t));
+    const cyr1 = tokens1.filter(t => isCyrillicScript(t) && !isLatinScript(t));
+
+    const lat2 = tokens2.filter(t => isLatinScript(t) && !isCyrillicScript(t));
+    const cyr2 = tokens2.filter(t => isCyrillicScript(t) && !isLatinScript(t));
+
+    // Compare same-script tokens if both sides have Latin tokens
+    if (lat1.length > 0 && lat2.length > 0) {
+        const s1Lat = lat1.join('');
+        const s2Lat = lat2.join('');
+        if (s1Lat === s2Lat || lat1.includes(s2Lat) || lat2.includes(s1Lat)) {
+            return 'MATCH';
+        }
+        return 'MISMATCH';
     }
 
-    // Same script comparison
-    if (s1 === s2) {
-        return 'MATCH';
+    // Compare same-script tokens if both sides have Cyrillic tokens
+    if (cyr1.length > 0 && cyr2.length > 0) {
+        const s1Cyr = cyr1.join('');
+        const s2Cyr = cyr2.join('');
+        if (s1Cyr === s2Cyr || cyr1.includes(s2Cyr) || cyr2.includes(s1Cyr)) {
+            return 'MATCH';
+        }
+        return 'MISMATCH';
     }
 
-    return 'MISMATCH';
+    // Cross-script comparison where one side lacks matching script tokens
+    return 'NOT_COMPARABLE';
 }
 
 module.exports = {

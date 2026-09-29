@@ -512,6 +512,9 @@ async function recognizePassportDocument(images, options = {}) {
     }
 
     const firstPassMrzStatus = mrzAnalysis ? mrzAnalysis.status : 'MRZ_NOT_DETECTED';
+    const firstPassLineLengths = Array.isArray(normalizedVisualZone.mrz_lines)
+        ? normalizedVisualZone.mrz_lines.map(l => (typeof l === 'string' ? l.length : 0))
+        : [];
 
     // 6. CONDITIONAL MRZ SECOND PASS
     // Triggered ONLY IF:
@@ -520,6 +523,9 @@ async function recognizePassportDocument(images, options = {}) {
     // - Second pass is not explicitly disabled via options.disableSecondPass
     let secondPassTriggered = false;
     let secondPassDurationMs = 0;
+    let secondPassStatus = null;
+    let secondPassLineLengths = null;
+    let selectedPass = (mrzAnalysis && mrzAnalysis.valid) ? 'FIRST' : 'NONE';
 
     const hasBasicVisualFields = Boolean(normalizedSurname || normalizedGivenName || normalizedDocNumber);
     const needsMrzFix = (!mrzAnalysis || !mrzAnalysis.valid);
@@ -531,12 +537,16 @@ async function recognizePassportDocument(images, options = {}) {
         secondPassDurationMs = Date.now() - spStart;
 
         if (secondPassResult && Array.isArray(secondPassResult.mrz_lines) && secondPassResult.mrz_lines.length > 0) {
+            secondPassLineLengths = secondPassResult.mrz_lines.map(l => (typeof l === 'string' ? l.length : 0));
             const secondPassMrzAnalysis = validateMrz(secondPassResult.mrz_lines);
-            if (secondPassMrzAnalysis && secondPassMrzAnalysis.valid) {
+            secondPassStatus = secondPassMrzAnalysis ? secondPassMrzAnalysis.status : 'MRZ_NOT_DETECTED';
+
+            if (secondPassMrzAnalysis && secondPassMrzAnalysis.valid === true) {
                 // Second pass succeeded deterministically! Update MRZ data
                 mrzAnalysis = secondPassMrzAnalysis;
                 normalizedVisualZone.mrz_lines = secondPassResult.mrz_lines;
                 normalizedVisualZone.mrz_present = true;
+                selectedPass = 'SECOND';
             }
         }
     }
@@ -606,11 +616,17 @@ async function recognizePassportDocument(images, options = {}) {
         warnings,
         diagnostics: {
             first_pass_duration_ms: firstPassDurationMs,
+            first_pass_status: firstPassMrzStatus,
+            first_pass_line_lengths: firstPassLineLengths,
             second_pass_triggered: secondPassTriggered,
+            second_pass_status: secondPassStatus,
+            second_pass_line_lengths: secondPassLineLengths,
             second_pass_duration_ms: secondPassDurationMs,
+            selected_pass: selectedPass,
+            mrz_verified: Boolean(mrzAnalysis && mrzAnalysis.valid === true),
+            conflict_count: conflicts.length,
             total_duration_ms: totalDurationMs,
             total_payload_bytes: totalPayloadBytes,
-            first_pass_mrz_status: firstPassMrzStatus,
             final_mrz_status: mrzAnalysis?.status || 'MRZ_NOT_DETECTED'
         }
     };

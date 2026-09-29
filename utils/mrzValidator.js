@@ -217,13 +217,55 @@ function validateMrz(rawLines) {
     const lines = rawLines.map(sanitizeMrzLine).filter(l => l.length > 0);
     if (lines.length === 0) return null;
 
-    // Check TD1 (3 lines, expected length 30 per line)
+    // 1. Check TD1 if 3 lines available (~30 chars each)
     if (lines.length >= 3) {
         const l0 = lines[0];
         const l1 = lines[1];
         const l2 = lines[2];
 
-        // Strict length check: do NOT use padEnd to fake missing characters
+        if (l0.length >= 28 && l0.length <= 32 &&
+            l1.length >= 28 && l1.length <= 32 &&
+            l2.length >= 28 && l2.length <= 32) {
+            const p0 = l0.padEnd(30, '<');
+            const p1 = l1.padEnd(30, '<');
+            const p2 = l2.padEnd(30, '<');
+            try {
+                const td1 = parseTD1(p0, p1, p2);
+                if (td1 && td1.valid) {
+                    td1.status = 'MRZ_VALID';
+                    td1.error_class = null;
+                    return td1;
+                }
+            } catch (e) {}
+        }
+    }
+
+    // 2. Check TD3 on any contiguous 2-line pair (~44 chars each)
+    if (lines.length >= 2) {
+        for (let i = 0; i <= lines.length - 2; i++) {
+            const l0 = lines[i];
+            const l1 = lines[i + 1];
+
+            if (l0.length >= 40 && l1.length >= 40) {
+                const p0 = l0.padEnd(44, '<');
+                const p1 = l1.padEnd(44, '<');
+                try {
+                    const td3 = parseTD3(p0, p1);
+                    if (td3 && td3.valid) {
+                        td3.status = 'MRZ_VALID';
+                        td3.error_class = null;
+                        return td3;
+                    }
+                } catch (e) {}
+            }
+        }
+    }
+
+    // 3. Fallback: if no candidate passed checksum, evaluate primary format for status reporting
+    if (lines.length >= 3 && lines[0].length <= 34) {
+        const l0 = lines[0];
+        const l1 = lines[1];
+        const l2 = lines[2];
         if (l0.length < 28 || l1.length < 28 || l2.length < 28) {
             return {
                 format: 'TD1',
@@ -233,26 +275,17 @@ function validateMrz(rawLines) {
                 message: 'Машиночитаемая строка (MRZ) неполная или обрезана'
             };
         }
-
-        const p0 = l0.padEnd(30, '<');
-        const p1 = l1.padEnd(30, '<');
-        const p2 = l2.padEnd(30, '<');
         try {
-            const td1 = parseTD1(p0, p1, p2);
-            if (td1) {
-                td1.status = td1.valid ? 'MRZ_VALID' : 'MRZ_CHECKSUM_FAILED';
-                td1.error_class = td1.valid ? null : 'CHECKSUM_IMPLEMENTATION_ERROR';
-                return td1;
-            }
+            const td1 = parseTD1(l0.padEnd(30, '<'), l1.padEnd(30, '<'), l2.padEnd(30, '<'));
+            td1.status = 'MRZ_CHECKSUM_FAILED';
+            td1.error_class = 'CHECKSUM_IMPLEMENTATION_ERROR';
+            return td1;
         } catch (e) {}
     }
 
-    // Check TD3 (2 lines, expected length 44 per line)
     if (lines.length >= 2) {
         const l0 = lines[0];
         const l1 = lines[1];
-
-        // Strict length check: do NOT use padEnd to fake missing characters
         if (l0.length < 40 || l1.length < 40) {
             return {
                 format: 'TD3',
@@ -262,16 +295,11 @@ function validateMrz(rawLines) {
                 message: 'Машиночитаемая строка (MRZ) неполная или обрезана'
             };
         }
-
-        const p0 = l0.padEnd(44, '<');
-        const p1 = l1.padEnd(44, '<');
         try {
-            const td3 = parseTD3(p0, p1);
-            if (td3) {
-                td3.status = td3.valid ? 'MRZ_VALID' : 'MRZ_CHECKSUM_FAILED';
-                td3.error_class = td3.valid ? null : 'CHECKSUM_IMPLEMENTATION_ERROR';
-                return td3;
-            }
+            const td3 = parseTD3(l0.padEnd(44, '<'), l1.padEnd(44, '<'));
+            td3.status = 'MRZ_CHECKSUM_FAILED';
+            td3.error_class = 'CHECKSUM_IMPLEMENTATION_ERROR';
+            return td3;
         } catch (e) {}
     }
 
@@ -286,7 +314,7 @@ function validateMrz(rawLines) {
 
 /**
  * Compares Visual Zone data extracted by AI with MRZ validated data.
- * Emits derived field conflicts ONLY when MRZ itself is valid (prevents warning cascade).
+ * Emits derived field conflicts ONLY when MRZ itself is deterministically valid (valid === true).
  * Handles cross-script surname comparisons (Cyrillic vs Latin).
  * @param {Object} visualZone
  * @param {Object} mrzParsed
@@ -297,9 +325,9 @@ function crossCheckVisualAndMrz(visualZone, mrzParsed) {
     if (!visualZone || !mrzParsed) return conflicts;
 
     // PREVENT WARNING CASCADE:
-    // If MRZ is explicitly invalid or incomplete (valid === false), DO NOT perform derived field comparisons
-    if (mrzParsed.valid === false) {
-        return conflicts;
+    // Field-level MRZ conflicts MUST ONLY be generated when MRZ is deterministically valid (mrzParsed.valid === true)
+    if (mrzParsed.valid !== true) {
+        return [];
     }
 
     // Compare Document Number (Normalized)
@@ -339,15 +367,6 @@ function crossCheckVisualAndMrz(visualZone, mrzParsed) {
 
     return conflicts;
 }
-
-module.exports = {
-    calculateCheckDigit,
-    sanitizeMrzLine,
-    parseMrzDate,
-    parseMrzName,
-    validateMrz,
-    crossCheckVisualAndMrz
-};
 
 module.exports = {
     calculateCheckDigit,

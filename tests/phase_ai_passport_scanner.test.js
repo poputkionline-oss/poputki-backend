@@ -119,6 +119,7 @@ describe('AI Passport Scanner — Backend Unit & Integration Tests', () => {
         };
 
         const mrzParsed = {
+            valid: true,
             document_number: '405093698',
             birth_date: '1998-05-14',
             sex: 'M',
@@ -385,14 +386,14 @@ describe('AI Passport Scanner — Backend Unit & Integration Tests', () => {
         // Same document number with whitespace vs formatted -> NO CONFLICT
         const noConflict = crossCheckVisualAndMrz(
             { document_number: '405 093 698' },
-            { document_number: '405093698' }
+            { valid: true, document_number: '405093698' }
         );
         assert.equal(noConflict.length, 0, 'Formatted spaces must not trigger false document number conflict');
 
         // Real mismatch -> CONFLICT
         const realConflict = crossCheckVisualAndMrz(
             { document_number: '405093699' },
-            { document_number: '405093698' }
+            { valid: true, document_number: '405093698' }
         );
         assert.equal(realConflict.length, 1);
         assert.ok(realConflict[0].includes('Номер документа'));
@@ -911,6 +912,222 @@ describe('AI Passport Scanner — Backend Unit & Integration Tests', () => {
 
         assert.equal(res, 'Узбекистан', 'Must resolve citizenship to Узбекистан');
         assert.notEqual(res, 'Россия');
+    });
+
+    // ------------------------------------------------------------------------
+    // V4 AUDIT REGRESSION TESTS (FALSE MRZ CONFLICT GATING & CONTRACT ENFORCEMENT)
+    // ------------------------------------------------------------------------
+
+    // 42. Test Matrix A: Visual data correct + MRZ_INVALID with different doc number
+    it('[AI-OCR-42] suppresses document number conflict when MRZ is invalid', () => {
+        const visualZone = {
+            document_number: '405093698',
+            birth_date: '1998-05-14',
+            sex: 'M',
+            surname: 'SHOMIRSAIDOV'
+        };
+
+        const invalidMrz = {
+            valid: false,
+            status: 'MRZ_CHECKSUM_FAILED',
+            document_number: '999999999'
+        };
+
+        const conflicts = crossCheckVisualAndMrz(visualZone, invalidMrz);
+        assert.equal(conflicts.length, 0, 'Invalid MRZ MUST NOT emit document number mismatch warning');
+    });
+
+    // 43. Test Matrix B: Visual surname correct + invalid MRZ with different surname
+    it('[AI-OCR-43] suppresses surname conflict when MRZ is invalid', () => {
+        const visualZone = {
+            document_number: '405093698',
+            surname: 'SHOMIRSAIDOV'
+        };
+
+        const invalidMrz = {
+            valid: false,
+            status: 'MRZ_INCOMPLETE',
+            surname: 'DIFFERENT'
+        };
+
+        const conflicts = crossCheckVisualAndMrz(visualZone, invalidMrz);
+        assert.equal(conflicts.length, 0, 'Invalid MRZ MUST NOT emit surname mismatch warning');
+    });
+
+    // 44. Test Matrix C: First pass invalid + Second pass invalid
+    it('[AI-OCR-44] keeps mrz_verified=false and conflicts=[] when both passes are invalid', async () => {
+        const mockFirstPass = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'RUS',
+                document_type: 'passport',
+                surname: 'IVANOV',
+                given_name: 'IVAN',
+                document_number: '751234567',
+                mrz_present: true,
+                mrz_lines: ['BAD_LINE_1', 'BAD_LINE_2']
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const mockSecondPass = {
+            mrz_present: true,
+            mrz_format: 'TD3',
+            mrz_lines: ['STILL_BAD_1', 'STILL_BAD_2']
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], {
+            mockAiResponse: mockFirstPass,
+            mockSecondPassResponse: mockSecondPass
+        });
+
+        assert.equal(res.diagnostics.mrz_verified, false);
+        assert.equal(res.conflicts.length, 0, 'Must not emit field conflicts when MRZ is invalid');
+        assert.ok(res.warnings.some(w => w.includes('машиночитаемой')));
+    });
+
+    // 45. Test Matrix D: First pass invalid + Second pass valid
+    it('[AI-OCR-45] accepts second pass ONLY if second pass is deterministically valid', async () => {
+        const mockFirstPass = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'TJK',
+                document_type: 'passport',
+                surname: 'SHOMIRSAIDOV',
+                given_name: 'ABUBAKR',
+                document_number: '405093698',
+                mrz_present: true,
+                mrz_lines: ['P<TJKSHOMIR', '405093698']
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const mockSecondPass = {
+            mrz_present: true,
+            mrz_format: 'TD3',
+            mrz_lines: [
+                'P<TJKSHOMIRSAIDOV<<ABUBAKR<<<<<<<<<<<<<<<<<',
+                '4050936980TJK9805149M2805140<<<<<<<<<<<<<<08'
+            ]
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], {
+            mockAiResponse: mockFirstPass,
+            mockSecondPassResponse: mockSecondPass
+        });
+
+        assert.equal(res.diagnostics.selected_pass, 'SECOND');
+        assert.equal(res.diagnostics.mrz_verified, true);
+        assert.equal(res.conflicts.length, 0);
+    });
+
+    // 46. Test Matrix E: First pass valid + Second pass NOT needed
+    it('[AI-OCR-46] does NOT trigger second pass when first pass MRZ is valid', async () => {
+        const mockFirstPass = {
+            quality: { acceptable: true, blur_detected: false, glare_detected: false, document_cut_off: false, too_dark: false, fields_obscured: false },
+            document: {
+                country: 'RUS',
+                document_type: 'passport',
+                surname: 'IVANOV',
+                given_name: 'IVAN',
+                document_number: '751234567',
+                mrz_present: true,
+                mrz_lines: [
+                    'P<RUSIVANOV<<IVAN<<<<<<<<<<<<<<<<<<<<<<<<<<',
+                    '7512345672RUS8001014M2501017<<<<<<<<<<<<<<03'
+                ]
+            },
+            confidence: { overall: 0.95 }
+        };
+
+        const res = await recognizePassportDocument(['data:image/jpeg;base64,dummy'], { mockAiResponse: mockFirstPass });
+        assert.equal(res.diagnostics.selected_pass, 'FIRST');
+        assert.equal(res.diagnostics.second_pass_triggered, false);
+    });
+
+    // 47. Test Matrix F: Valid MRZ + genuinely different document number
+    it('[AI-OCR-47] emits genuine document number conflict when MRZ is valid and numbers differ', () => {
+        const visualZone = {
+            document_number: '751234568', // Discrepancy: last digit is 8 instead of 7
+            birth_date: '1980-01-01',
+            sex: 'M',
+            surname: 'IVANOV'
+        };
+
+        const validMrz = {
+            valid: true,
+            status: 'MRZ_VALID',
+            document_number: '751234567',
+            birth_date: '1980-01-01',
+            sex: 'M',
+            surname: 'IVANOV'
+        };
+
+        const conflicts = crossCheckVisualAndMrz(visualZone, validMrz);
+        assert.equal(conflicts.length, 1);
+        assert.ok(conflicts[0].includes('Номер документа в паспорте и в строке MRZ отличается'));
+    });
+
+    // 48. Test Matrix G: Bilingual visual surname + Latin valid MRZ surname
+    it('[AI-OCR-48] handles bilingual visual zone surname "ИВАНОВ / IVANOV" without false mismatch', () => {
+        const { compareSurnames } = require('../utils/passportNormalizer');
+
+        const res = compareSurnames('ИВАНОВ / IVANOV', 'IVANOV');
+        assert.equal(res, 'MATCH', 'Bilingual visual surname matching Latin MRZ surname MUST yield MATCH');
+
+        const validMrz = {
+            valid: true,
+            status: 'MRZ_VALID',
+            document_number: '751234567',
+            birth_date: '1980-01-01',
+            sex: 'M',
+            surname: 'IVANOV'
+        };
+
+        const visualZone = {
+            surname: 'ИВАНОВ / IVANOV',
+            document_number: '751234567',
+            birth_date: '1980-01-01',
+            sex: 'M'
+        };
+
+        const conflicts = crossCheckVisualAndMrz(visualZone, validMrz);
+        assert.equal(conflicts.length, 0, 'Must produce 0 conflicts for bilingual surname matching MRZ');
+    });
+
+    // 49. Test Matrix H: Truncated MRZ
+    it('[AI-OCR-49] treats truncated MRZ lines as MRZ_INCOMPLETE with 0 field conflicts', () => {
+        const truncatedLines = [
+            'P<RUSIVANOV<<IVAN<<<<<<<<<<',
+            '7512345672RUS8001014M2501017'
+        ];
+        const mrzRes = validateMrz(truncatedLines);
+        assert.equal(mrzRes.valid, false);
+        assert.equal(mrzRes.status, 'MRZ_INCOMPLETE');
+
+        const conflicts = crossCheckVisualAndMrz({ document_number: '751234567' }, mrzRes);
+        assert.equal(conflicts.length, 0);
+    });
+
+    // 50. Document number symbol normalization (№, Nº, N°, ., #, /)
+    it('[AI-OCR-50] normalizes document number symbols (№, Nº, N°, ., #, /) preventing false mismatches', () => {
+        assert.equal(normalizeDocumentNumber('№ 45 12 345678'), '4512345678');
+        assert.equal(normalizeDocumentNumber('Nº A1234567'), 'A1234567');
+        assert.equal(normalizeDocumentNumber('N° 75.12/345678'), '7512345678');
+        assert.equal(normalizeDocumentNumber('#12345678'), '12345678');
+
+        const validMrz = {
+            valid: true,
+            status: 'MRZ_VALID',
+            document_number: '4512345678'
+        };
+
+        const visualZone = {
+            document_number: '№ 45 12 345678'
+        };
+
+        const conflicts = crossCheckVisualAndMrz(visualZone, validMrz);
+        assert.equal(conflicts.length, 0, 'Symbol-prefixed document number must not trigger false mismatch');
     });
 });
 
