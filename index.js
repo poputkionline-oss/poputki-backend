@@ -203,4 +203,12 @@ app.use('/', acquisitionRoutes); // For GET /l/:rawToken and GET /r/:rawCode red
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
     console.log(`Swagger docs available at http://localhost:${PORT}/api-docs`);
+
+    // Fail-closed no-op unless OSON_SMS_RETRY_SWEEP_ENABLED=true — see
+    // utils/manualBookingSmsOutboxService.js for the full safety model.
+    // Complements the fast trigger (new bookings) and GitHub Actions
+    // (external fallback) with a periodic in-process check for existing
+    // retry/pending outbox rows.
+    const { startManualBookingSmsRetrySweep } = require('./utils/manualBookingSmsOutboxService');
+    startManualBookingSmsRetrySweep();
 });

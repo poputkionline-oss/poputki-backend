@@ -27,6 +27,15 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.poputki.online';
 const TIMEOUT_BACKOFF_SECONDS = 30 * 60;
 const DEFAULT_BACKOFF_SECONDS = 5 * 60;
 
+// A cap/allowlist rejection never reaches the provider — same-day-responsive
+// (not deferred to the next UTC day, so a mid-day cap increase like the one
+// observed on booking 489 is picked up again within 15 minutes rather than
+// stuck until tomorrow) but gentler than the generic 5-minute default, since
+// a daily cap by definition only changes at most a few times a day.
+const CAP_RETRY_BACKOFF_SECONDS = 15 * 60;
+
+const DEFAULT_RETRY_SWEEP_INTERVAL_MS = 45 * 1000;
+
 async function markOutboxRow(client, id, patch) {
     await client.from('manual_booking_sms_outbox').update(patch).eq('id', id);
 }
@@ -118,10 +127,20 @@ async function processManualBookingSmsOutbox(options = {}) {
 
         const capResult = await checkSendCaps({ dbClient: client, phone, carrierId: entry.carrier_id || booking.created_by_user_id, outboxId: entryId });
         if (!capResult.allowed) {
-            // Cap failures are temporary (reset daily) — retry later, don't burn the attempt budget hard.
+            // fn_claim_manual_booking_sms_batch already incremented
+            // attempts_count the moment this row was claimed — before this
+            // code ever knew whether a cap would allow the send. A cap
+            // rejection means NO delivery attempt reached the provider, so
+            // that increment is refunded here: attempts_count tracks
+            // provider attempts, not claim attempts. Without this, a
+            // persistently- or temporarily-exhausted cap could by itself
+            // burn through max_attempts and permanently dead-letter a row
+            // that was simply waiting for capacity (Stage D1 audit finding).
+            const refundedAttempts = Math.max(0, (entry.attempts_count || 1) - 1);
             await markOutboxRow(client, entryId, {
                 status: 'retry',
-                scheduled_at: new Date(Date.now() + DEFAULT_BACKOFF_SECONDS * 1000).toISOString(),
+                attempts_count: refundedAttempts,
+                scheduled_at: new Date(Date.now() + CAP_RETRY_BACKOFF_SECONDS * 1000).toISOString(),
                 last_error_code: capResult.reason,
                 recipient_phone_masked: maskPhone(phone),
                 recipient_phone_hmac: safeHmac(phone)
@@ -396,4 +415,124 @@ function triggerManualBookingSmsOutboxFast({ bookingId, supabaseClient } = {}) {
     });
 }
 
-module.exports = { processManualBookingSmsOutbox, triggerManualBookingSmsOutboxFast };
+// Module-level sweep state. Deliberately NOT the source of truth for
+// anything — it only tracks whether a timer/tick is currently running in
+// THIS process, purely to avoid registering a second interval and to skip
+// an overlapping local tick. Every actual scheduling decision (what is
+// eligible, what to claim, what cap allows) still lives entirely in
+// Postgres (scheduled_at, status, attempts_count, FOR UPDATE SKIP LOCKED,
+// pg_advisory_xact_lock) exactly as it does for the fast trigger and for
+// GitHub Actions.
+let sweepIntervalHandle = null;
+let sweepTickInProgress = false;
+
+/**
+ * Starts an in-process periodic sweep of processManualBookingSmsOutbox(),
+ * so existing 'retry'/'pending' rows are picked up on a short cadence
+ * instead of depending solely on the GitHub Actions maintenance tick
+ * (which has been observed to fire every 4-8.5h instead of hourly).
+ *
+ * This is NOT a second SMS pipeline: every tick calls the exact same,
+ * unmodified processManualBookingSmsOutbox() that the fast trigger and
+ * GitHub Actions already call, so every existing gate (kill switches,
+ * claim/lease, daily cap, allowlists, rollout cutoff, idempotency,
+ * retry/reconciliation) applies unchanged.
+ *
+ * Fail-closed: OSON_SMS_RETRY_SWEEP_ENABLED must be exactly 'true' or no
+ * timer is registered at all — absent/misspelled/any other value means
+ * this function is a complete no-op, identical to not calling it.
+ *
+ * Safe to call more than once: a second call while a sweep is already
+ * running is a no-op (logged, not silently ignored) rather than creating
+ * a second interval.
+ *
+ * @param {Object} [options]
+ * @param {number} [options.intervalMs] - overrides OSON_SMS_RETRY_SWEEP_INTERVAL_MS/default (45s)
+ * @param {Object} [options.supabaseClient] - injectable client, for tests only; production uses the default service-role client
+ * @param {Function} [options.fetchImpl] - injectable fetch, for tests only
+ * @returns {{started: boolean, intervalMs?: number}} started=false when disabled or already running
+ */
+function startManualBookingSmsRetrySweep(options = {}) {
+    if (process.env.OSON_SMS_RETRY_SWEEP_ENABLED !== 'true') {
+        return { started: false };
+    }
+
+    if (sweepIntervalHandle) {
+        console.warn('[OsonSmsRetrySweep] start called while a sweep is already running — ignoring (call stop() first to restart with new options)');
+        return { started: false };
+    }
+
+    const intervalMs = Number(options.intervalMs || process.env.OSON_SMS_RETRY_SWEEP_INTERVAL_MS) || DEFAULT_RETRY_SWEEP_INTERVAL_MS;
+
+    const tick = () => {
+        if (sweepTickInProgress) {
+            // The previous tick's processManualBookingSmsOutbox() call is
+            // still in flight (e.g. a large batch, or a slow provider
+            // round-trip) — skip this tick entirely rather than starting a
+            // second concurrent local run. Correctness does not depend on
+            // this (DB-level claim is already safe under overlap, proven
+            // for fast trigger + recovery races in Stage B), but running
+            // two ticks from the SAME process at once is pure waste with
+            // no benefit, so it is avoided here.
+            console.log('[OsonSmsRetrySweep] SMS_RETRY_SWEEP_SKIPPED_OVERLAP');
+            return;
+        }
+
+        sweepTickInProgress = true;
+        const startedAt = Date.now();
+        console.log('[OsonSmsRetrySweep] SMS_RETRY_SWEEP_STARTED');
+
+        processManualBookingSmsOutbox({
+            supabaseClient: options.supabaseClient,
+            fetchImpl: options.fetchImpl
+        })
+            .then(result => {
+                console.log('[OsonSmsRetrySweep] SMS_RETRY_SWEEP_FINISHED', {
+                    processed: result.processed,
+                    sent: result.sent,
+                    retried: result.retried,
+                    failed: result.failed,
+                    duration_ms: Date.now() - startedAt
+                });
+            })
+            .catch(err => {
+                console.error('[OsonSmsRetrySweep] SMS_RETRY_SWEEP_FAILED', {
+                    duration_ms: Date.now() - startedAt,
+                    error_code: (err && err.code) || (err && err.message) || 'UNKNOWN_ERROR'
+                });
+            })
+            .finally(() => {
+                sweepTickInProgress = false;
+            });
+    };
+
+    sweepIntervalHandle = setInterval(tick, intervalMs);
+    // unref(): this recurring timer must never by itself keep the Node
+    // process alive (e.g. during a graceful shutdown or in a short-lived
+    // test/script process) — it is pure background housekeeping.
+    if (typeof sweepIntervalHandle.unref === 'function') {
+        sweepIntervalHandle.unref();
+    }
+
+    return { started: true, intervalMs };
+}
+
+/**
+ * Stops the periodic sweep started by startManualBookingSmsRetrySweep().
+ * Idempotent: calling it when no sweep is running is a safe no-op. Does
+ * not interrupt a tick that is already in flight — that call finishes
+ * naturally; only future ticks are cancelled.
+ */
+function stopManualBookingSmsRetrySweep() {
+    if (sweepIntervalHandle) {
+        clearInterval(sweepIntervalHandle);
+        sweepIntervalHandle = null;
+    }
+}
+
+module.exports = {
+    processManualBookingSmsOutbox,
+    triggerManualBookingSmsOutboxFast,
+    startManualBookingSmsRetrySweep,
+    stopManualBookingSmsRetrySweep
+};
