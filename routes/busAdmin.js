@@ -1316,6 +1316,13 @@ router.post('/bookings/manual', async (req, res) => {
             .single();
 
         if (tErr || !ticket) return res.status(404).json({ error: 'Рейс не найден' });
+        if (ticket.status !== 'active') {
+            return res.status(409).json({
+                error: 'TRIP_NOT_BOOKABLE',
+                message: 'Рейс завершён, отменён или недоступен для бронирования. Выберите другой рейс.'
+            });
+        }
+
 
         // Check if seats are already taken
         const reserved = typeof ticket.reserved_seats === 'string' ? JSON.parse(ticket.reserved_seats || '[]') : (ticket.reserved_seats || []);
