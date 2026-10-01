@@ -80,6 +80,7 @@ function sanitizeErrorMessage(message) {
 
 // Protect ALL carrier panel routes with carrierAuth
 router.use(carrierAuth);
+router.use('/reviews', require('./carrierReviews'));
 
 /**
  * @swagger

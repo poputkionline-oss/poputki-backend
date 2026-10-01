@@ -25,6 +25,7 @@ function submitReview(kind) {
 }
 router.post('/',userAuth,submitReview('ride'));
 router.post('/bus',userAuth,submitReview('bus'));
+router.get('/sent', userAuth, require('../utils/reviewCabinetHelper').reviewCabinetHandler(false));
 router.get('/mine',userAuth,async(req,res)=>{
     try{
         const {data,error}=await getServiceRoleClient().from('reviews').select('id,ride_id,bus_ticket_id,rating').eq('reviewer_id',req.user.id);
