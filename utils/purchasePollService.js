@@ -2,7 +2,7 @@
 const crypto = require('crypto');
 const axios = require('axios');
 const { getServiceRoleClient } = require('../dbServiceRole');
-const CUSTOM_OPTION = 'Ваш вариант (напишите, что именно мешает)';
+const CUSTOM_OPTION = 'Свой вариант (напишите ответ)';
 let webhookReady = false;
 function validatePollSettings(body) {
     const fields = ['question', 'option1', 'option2', 'option3'];
@@ -10,6 +10,8 @@ function validatePollSettings(body) {
     const result = Object.fromEntries(fields.map(key => [key, body[key].trim()]));
     if (new Set([result.option1, result.option2, result.option3, CUSTOM_OPTION].map(s => s.toLowerCase())).size !== 4) return null;
     result.enabled = body.enabled ?? true;
+    result.event_type = body.event_type ?? 'purchase';
+    if (!['purchase', 'completed'].includes(result.event_type)) return null;
     result.delay_minutes = body.delay_minutes ?? 15;
     result.cooldown_days = body.cooldown_days ?? 7;
     if (typeof result.enabled !== 'boolean' || !Number.isInteger(result.delay_minutes) || result.delay_minutes < 1 || result.delay_minutes > 1440 || !Number.isInteger(result.cooldown_days) || result.cooldown_days < 1 || result.cooldown_days > 365) return null;
@@ -46,7 +48,15 @@ function stillEligible(booking, row, settings, user, now = Date.now()) {
     if (!settings?.enabled || !booking || !user || user.is_blocked || String(user.telegram_id) !== row.telegram_id) return false;
     const owner = booking.claimed_by_user_id ?? booking.passenger_id;
     const trip = booking.bus_tickets;
-    if (owner !== row.user_id || booking.channel === 'manual' || booking.source_type === 'manual' || booking.contact_role === 'carrier_contact' || trip?.operator_id === owner || trip?.status !== 'active') return false;
+    if (owner !== row.user_id || booking.channel === 'manual' || booking.source_type === 'manual' || booking.contact_role === 'carrier_contact' || trip?.operator_id === owner) return false;
+    const event = row.event_type || 'purchase';
+    if (event !== (settings.event_type || 'purchase')) return false;
+    if (event === 'completed') {
+        const completedAt = trip?.poll_completed_at ? new Date(trip.poll_completed_at).getTime() : NaN;
+        return trip?.status === 'completed' && booking.status === 'confirmed' && booking.boarding_status === 'boarded'
+            && completedAt >= now - 86400000 && completedAt <= now - settings.delay_minutes * 60000;
+    }
+    if (trip?.status !== 'active') return false;
     if (new Date(booking.created_at).getTime() < now - 86400000) return false;
     const expiration = booking.status === 'cancelled' ? (booking.purchase_poll_expired_at ? new Date(booking.purchase_poll_expired_at).getTime() : NaN)
         : (booking.status === 'pending_payment' ? new Date(booking.hold_expires_at || new Date(new Date(booking.created_at).getTime() + 1800000)).getTime() : NaN);
@@ -66,7 +76,7 @@ async function processPurchasePolls({ dbClient = null, send = sendPurchasePoll, 
     for (const row of rows || []) {
         let status = 'skipped';
         try {
-            const bResult = await db.from('bus_ticket_bookings').select('*,bus_tickets!inner(status,operator_id,departure_date,departure_time)').eq('id', row.booking_id).single();
+            const bResult = await db.from('bus_ticket_bookings').select('*,bus_tickets!inner(status,operator_id,departure_date,departure_time,poll_completed_at)').eq('id', row.booking_id).single();
             const uResult = await db.from('users').select('telegram_id,is_blocked').eq('id', row.user_id).single();
             const sResult = await db.from('poll_settings').select('*').eq('id', 1).single();
             if (bResult.error || uResult.error || sResult.error) throw new Error('LOOKUP_FAILED');
@@ -76,7 +86,8 @@ async function processPurchasePolls({ dbClient = null, send = sendPurchasePoll, 
             if (paidError) throw paidError;
             const trip = b.bus_tickets;
             const departure = new Date(`${trip.departure_date}T${trip.departure_time}+05:00`).getTime();
-            if (stillEligible(b, row, sResult.data, uResult.data) && departure > Date.now() && !paid?.length) {
+            const eventEligible = row.event_type === 'completed' || (departure > Date.now() && !paid?.length);
+            if (stillEligible(b, row, sResult.data, uResult.data) && eventEligible) {
                 status = 'uncertain'; // network or ledger ambiguity: never automatically resend
                 const pollId = await send(row);
                 const finalized = await db.rpc('fn_finalize_purchase_poll', { p_outbox_id: row.id, p_poll_id: pollId });

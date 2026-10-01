@@ -1,6 +1,12 @@
 const router = require('express').Router();
 const { getServiceRoleClient } = require('../dbServiceRole');
 const { validatePollSettings, processPurchasePolls } = require('../utils/purchasePollService');
+router.get('/templates', async (req, res) => {
+    try {
+        const { data, error } = await getServiceRoleClient().from('poll_templates').select('*').order('id');
+        if (error) throw error; res.json({ templates: data || [] });
+    } catch (_) { res.status(500).json({ error: 'Не удалось загрузить готовые опросы' }); }
+});
 // Mounted after adminAuth. Never access these tables through an anonymous client.
 router.get('/settings', async (req, res) => {
     try {
@@ -32,10 +38,15 @@ router.post('/trigger', async (req, res) => {
 });
 router.get('/recipients', async (req, res) => {
     const page = Number(req.query.page ?? 1);
+    const filter = req.query.filter || 'all';
+    if (!['all', 'sent', 'answered', 'awaiting', 'issues'].includes(filter)) return res.status(400).json({ error: 'INVALID_FILTER' });
     if (!Number.isSafeInteger(page) || page < 1 || page > 1000000) return res.status(400).json({ error: 'INVALID_PAGE' });
     try {
-        const { data, error, count } = await getServiceRoleClient().from('purchase_poll_recipients')
-            .select('*', { count: 'exact' }).order('created_at', { ascending: false }).order('id', { ascending: false })
+        let query = getServiceRoleClient().from('purchase_poll_recipients').select('*', { count: 'exact' });
+        if (filter === 'sent') query = query.eq('delivery_status', 'sent');
+        if (filter === 'answered' || filter === 'awaiting') query = query.eq('delivery_status', 'sent').eq('answer_status', filter);
+        if (filter === 'issues') query = query.in('delivery_status', ['failed', 'uncertain']);
+        const { data, error, count } = await query.order('created_at', { ascending: false }).order('id', { ascending: false })
             .range((page - 1) * 20, page * 20 - 1);
         if (error) throw error;
         res.json({ recipients: data || [], count: count || 0, page, page_size: 20 });
