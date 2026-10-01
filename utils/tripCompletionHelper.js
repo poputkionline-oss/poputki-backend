@@ -245,6 +245,14 @@ async function completeTrip({ tripId, actorContext = null, dbClient = null } = {
         }
     }
 
+    if (data.already_completed === false) {
+        try {
+            await require('./busReviewInvitationService').processBusReviewInvitations({ dbClient: db, limit: 1 });
+        } catch (err) {
+            console.warn('[TripCompletion] Review invitations remain queued:', err.code || 'DISPATCH_FAILED');
+        }
+    }
+
     return {
         success: true,
         already_completed: Boolean(data.already_completed),

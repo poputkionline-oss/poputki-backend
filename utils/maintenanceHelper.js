@@ -84,12 +84,19 @@ async function runMaintenanceTick(options = {}) {
         tasks.manual_booking_sms_outbox = { success: false, error: err.message || 'SMS_OUTBOX_PROCESSING_FAILED' };
     }
 
+    try {
+        tasks.bus_review_invitations = { success: true, ...await require('./busReviewInvitationService').processBusReviewInvitations({ dbClient, dryRun }) };
+    } catch (err) {
+        tasks.bus_review_invitations = { success: false, error: 'REVIEW_INVITATIONS_FAILED' };
+    }
+
     return {
         success: Boolean(
             tasks.expire_pending.success &&
             tasks.auto_complete.success &&
             tasks.trip_change_outbox.success &&
-            tasks.manual_booking_sms_outbox.success
+            tasks.manual_booking_sms_outbox.success &&
+            tasks.bus_review_invitations.success
         ),
         timestamp,
         tasks
