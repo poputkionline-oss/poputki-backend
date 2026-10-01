@@ -30,15 +30,34 @@ router.post('/trigger', async (req, res) => {
     try { res.json({ success: true, ...await processPurchasePolls({ dryRun: req.query.dry_run === 'true' }) }); }
     catch (_) { res.status(503).json({ success: false, error: 'POLL_DISPATCH_FAILED' }); }
 });
+router.get('/recipients', async (req, res) => {
+    const page = Number(req.query.page ?? 1);
+    if (!Number.isSafeInteger(page) || page < 1 || page > 1000000) return res.status(400).json({ error: 'INVALID_PAGE' });
+    try {
+        const { data, error, count } = await getServiceRoleClient().from('purchase_poll_recipients')
+            .select('*', { count: 'exact' }).order('created_at', { ascending: false }).order('id', { ascending: false })
+            .range((page - 1) * 20, page * 20 - 1);
+        if (error) throw error;
+        res.json({ recipients: data || [], count: count || 0, page, page_size: 20 });
+    } catch (_) { res.status(500).json({ error: 'Не удалось загрузить получателей опросов' }); }
+});
 router.get('/status', async (req, res) => {
     try {
         const db = getServiceRoleClient();
-        const states = ['sent', 'failed', 'uncertain', 'skipped'];
+        const states = ['sent', 'failed', 'uncertain', 'skipped', 'processing'];
         const counts = {};
         for (const status of states) {
             const result = await db.from('purchase_poll_outbox').select('id', { count: 'exact', head: true }).eq('status', status);
             if (result.error) throw result.error; counts[status] = result.count || 0;
         }
+        const [sent, answered] = await Promise.all([
+            db.from('purchase_poll_recipients').select('id', { count: 'exact', head: true }).eq('delivery_status', 'sent'),
+            db.from('purchase_poll_recipients').select('id', { count: 'exact', head: true }).eq('delivery_status', 'sent').eq('answer_status', 'answered')
+        ]);
+        if (sent.error || answered.error) throw sent.error || answered.error;
+        counts.sent_total = sent.count || 0;
+        counts.answered_total = answered.count || 0;
+        counts.awaiting_total = Math.max(0, counts.sent_total - counts.answered_total);
         res.json({ ...counts, webhook_ready: require('../utils/purchasePollService').isWebhookReady() });
     } catch (_) { res.status(500).json({ error: 'Не удалось загрузить состояние отправки' }); }
 });
