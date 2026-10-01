@@ -62,6 +62,13 @@ router.post('/', userAuth, async (req, res) => {
             .single();
 
         if (ticketError || !ticket) return res.status(404).json({ error: 'Ticket not found' });
+        if (ticket.status !== 'active') {
+            return res.status(409).json({
+                error: 'TRIP_NOT_BOOKABLE',
+                message: 'Рейс завершён, отменён или недоступен для бронирования. Выберите другой рейс.'
+            });
+        }
+
 
         const { data: existingBookings } = await supabase
             .from('bus_ticket_bookings')
