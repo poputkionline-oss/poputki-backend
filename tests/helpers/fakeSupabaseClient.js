@@ -27,6 +27,7 @@
 
 function matchesFilters(row, filters) {
     return filters.every(([col, val, op]) => {
+        if (op === 'or') return val.some(([key, value]) => String(row[key]) === value);
         if (op === 'gte') return row[col] >= val;
         if (op === 'lte') return row[col] <= val;
         if (op === 'gt') return row[col] > val;
@@ -89,6 +90,15 @@ function createFakeSupabaseClient(tables = {}) {
                 },
                 neq(col, val) {
                     filters.push([col, val, 'neq']);
+                    return builder;
+                },
+                or(expression) {
+                    const alternatives = expression.split(',').map(part => {
+                        const [key, operator, ...value] = part.split('.');
+                        if (operator !== 'eq') throw new Error('Fake only supports OR equality');
+                        return [key, value.join('.')];
+                    });
+                    filters.push([null, alternatives, 'or']);
                     return builder;
                 },
                 gte(col, val) {
