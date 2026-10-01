@@ -60,7 +60,7 @@ router.get('/stats', async (req, res) => {
         const { count: totalBusTickets } = await supabase.from('bus_tickets').select('*', { count: 'exact', head: true });
         const { count: activeBusTickets } = await supabase.from('bus_tickets').select('*', { count: 'exact', head: true }).eq('status', 'active');
         const { count: totalBusBookings } = await supabase.from('bus_ticket_bookings').select('*', { count: 'exact', head: true }).eq('status', 'confirmed');
-        const { count: totalReviews } = await supabase.from('reviews').select('*', { count: 'exact', head: true });
+        const { count: totalReviews } = await require('../dbServiceRole').getServiceRoleClient().from('reviews').select('*', { count: 'exact', head: true });
 
         const { data: busBookingsRevenue } = await supabase.from('bus_ticket_bookings').select('total_price').eq('status', 'confirmed');
         const revenue = (busBookingsRevenue || []).reduce((acc, curr) => acc + (curr.total_price || 0), 0);
@@ -497,9 +497,9 @@ router.delete('/bus-tickets/:id', async (req, res) => {
 // Review Moderation
 router.get('/reviews', async (req, res) => {
     try {
-        const { data: reviews, error } = await supabase
+        const { data: reviews, error } = await require('../dbServiceRole').getServiceRoleClient()
             .from('reviews')
-            .select('*, u1:reviewer_id(name), u2:driver_id(name)')
+            .select('*, u1:reviewer_id(name), u2:driver_id(name), bus_tickets:bus_ticket_id(from_city,to_city,departure_date,transport_company)')
             .order('created_at', { ascending: false });
         if (error) throw error;
 
@@ -510,6 +510,7 @@ router.get('/reviews', async (req, res) => {
             delete r.u2;
             return {
                 ...r,
+                review_type: r.bus_ticket_id ? 'bus' : 'ride',
                 reviewer_name: reviewerName,
                 driver_name: driverName
             };
@@ -523,7 +524,9 @@ router.get('/reviews', async (req, res) => {
 
 router.delete('/reviews/:id', async (req, res) => {
     try {
-        await supabase.from('reviews').delete().eq('id', req.params.id);
+        const { data, error } = await require('../dbServiceRole').getServiceRoleClient().rpc('fn_delete_verified_review', { p_review_id: Number(req.params.id) });
+        if (error) throw error;
+        if (!data?.success) return res.status(404).json({ error: 'Отзыв не найден' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });

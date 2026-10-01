@@ -198,6 +198,7 @@ describe('Phase E.47.2 — fn_complete_bus_trip RPC call contract', () => {
         let captured = null;
         const dbClient = {
             async rpc(name, params) {
+                if (name === 'fn_claim_bus_review_invitations') return { data: [], error: null };
                 captured = { name, params };
                 return { data: { success: true, already_completed: false, trip_id: 720, no_show_marked: 2 }, error: null };
             }
@@ -218,6 +219,7 @@ describe('Phase E.47.2 — fn_complete_bus_trip RPC call contract', () => {
         let captured = null;
         const dbClient = {
             async rpc(name, params) {
+                if (name === 'fn_claim_bus_review_invitations') return { data: [], error: null };
                 captured = { name, params };
                 return { data: { success: true, already_completed: false, trip_id: 710, no_show_marked: 0 }, error: null };
             }

@@ -358,6 +358,7 @@ describe('Phase E.47.7.2 — POST /api/admin/maintenance/tick (HTTP)', () => {
         };
 
         delete require.cache[require.resolve('../utils/tripCompletionHelper')];
+        delete require.cache[require.resolve('../utils/busReviewInvitationService')];
         delete require.cache[require.resolve('../utils/paymentExpirationHelper')];
         delete require.cache[require.resolve('../utils/maintenanceHelper')];
         delete require.cache[require.resolve('../routes/admin')];

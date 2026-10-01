@@ -274,13 +274,14 @@ router.post('/vehicle', userAuth, async (req, res) => {
  */
 router.get('/:id/reviews', async (req, res) => {
     try {
-        const { data: reviews, error } = await supabase
+        const { data: reviews, error } = await require('../dbServiceRole').getServiceRoleClient()
             .from('reviews')
             .select(`
                 id, driver_id, reviewer_id, rating, comment, created_at,
                 users:reviewer_id (name)
             `)
             .eq('driver_id', req.params.id)
+            .not('ride_id', 'is', null)
             .order('created_at', { ascending: false });
 
         if (error) throw error;
