@@ -11,6 +11,7 @@
 
 const express = require('express');
 const router = express.Router();
+const { STAGE_EVENTS, reachedFunnelStage } = require('../utils/funnelStageHelper');
 const supabase = require('../db');
 const { getServiceRoleClient } = require('../dbServiceRole');
 
@@ -258,12 +259,14 @@ router.get('/stages', async (req, res) => {
                 id, channel, source_type, created_at,
                 bus_tickets (id, operator_id)
             `)
+            .or('channel.eq.manual,source_type.eq.manual')
             .gte('created_at', range.start)
             .lte('created_at', range.end);
 
         if (bus_ticket_id) query = query.eq('bus_ticket_id', Number(bus_ticket_id));
 
-        const { data: rawBookings } = await query;
+        const { data: rawBookings, error: bookingError } = await query;
+        if (bookingError) throw bookingError;
         let bookings = (rawBookings || []).filter(b => b.channel === 'manual' || b.source_type === 'manual');
         if (carrier_id) {
             bookings = bookings.filter(b => {
@@ -275,10 +278,11 @@ router.get('/stages', async (req, res) => {
         const bookingIds = bookings.map(b => b.id);
         let events = [];
         if (bookingIds.length > 0) {
-            const { data: evData } = await dbClient
+            const { data: evData, error: evError } = await dbClient
                 .from('booking_journey_events')
                 .select('booking_id, event_type, channel')
                 .in('booking_id', bookingIds);
+            if (evError) throw evError;
             events = evData || [];
         }
 
@@ -293,29 +297,9 @@ router.get('/stages', async (req, res) => {
             eventsByBooking.get(ev.booking_id).add(ev.event_type);
         }
 
-        let cManual = bookings.length;
-        let cHandoff = 0;
-        let cOpen = 0;
-        let cCta = 0;
-        let cBot = 0;
-        let cPhone = 0;
-        let cVerified = 0;
-        let cLinked = 0;
-        let cActivated = 0;
+        const cManual = bookings.length;
 
-        for (const b of bookings) {
-            const types = eventsByBooking.get(b.id) || new Set();
-            if (types.has(JOURNEY_EVENT_TYPES.SHARE_INITIATED) || types.has(JOURNEY_EVENT_TYPES.LINK_OPENED)) cHandoff++;
-            if (types.has(JOURNEY_EVENT_TYPES.LINK_OPENED)) cOpen++;
-            if (types.has(JOURNEY_EVENT_TYPES.TELEGRAM_CTA_CLICKED)) cCta++;
-            if (types.has(JOURNEY_EVENT_TYPES.TELEGRAM_BOT_STARTED)) cBot++;
-            if (types.has(JOURNEY_EVENT_TYPES.PHONE_SHARED)) cPhone++;
-            if (types.has(JOURNEY_EVENT_TYPES.PHONE_VERIFIED)) cVerified++;
-            if (types.has(JOURNEY_EVENT_TYPES.BOOKING_LINKED_TO_USER)) cLinked++;
-            if (types.has(JOURNEY_EVENT_TYPES.ACTIVATION_COMPLETED) || types.has(JOURNEY_EVENT_TYPES.CLAIM_COMPLETED)) cActivated++;
-        }
-
-        const counts = [cManual, cHandoff, cOpen, cCta, cBot, cPhone, cVerified, cLinked, cActivated];
+        const counts = Object.keys(STAGE_EVENTS).map(stage => bookings.filter(b => reachedFunnelStage(stage, eventsByBooking.get(b.id) || new Set())).length);
         const stepDefs = [
             { id: 'manual_booking', name: 'Ручная бронь' },
             { id: 'handoff_initiated', name: 'Передача инициирована' },
@@ -358,6 +342,8 @@ router.get('/stages', async (req, res) => {
  * Server-side paginated, filterable and sortable passenger journeys
  */
 router.get('/passengers', async (req, res) => {
+    const stage = req.query.stage;
+    if (stage && !Object.hasOwn(STAGE_EVENTS, stage)) return res.status(400).json({ error: 'INVALID_STAGE' });
     try {
         const dbClient = getDbClient();
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -381,7 +367,7 @@ router.get('/passengers', async (req, res) => {
         // Filter manual bookings
         query = query.or('channel.eq.manual,source_type.eq.manual');
 
-        if (period && period !== 'all') {
+        if (stage || (period && period !== 'all')) {
             query = query.gte('created_at', range.start).lte('created_at', range.end);
         }
 
@@ -409,34 +395,37 @@ router.get('/passengers', async (req, res) => {
         let claimRequestsMap = new Map();
 
         if (bIds.length > 0) {
-            const { data: allEvents } = await dbClient
+            const { data: allEvents, error: eventsError } = await dbClient
                 .from('booking_journey_events')
                 .select('*')
                 .in('booking_id', bIds)
                 .order('created_at', { ascending: true });
 
+            if (eventsError) throw eventsError;
             (allEvents || []).forEach(ev => {
                 if (!eventsMap.has(ev.booking_id)) eventsMap.set(ev.booking_id, []);
                 eventsMap.get(ev.booking_id).push(ev);
             });
 
-            const { data: allHandoffs } = await dbClient
+            const { data: allHandoffs, error: handoffError } = await dbClient
                 .from('booking_handoffs')
                 .select('*')
                 .in('booking_id', bIds)
                 .order('created_at', { ascending: false });
 
+            if (handoffError) throw handoffError;
             (allHandoffs || []).forEach(h => {
                 if (!handoffsMap.has(h.booking_id)) handoffsMap.set(h.booking_id, []);
                 handoffsMap.get(h.booking_id).push(h);
             });
 
-            const { data: allReqs } = await dbClient
+            const { data: allReqs, error: requestsError } = await dbClient
                 .from('booking_claim_requests')
                 .select('id, booking_id, status')
                 .in('booking_id', bIds)
                 .eq('status', 'pending');
 
+            if (requestsError) throw requestsError;
             (allReqs || []).forEach(r => claimRequestsMap.set(r.booking_id, r.id));
         }
 
@@ -494,8 +483,9 @@ router.get('/passengers', async (req, res) => {
 
         // Filter by channel if requested
         let filtered = mappedList;
+        if (stage) filtered = filtered.filter(p => reachedFunnelStage(stage, new Set((eventsMap.get(p.bookingId) || []).map(e => e.event_type))));
         if (channel) {
-            filtered = filtered.filter(p => p.channel === channel);
+            filtered = filtered.filter(p => stage ? (eventsMap.get(p.bookingId) || []).some(e => e.channel === channel) : p.channel === channel);
         }
 
         // Filter by status if requested
