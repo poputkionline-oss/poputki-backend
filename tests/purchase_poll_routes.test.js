@@ -9,6 +9,7 @@ require('../dbServiceRole').getServiceRoleClient = () => ({ from(table) {
     const chain = {
         select(fields, options) { query.fields = fields; query.options = options; return chain; },
         eq(key, value) { (query.filters ||= []).push([key, value]); return chain; },
+        in(key, value) { (query.memberships ||= []).push([key, value]); return chain; },
         order(key, options) { (query.orders ||= []).push([key, options]); return chain; },
         range(start, end) { query.range = [start, end]; return chain; },
         then(resolve, reject) {
@@ -57,6 +58,22 @@ test('status includes historical sent ledger totals and separate dispatch errors
     const result = await response.json();
     assert.equal(result.sent_total, 23); assert.equal(result.answered_total, 8); assert.equal(result.awaiting_total, 15);
     assert.equal(result.sent, 0); assert.equal(result.failed, 0);
+});
+test('banner filters apply to the database query before pagination', async () => {
+    const headers = { 'x-admin-token': 'poll-test-admin' };
+    for (const filter of ['sent', 'answered', 'awaiting', 'issues']) {
+        queryLog = [];
+        assert.equal((await fetch(origin + '/api/admin/polls/recipients?filter=' + filter, { headers })).status, 200);
+        if (filter === 'issues') assert.deepEqual(queryLog[0].memberships, [['delivery_status', ['failed', 'uncertain']]]);
+        else {
+            assert.deepEqual(queryLog[0].filters[0], ['delivery_status', 'sent']);
+            if (filter !== 'sent') assert.deepEqual(queryLog[0].filters[1], ['answer_status', filter]);
+        }
+        assert.deepEqual(queryLog[0].range, [0, 19]);
+    }
+    assert.equal((await fetch(origin + '/api/admin/polls/recipients?filter=invalid', { headers })).status, 400);
+    assert.equal((await fetch(origin + '/api/admin/polls/templates')).status, 401);
+    assert.equal((await fetch(origin + '/api/admin/polls/templates', { headers })).status, 200);
 });
 test('signed vote persists only supplied Telegram voter and selected index', async () => {
     assert.equal((await post({ ...body, user_id: 999, booking_id: 999 })).status, 200);

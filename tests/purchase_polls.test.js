@@ -16,17 +16,34 @@ test('eligibility excludes unmarked cancellations, manual, paid, blocked and cha
     assert.equal(stillEligible(booking, row, settings, { telegram_id: 66 }, now), false);
     assert.equal(stillEligible(booking, row, settings, { telegram_id: 55, is_blocked: true }, now), false);
 });
-function mock({ paid = false, disabled = false, lookupFailure = false, finalFailure = false } = {}) {
+test('post-trip poll requires completed marked trip and confirmed boarded online passenger', () => {
+    const completedSettings = { ...settings, event_type: 'completed' };
+    const completedRow = { ...row, event_type: 'completed' };
+    const completedBooking = { ...booking, status: 'confirmed', boarding_status: 'boarded', created_at: '2020-01-01',
+        bus_tickets: { ...booking.bus_tickets, status: 'completed', poll_completed_at: new Date(now - 1800000).toISOString() } };
+    assert.equal(stillEligible(completedBooking, completedRow, completedSettings, { telegram_id: 55 }, now), true);
+    for (const patch of [{ boarding_status: 'pending_boarding' }, { status: 'cancelled' }, { channel: 'manual' },
+        { bus_tickets: { ...completedBooking.bus_tickets, poll_completed_at: null } },
+        { bus_tickets: { ...completedBooking.bus_tickets, poll_completed_at: new Date(now - 90000000).toISOString() } }]) {
+        assert.equal(stillEligible({ ...completedBooking, ...patch }, completedRow, completedSettings, { telegram_id: 55 }, now), false);
+    }
+    assert.equal(stillEligible(completedBooking, completedRow, settings, { telegram_id: 55 }, now), false);
+    assert.equal(validatePollSettings({ ...settings, event_type: 'invalid' }), null);
+});
+function mock({ paid = false, disabled = false, lookupFailure = false, finalFailure = false, completed = false } = {}) {
     const updates = [], rpcs = [];
+    const activeRow = completed ? { ...row, event_type: 'completed' } : row;
+    const activeBooking = completed ? { ...booking, status: 'confirmed', boarding_status: 'boarded',
+        bus_tickets: { ...booking.bus_tickets, status: 'completed', departure_date: '2020-01-01', poll_completed_at: new Date(Date.now() - 1800000).toISOString() } } : booking;
     const db = {
         from(table) {
             let confirmed = false;
             return { select() { return this; }, eq(key, value) { if (key === 'status' && value === 'confirmed') confirmed = true; return this; }, or() { return this; },
-                single: async () => ({ data: table === 'poll_settings' ? { ...settings, enabled: !disabled } : table === 'users' ? { telegram_id: 55 } : booking, error: lookupFailure && table === 'bus_ticket_bookings' ? {} : null }),
+                single: async () => ({ data: table === 'poll_settings' ? { ...settings, event_type: completed ? 'completed' : 'purchase', enabled: !disabled } : table === 'users' ? { telegram_id: 55 } : activeBooking, error: lookupFailure && table === 'bus_ticket_bookings' ? {} : null }),
                 limit: async () => ({ data: confirmed && paid ? [{ id: 1 }] : [], error: null }),
                 update(value) { updates.push(value); return this; }, then(resolve) { resolve({ error: null }); } };
         },
-        rpc: async (name, params) => { rpcs.push({ name, params }); return name === 'fn_claim_purchase_polls' ? { data: [row], error: null } : { data: { success: !finalFailure }, error: null }; }
+        rpc: async (name, params) => { rpcs.push({ name, params }); return name === 'fn_claim_purchase_polls' ? { data: [activeRow], error: null } : { data: { success: !finalFailure }, error: null }; }
     }; return { db, updates, rpcs };
 }
 test('dry-run and disabled settings never claim or send', async () => {
@@ -40,6 +57,11 @@ test('dispatch uses frozen snapshot and atomically finalizes ledger', async () =
     const m = mock(); let sentRow;
     const result = await processPurchasePolls({ dbClient: m.db, configure: async () => {}, send: async r => { sentRow = r; return 'test-poll'; } });
     assert.equal(result.sent, 1); assert.equal(sentRow.question_snapshot, 'Original'); assert.equal(m.rpcs[1].name, 'fn_finalize_purchase_poll'); assert.equal(m.updates.length, 0);
+});
+test('post-trip dispatch accepts completed boarded paid booking with past departure', async () => {
+    const m = mock({ completed: true, paid: true });
+    const result = await processPurchasePolls({ dbClient: m.db, configure: async () => {}, send: async () => 'completed-poll' });
+    assert.equal(result.sent, 1); assert.equal(m.updates.length, 0);
 });
 test('late payment or lookup failure suppresses dispatch', async () => {
     for (const opts of [{ paid: true }, { lookupFailure: true }]) {
