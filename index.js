@@ -198,10 +198,12 @@ app.use('/api/acquisition', acquisitionRoutes);
 app.use('/api/marketing-consents', consentRoutes);
 app.use('/api/referrals', referralRoutes);
 app.use('/api/internal/acquisition', internalAcquisitionRoutes);
+app.use('/api/internal/polls', require('./routes/internalPolls'));
 app.use('/', acquisitionRoutes); // For GET /l/:rawToken and GET /r/:rawCode redirect routes
 
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
+    require('./utils/purchasePollService').configurePollWebhook().catch(() => console.warn('[Polls] Webhook setup pending; dispatch will retry setup.'));
     console.log(`Swagger docs available at http://localhost:${PORT}/api-docs`);
 
     // Fail-closed no-op unless OSON_SMS_RETRY_SWEEP_ENABLED=true — see

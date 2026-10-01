@@ -1,0 +1,42 @@
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('crypto');
+process.env.INTERNAL_SERVICE_SECRET = 'poll-route-test-secret';
+process.env.ADMIN_SECRET_TOKEN = 'poll-test-admin';
+let captured, fail = false;
+require('../dbServiceRole').getServiceRoleClient = () => ({ rpc: async (name, params) => {
+    if (name === 'fn_record_internal_service_nonce') return { data: true, error: null };
+    captured = { name, params }; return { data: { status: 'saved' }, error: fail ? {} : null };
+} });
+const { computeSignature } = require('../utils/internalServiceAuth');
+const express = require('express'); const app = express(); app.use(express.json());
+app.use('/api/internal/polls', require('../routes/internalPolls'));
+app.use('/api/admin/polls', require('../utils/adminTokenAuth').requireAdminToken, require('../routes/adminPolls'));
+let server, origin;
+before(async () => { server = app.listen(0, '127.0.0.1'); await new Promise(r => server.once('listening', r)); origin = `http://127.0.0.1:${server.address().port}`; });
+after(() => { server.closeAllConnections(); server.close(); });
+function sign(body) {
+    const timestamp = String(Date.now()), nonce = crypto.randomBytes(16).toString('hex');
+    return { 'Content-Type': 'application/json', 'x-internal-timestamp': timestamp, 'x-internal-nonce': nonce,
+        'x-internal-signature': computeSignature({ method: 'POST', path: '/api/internal/polls/answer', timestamp, nonce, body, secret: process.env.INTERNAL_SERVICE_SECRET }) };
+}
+const body = { action: 'vote', telegram_id: '55', poll_id: 'test-poll', option: 1 };
+async function post(data, headers = sign(data)) { return fetch(origin + '/api/internal/polls/answer', { method: 'POST', headers, body: JSON.stringify(data) }); }
+test('poll answer endpoint rejects unsigned and replayed calls', async () => {
+    assert.equal((await post(body, { 'Content-Type': 'application/json' })).status, 401);
+    const headers = sign(body); assert.equal((await post(body, headers)).status, 200); assert.equal((await post(body, headers)).status, 401);
+});
+test('signed vote persists only supplied Telegram voter and selected index', async () => {
+    assert.equal((await post({ ...body, user_id: 999, booking_id: 999 })).status, 200);
+    assert.deepEqual(captured, { name: 'fn_answer_purchase_poll', params: { p_poll_id: 'test-poll', p_telegram_id: '55', p_option: 1 } });
+});
+test('invalid inputs are rejected and persistence errors request Telegram retry', async () => {
+    for (const patch of [{ telegram_id: '-1' }, { option: 4 }, { option: '1' }, { action: 'x' }]) assert.equal((await post({ ...body, ...patch })).status, 400);
+    fail = true; assert.equal((await post(body)).status, 503); fail = false;
+});
+test('poll admin APIs require admin token; dry-run does not send or read recipients', async () => {
+    assert.equal((await fetch(origin + '/api/admin/polls/settings')).status, 401);
+    captured = null;
+    const result = await fetch(origin + '/api/admin/polls/trigger?dry_run=true', { method: 'POST', headers: { 'x-admin-token': 'poll-test-admin' } });
+    assert.equal(result.status, 200); assert.equal((await result.json()).sent, 0); assert.equal(captured, null);
+});
