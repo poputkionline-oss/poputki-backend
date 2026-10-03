@@ -6,6 +6,14 @@ const { sendBroadcast } = require('../utils/telegramBot');
 const { uploadToCloudinary } = require('../utils/cloudinaryUtils');
 const { verifyBusAccess, checkBusScheduleConflict } = require('../utils/busHelper');
 const { buildPublicBusDetails } = require('../utils/publicBusHelper');
+const {
+    PUBLIC_TRIP_LIST_COLUMNS,
+    PUBLIC_TRIP_DETAILS_COLUMNS,
+    computeSeatOccupancy,
+    toPublicBusTripSummary,
+    toPublicBusTripDetails
+} = require('../utils/publicBusTicketProjection');
+const { optionalUserAuth } = require('../utils/userAuth');
 const { logCarrierActivity, AUDIT_ACTIONS, AUDIT_ENTITY_TYPES } = require('../utils/auditHelper');
 const {
     extractBookingIdFromToken,
@@ -350,9 +358,10 @@ router.get('/', async (req, res) => {
         const currentDate = now.toISOString().split('T')[0];
         const currentTime = now.toTimeString().split(' ')[0];
 
+        // SECURITY (V2.0A): public endpoint — explicit column allowlist, never select('*').
         let query = supabase
             .from('bus_tickets')
-            .select('*')
+            .select(PUBLIC_TRIP_LIST_COLUMNS)
             .eq('status', 'active')
             .or(`departure_date.gt.${currentDate},and(departure_date.eq.${currentDate},departure_time.gte.${currentTime})`)
             .order('departure_date', { ascending: true })
@@ -381,24 +390,8 @@ router.get('/', async (req, res) => {
             }
         }
 
-        let result = tickets.map(t => {
-            const stops = (typeof t.intermediate_stops === 'string' ? JSON.parse(t.intermediate_stops || '[]') : (t.intermediate_stops || [])).map(s => ({
-                ...s,
-                time: s.time ? s.time.substring(0, 5) : s.time
-            }));
-
-            const busMaster = t.bus_id ? busMap.get(t.bus_id) : null;
-            const busDetails = buildPublicBusDetails(t, busMaster);
-
-            return {
-                ...t,
-                bus: busDetails,
-                intermediate_stops: stops,
-                reserved_seats: typeof t.reserved_seats === 'string' ? JSON.parse(t.reserved_seats || '[]') : (t.reserved_seats || []),
-                departure_time: t.departure_time ? t.departure_time.substring(0, 5) : t.departure_time,
-                arrival_time: t.arrival_time ? t.arrival_time.substring(0, 5) : t.arrival_time
-            };
-        });
+        // Allowlist projection: only explicitly public fields are returned.
+        let result = (tickets || []).map(t => toPublicBusTripSummary(t, t.bus_id ? busMap.get(t.bus_id) : null));
 
         // If 'to' search is provided, filter or find matching stop
         if (to) {
@@ -436,32 +429,26 @@ router.get('/', async (req, res) => {
  *         schema:
  *           type: integer
  */
-router.get('/:id', async (req, res) => {
+router.get('/:id', optionalUserAuth, async (req, res) => {
     try {
+        // SECURITY (V2.0A): explicit column allowlist (no select('*')) and only the
+        // carrier's contact phone / fee percent from the joined users row.
         const { data: ticket, error: ticketError } = await supabase
             .from('bus_tickets')
-            .select(`
-                *,
-                operator:users!operator_id (phone, service_fee_percent)
-            `)
+            .select(`${PUBLIC_TRIP_DETAILS_COLUMNS}, operator:users!operator_id (phone, service_fee_percent)`)
             .eq('id', req.params.id)
             .single();
 
         if (ticketError || !ticket) return res.status(404).json({ error: 'Ticket not found' });
 
-        ticket.reserved_seats = typeof ticket.reserved_seats === 'string' ? JSON.parse(ticket.reserved_seats || '[]') : (ticket.reserved_seats || []);
-        ticket.intermediate_stops = (typeof ticket.intermediate_stops === 'string' ? JSON.parse(ticket.intermediate_stops || '[]') : (ticket.intermediate_stops || [])).map(s => ({
-            ...s,
-            time: s.time ? s.time.substring(0, 5) : s.time
-        }));
-        ticket.departure_time = ticket.departure_time ? ticket.departure_time.substring(0, 5) : ticket.departure_time;
-        ticket.arrival_time = ticket.arrival_time ? ticket.arrival_time.substring(0, 5) : ticket.arrival_time;
+        // Cancelled / completed trips are not exposed to the public (same rule
+        // POST /api/bus-ticket-bookings applies when booking).
+        if (ticket.status !== 'active') return res.status(404).json({ error: 'Ticket not found' });
 
         // Fetch passenger-safe bus projection if bus_id is present
-        let busDetails = null;
+        let busMaster = null;
         if (ticket.bus_id) {
             const serviceClient = getSafeServiceRoleClient();
-            let busMaster = null;
             if (serviceClient) {
                 const { data } = await serviceClient
                     .from('carrier_buses')
@@ -470,49 +457,44 @@ router.get('/:id', async (req, res) => {
                     .maybeSingle();
                 busMaster = data || null;
             }
-            busDetails = buildPublicBusDetails(ticket, busMaster);
         }
 
+        // Booking rows are read server-side ONLY to derive seat numbers; they are
+        // never returned. passengers_data is selected only for an authenticated
+        // passenger, and only to derive the per-seat gender map for the seat picker.
+        const isAuthenticatedPassenger = !!(req.user && req.user.id);
         const { data: bookings, error: bookingsError } = await supabase
             .from('bus_ticket_bookings')
-            .select('*')
+            .select(isAuthenticatedPassenger
+                ? 'seat_numbers, status, hold_expires_at, created_at, passengers_data'
+                : 'seat_numbers, status, hold_expires_at, created_at')
             .eq('bus_ticket_id', ticket.id)
             .eq('status', 'confirmed');
 
         if (bookingsError) throw bookingsError;
 
-        const bookedSeats = [];
-        const seatGenders = {};
+        const { confirmedSeats } = computeSeatOccupancy(bookings);
 
-        (bookings || []).forEach(b => {
-            const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
-            const pData = typeof b.passengers_data === 'string' ? JSON.parse(b.passengers_data || '[]') : (b.passengers_data || []);
-
-            bookedSeats.push(...seats);
-            seats.forEach((seatNum, idx) => {
-                if (pData[idx] && pData[idx].gender) {
-                    seatGenders[seatNum] = pData[idx].gender;
-                }
+        let seatGenders = null;
+        if (isAuthenticatedPassenger) {
+            seatGenders = {};
+            (bookings || []).forEach(b => {
+                const seats = typeof b.seat_numbers === 'string' ? JSON.parse(b.seat_numbers || '[]') : (b.seat_numbers || []);
+                const pData = typeof b.passengers_data === 'string' ? JSON.parse(b.passengers_data || '[]') : (b.passengers_data || []);
+                seats.forEach((seatNum, idx) => {
+                    if (pData[idx] && pData[idx].gender) {
+                        seatGenders[seatNum] = pData[idx].gender;
+                    }
+                });
             });
-        });
-
-        // Calculate premium seats for double-decker
-        let premiumSeats = [1, 2, 3, 4]; // Default front seats 2nd floor
-        if (ticket.bus_type === 'double') {
-            // Add table seats (1st floor)
-            premiumSeats = [...premiumSeats, 69, 70, 71, 72, 73, 74, 75, 76];
         }
 
-        res.json({ 
-            ...ticket, 
-            bus: busDetails,
-            operator_phone: ticket.operator?.phone,
-            service_fee_percent: ticket.operator?.service_fee_percent ?? 10,
-            bookings, 
-            bookedSeats, 
-            seatGenders, 
-            premiumSeats 
-        });
+        res.json(toPublicBusTripDetails(ticket, {
+            busMaster,
+            confirmedSeats,
+            operator: ticket.operator,
+            seatGenders
+        }));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
