@@ -14,7 +14,9 @@
    ```env
    PORT=5001
    SUPABASE_URL=ваш_url_supabase
-   SUPABASE_ANON_KEY=ваш_ключ_supabase
+   # Серверный ключ service_role (ТОЛЬКО на сервере; никогда не в браузер/Vite/логи).
+   # Бэкенд НЕ использует SUPABASE_ANON_KEY и без SUPABASE_SERVICE_ROLE_KEY не запустится.
+   SUPABASE_SERVICE_ROLE_KEY=ваш_service_role_ключ_supabase
    TELEGRAM_BOT_TOKEN=ваш_токен_бота
    TELEGRAM_BROADCAST_GROUP_ID=ид_канала_для_рассылок
    MINI_APP_URL=https://poputki.online
