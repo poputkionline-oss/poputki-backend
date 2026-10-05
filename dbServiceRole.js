@@ -1,5 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const { readJwtRole } = require('./utils/serverSupabaseConfig');
 require('dotenv').config();
 
 let serviceRoleClient = null;
@@ -52,6 +53,14 @@ function getServiceRoleClient() {
             result: 'FAILED'
         });
         throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for server-side claim operations');
+    }
+
+    // V2.0B-0: refuse a JWT-shaped key that is not a service_role key (e.g. an
+    // anon key pasted into SUPABASE_SERVICE_ROLE_KEY). Only the role string is
+    // ever reported, never the key.
+    const keyRole = readJwtRole(serviceRoleKey);
+    if (keyRole !== null && keyRole !== 'service_role') {
+        throw new Error(`SUPABASE_SERVICE_ROLE_KEY does not hold a service_role key (role claim: "${keyRole}")`);
     }
 
     serviceRoleClient = createClient(supabaseUrl, serviceRoleKey, {
